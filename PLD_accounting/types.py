@@ -40,8 +40,8 @@ class PrivacyParams:
     num_steps:    int
     num_selected: int   = 1
     num_epochs:   int   = 1
-    epsilon:      float = None
-    delta:        float = None
+    epsilon:      float | None = None
+    delta:        float | None = None
 
 @dataclass
 class AllocationSchemeConfig:

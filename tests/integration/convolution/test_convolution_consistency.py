@@ -4,12 +4,9 @@ Integration tests for convolution consistency and domination ordering.
 import numpy as np
 from scipy import stats
 
-from PLD_accounting.types import BoundType, ConvolutionMethod, SpacingType
-from PLD_accounting.convolution_API import (
-    self_convolve_discrete_distributions,
-    convolve_discrete_distributions,
-)
+from PLD_accounting.types import BoundType, SpacingType
 from PLD_accounting.distribution_discretization import discretize_continuous_distribution
+from PLD_accounting.FFT_convolution import FFT_convolve, FFT_self_convolve
 from PLD_accounting.geometric_convolution import geometric_convolve, geometric_self_convolve
 from tests.test_tolerances import TestTolerances as TOL
 
@@ -87,19 +84,18 @@ class TestConvolutionConsistency:
             spacing_type=SpacingType.LINEAR,
         )
 
-        pairwise = convolve_discrete_distributions(
+        pairwise = FFT_convolve(
             dist_1=dist,
             dist_2=dist,
             tail_truncation=0.0,
             bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.FFT,
         )
-        self_conv = self_convolve_discrete_distributions(
+        self_conv = FFT_self_convolve(
             dist=dist,
             T=2,
             tail_truncation=0.0,
             bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.FFT,
+            use_direct=True,
         )
 
         # Verify both have conserved mass
@@ -170,19 +166,19 @@ class TestDominationOrdering:
             spacing_type=SpacingType.LINEAR,
         )
 
-        upper_conv = self_convolve_discrete_distributions(
+        upper_conv = FFT_self_convolve(
             dist=upper,
             T=4,
             tail_truncation=0.0,
             bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.FFT,
+            use_direct=True,
         )
-        lower_conv = self_convolve_discrete_distributions(
+        lower_conv = FFT_self_convolve(
             dist=lower,
             T=4,
             tail_truncation=0.0,
             bound_type=BoundType.IS_DOMINATED,
-            convolution_method=ConvolutionMethod.FFT,
+            use_direct=True,
         )
 
         # Verify stochastic dominance via CCDF comparison on common grid
@@ -245,34 +241,34 @@ class TestDominationOrdering:
             spacing_type=SpacingType.LINEAR,
         )
 
-        upper_t2 = self_convolve_discrete_distributions(
+        upper_t2 = FFT_self_convolve(
             dist=upper,
             T=2,
             tail_truncation=0.0,
             bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.FFT,
+            use_direct=True,
         )
-        lower_t2 = self_convolve_discrete_distributions(
+        lower_t2 = FFT_self_convolve(
             dist=lower,
             T=2,
             tail_truncation=0.0,
             bound_type=BoundType.IS_DOMINATED,
-            convolution_method=ConvolutionMethod.FFT,
+            use_direct=True,
         )
 
-        upper_t8 = self_convolve_discrete_distributions(
+        upper_t8 = FFT_self_convolve(
             dist=upper,
             T=8,
             tail_truncation=0.0,
             bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.FFT,
+            use_direct=True,
         )
-        lower_t8 = self_convolve_discrete_distributions(
+        lower_t8 = FFT_self_convolve(
             dist=lower,
             T=8,
             tail_truncation=0.0,
             bound_type=BoundType.IS_DOMINATED,
-            convolution_method=ConvolutionMethod.FFT,
+            use_direct=True,
         )
 
         # Measure gap via maximum CCDF difference
@@ -330,25 +326,25 @@ class TestDominationOrdering:
 
         # Convolve both
         T = 4
-        upper_coarse_conv = self_convolve_discrete_distributions(
+        upper_coarse_conv = FFT_self_convolve(
             dist=upper_coarse, T=T, tail_truncation=0.0,
             bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.FFT,
+            use_direct=True,
         )
-        lower_coarse_conv = self_convolve_discrete_distributions(
+        lower_coarse_conv = FFT_self_convolve(
             dist=lower_coarse, T=T, tail_truncation=0.0,
             bound_type=BoundType.IS_DOMINATED,
-            convolution_method=ConvolutionMethod.FFT,
+            use_direct=True,
         )
-        upper_fine_conv = self_convolve_discrete_distributions(
+        upper_fine_conv = FFT_self_convolve(
             dist=upper_fine, T=T, tail_truncation=0.0,
             bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.FFT,
+            use_direct=True,
         )
-        lower_fine_conv = self_convolve_discrete_distributions(
+        lower_fine_conv = FFT_self_convolve(
             dist=lower_fine, T=T, tail_truncation=0.0,
             bound_type=BoundType.IS_DOMINATED,
-            convolution_method=ConvolutionMethod.FFT,
+            use_direct=True,
         )
 
         # Measure gaps
@@ -413,15 +409,15 @@ class TestDominationOrdering:
 
         # Convolve with both methods
         T = 3
-        upper_fft = self_convolve_discrete_distributions(
+        upper_fft = FFT_self_convolve(
             dist=upper_linear, T=T, tail_truncation=0.0,
             bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.FFT,
+            use_direct=True,
         )
-        lower_fft = self_convolve_discrete_distributions(
+        lower_fft = FFT_self_convolve(
             dist=lower_linear, T=T, tail_truncation=0.0,
             bound_type=BoundType.IS_DOMINATED,
-            convolution_method=ConvolutionMethod.FFT,
+            use_direct=True,
         )
         upper_geom_conv = geometric_self_convolve(
             dist=upper_geom, T=T, tail_truncation=0.0,

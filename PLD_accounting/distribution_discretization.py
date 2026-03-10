@@ -1,18 +1,21 @@
 import numpy as np
+from numba import njit
 from numpy.typing import NDArray
 from scipy import stats
-from numba import njit
 
 from PLD_accounting.core_utils import enforce_mass_conservation
-from PLD_accounting.types import BoundType, SpacingType, Direction
-from PLD_accounting.discrete_dist import DiscreteDist
+from PLD_accounting.discrete_dist import *
+from PLD_accounting.utils import (
+    exp_linear_to_geometric,
+    log_geometric_to_linear,
+)
+from PLD_accounting.types import BoundType, SpacingType
 
 # =============================================================================
 # Continuous distribution discretization
 # =============================================================================
 TAIL_SWITCH = 1e-10
 MIN_GRID_SIZE = 100
-
 def discretize_continuous_distribution(
     dist: stats.rv_continuous,
     tail_truncation: float,
@@ -20,9 +23,9 @@ def discretize_continuous_distribution(
     spacing_type: SpacingType,
     n_grid: int,
     align_to_multiples: bool,
-) -> DiscreteDist:
+) -> LinearDiscreteDist | GeometricDiscreteDist:
     """
-    Discretize continuous distribution to DiscreteDist representation.
+    Discretize a continuous distribution to a typed structured representation.
     """
     # 1. Generate grid
     if n_grid == 0:
@@ -39,7 +42,8 @@ def discretize_continuous_distribution(
         dist=dist,
         x_array=x_array,
         bound_type=bound_type,
-        PMF_min_increment=tail_truncation
+        PMF_min_increment=tail_truncation,
+        spacing_type=spacing_type,
     )
 
 def _discretize_continuous_to_grid(
@@ -83,8 +87,9 @@ def discretize_continuous_to_pmf(
     dist: stats.rv_continuous,
     x_array: NDArray[np.float64],
     bound_type: BoundType,
-    PMF_min_increment: float
-) -> DiscreteDist:
+    PMF_min_increment: float,
+    spacing_type: SpacingType,
+) -> LinearDiscreteDist | GeometricDiscreteDist:
     """
     Convert continuous distribution to discrete PMF with bounding semantics.
     """
@@ -117,12 +122,23 @@ def discretize_continuous_to_pmf(
     else:
         raise ValueError(f"Unknown BoundType: {bound_type}")
 
-    return DiscreteDist(
-        x_array=x_array,
-        PMF_array=PMF_array,
-        p_neg_inf=p_neg_inf,
-        p_pos_inf=p_pos_inf
-    ).validate_mass_conservation(bound_type)
+    if spacing_type == SpacingType.LINEAR:
+        return LinearDiscreteDist.from_x_array(
+            x_array=x_array,
+            PMF_array=PMF_array,
+            p_neg_inf=p_neg_inf,
+            p_pos_inf=p_pos_inf,
+        ).validate_mass_conservation(bound_type)
+
+    if spacing_type == SpacingType.GEOMETRIC:
+        return GeometricDiscreteDist.from_x_array(
+            x_array=x_array,
+            PMF_array=PMF_array,
+            p_neg_inf=p_neg_inf,
+            p_pos_inf=p_pos_inf,
+        ).validate_mass_conservation(bound_type)
+
+    raise ValueError(f"Invalid spacing_type: {spacing_type}")
 
 def discretize_aligned_range(
     x_min: float,
@@ -293,16 +309,20 @@ def _compute_discrete_PMF(
 # Change spacing type of discrete distributions
 # =============================================================================
 
-def change_spacing_type(dist: DiscreteDist,
+def change_spacing_type(dist: DiscreteDistBase,
                         tail_truncation: float,
                         loss_discretization: float,
                         spacing_type: SpacingType,
-                        bound_type: BoundType) -> DiscreteDist:
+                        bound_type: BoundType) -> LinearDiscreteDist | GeometricDiscreteDist:
     """Convert distribution to different grid spacing (linear ↔ geometric).
 
     Remaps PMF onto a new grid with the requested spacing and discretization.
     Implementation trims zero/tail regions, computes new grid size, then remaps
     using domination-aware rounding (e.g., linear grids for dp_accounting output).
+
+    Returns:
+        Dense linear distribution if spacing_type is LINEAR,
+        Dense geometric distribution if spacing_type is GEOMETRIC.
     """
     trunc_dist = dist.copy().truncate_edges(
         tail_truncation=tail_truncation / 2,
@@ -330,13 +350,24 @@ def change_spacing_type(dist: DiscreteDist,
         expected_pos_inf=dist.p_pos_inf,
         bound_type=bound_type,
     )
-    return DiscreteDist(
-        x_array=x_array_out,
-        PMF_array=PMF_out,
-        p_neg_inf=p_neg_inf,
-        p_pos_inf=p_pos_inf
-    ).validate_mass_conservation(bound_type)
 
+    if spacing_type == SpacingType.LINEAR:
+        return LinearDiscreteDist.from_x_array(
+            x_array=x_array_out,
+            PMF_array=PMF_out,
+            p_neg_inf=p_neg_inf,
+            p_pos_inf=p_pos_inf,
+        ).validate_mass_conservation(bound_type)
+
+    if spacing_type == SpacingType.GEOMETRIC:
+        return GeometricDiscreteDist.from_x_array(
+            x_array=x_array_out,
+            PMF_array=PMF_out,
+            p_neg_inf=p_neg_inf,
+            p_pos_inf=p_pos_inf,
+        ).validate_mass_conservation(bound_type)
+
+    raise ValueError(f"Invalid spacing_type: {spacing_type}")
 @njit(cache=True)
 def rediscritize_PMF(x_array: NDArray[np.float64],
                   PMF_array: NDArray[np.float64],

@@ -1,12 +1,12 @@
 import numpy as np
 
-from PLD_accounting.discrete_dist import DiscreteDist
+from PLD_accounting.discrete_dist import GeneralDiscreteDist
 from PLD_accounting.types import BoundType
 from PLD_accounting.utils import combine_distributions
 
 
 def _make_dist(x_values, probs, p_pos_inf=0.0, p_neg_inf=0.0):
-    return DiscreteDist(
+    return GeneralDiscreteDist(
         x_array=np.array(x_values, dtype=np.float64),
         PMF_array=np.array(probs, dtype=np.float64),
         p_neg_inf=p_neg_inf,

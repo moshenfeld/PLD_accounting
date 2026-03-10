@@ -15,7 +15,7 @@ from PLD_accounting.subsample_PLD import (
     subsample_PMF,
     _calc_PLD_dual,
 )
-from PLD_accounting.discrete_dist import DiscreteDist
+from PLD_accounting.discrete_dist import GeneralDiscreteDist
 from PLD_accounting.types import Direction, BoundType
 from tests.integration.subsampling.analytic_gaussian import gaussian_pld
 
@@ -71,7 +71,7 @@ def compute_analytical_base_gaussian(
     return compute_analytical_subsampled_gaussian(sigma, 1.0, discretization, remove_direction)
 
 
-def _upper_to_lower(dist: DiscreteDist) -> DiscreteDist:
+def _upper_to_lower(dist: GeneralDiscreteDist) -> GeneralDiscreteDist:
     if dist.p_neg_inf > 0:
         raise ValueError("Expected p_neg_inf=0 for upper PLD")
     losses = dist.x_array
@@ -79,8 +79,8 @@ def _upper_to_lower(dist: DiscreteDist) -> DiscreteDist:
     lower_probs = np.zeros_like(probs)
     mask = probs > 0
     lower_probs[mask] = np.exp(np.log(probs[mask]) - losses[mask])
-    sum_prob = np.sum(lower_probs)
-    return DiscreteDist(
+    sum_prob = float(np.sum(lower_probs))
+    return GeneralDiscreteDist(
         x_array=losses,
         PMF_array=lower_probs,
         p_neg_inf=max(0.0, 1.0 - sum_prob),
@@ -88,8 +88,8 @@ def _upper_to_lower(dist: DiscreteDist) -> DiscreteDist:
     )
 
 
-def _negate_distribution(dist: DiscreteDist) -> DiscreteDist:
-    return DiscreteDist(
+def _negate_distribution(dist: GeneralDiscreteDist) -> GeneralDiscreteDist:
+    return GeneralDiscreteDist(
         x_array=-np.flip(dist.x_array),
         PMF_array=np.flip(dist.PMF_array),
         p_neg_inf=dist.p_pos_inf,
@@ -104,7 +104,7 @@ class TestPLDDualTransformation:
         losses = np.array([0.0, 0.5, 1.0, 1.5, 2.0])
         probs = np.array([0.1, 0.2, 0.3, 0.25, 0.1])
 
-        upper = DiscreteDist(
+        upper = GeneralDiscreteDist(
             x_array=losses,
             PMF_array=probs,
             p_neg_inf=0.0,
@@ -121,7 +121,7 @@ class TestPLDDualTransformation:
         assert lower.p_pos_inf == 0.0
 
     def test_upper_to_lower_rejects_invalid_upper(self):
-        invalid_upper = DiscreteDist(
+        invalid_upper = GeneralDiscreteDist(
             x_array=np.array([0.0, 1.0]),
             PMF_array=np.array([0.5, 0.4]),
             p_neg_inf=0.1,
@@ -139,7 +139,7 @@ class TestPLDDualTransformation:
         ]
 
         for losses, probs, p_pos_inf in test_cases:
-            upper = DiscreteDist(
+            upper = GeneralDiscreteDist(
                 x_array=losses,
                 PMF_array=probs,
                 p_neg_inf=0.0,
@@ -161,7 +161,7 @@ class TestSubsampleDistDual:
         dual_sum = np.sum(probs * np.exp(-losses))
         assert dual_sum <= 1.0
 
-        base_dist = DiscreteDist(
+        base_dist = GeneralDiscreteDist(
             x_array=losses,
             PMF_array=probs,
             p_neg_inf=0.0,
@@ -185,7 +185,7 @@ class TestSubsampleDistDual:
 
     def test_subsample_PMF_mass_conservation_add(self):
         losses = np.linspace(0.0, 3.0, 50)
-        add_upper = DiscreteDist(
+        add_upper = GeneralDiscreteDist(
             x_array=-losses[::-1],
             PMF_array=np.ones(50)[::-1] / 52.0,
             p_neg_inf=0.02,
@@ -212,7 +212,7 @@ class TestSubsampleDistDual:
     def test_subsample_PMF_various_params(self, sampling_prob, direction):
         if direction == Direction.REMOVE:
             losses = np.linspace(0.0, 3.0, 30)
-            dist = DiscreteDist(
+            dist = GeneralDiscreteDist(
                 x_array=losses,
                 PMF_array=np.ones(30) / 32.0,
                 p_neg_inf=0.0,
@@ -221,7 +221,7 @@ class TestSubsampleDistDual:
             bound_type = BoundType.DOMINATES
         else:
             losses = np.linspace(0.0, 3.0, 30)
-            dist = DiscreteDist(
+            dist = GeneralDiscreteDist(
                 x_array=-losses[::-1],
                 PMF_array=np.ones(30)[::-1] / 32.0,
                 p_neg_inf=0.02,
@@ -240,5 +240,4 @@ class TestSubsampleDistDual:
         assert abs(total_mass - 1.0) < 1e-6
 
         assert np.sum(subsampled.PMF_array > 1e-10) > 0
-
 

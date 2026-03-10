@@ -1,19 +1,25 @@
-from typing import Callable
+from typing import Callable, Any
 import numpy as np
 from numpy.typing import NDArray
 from numba import njit
 
 from PLD_accounting.core_utils import stable_array_equal, enforce_mass_conservation
 from PLD_accounting.types import BoundType
-from PLD_accounting.discrete_dist import DiscreteDist
+from PLD_accounting.discrete_dist import (
+    DiscreteDistBase,
+    GeneralDiscreteDist,
+    GeometricDiscreteDist,
+    LinearDiscreteDist,
+)
+
 
 def binary_self_convolve(
-    dist: DiscreteDist,
+    dist: DiscreteDistBase,
     T: int,
     tail_truncation: float,
     bound_type: BoundType,
-    convolve: Callable
-) -> DiscreteDist:
+    convolve: Callable[..., DiscreteDistBase]
+) -> DiscreteDistBase:
     """Binary-exponentiation self-convolution using a provided convolve function."""
     if T < 1:
         raise ValueError(f"T must be >= 1, got {T}")
@@ -46,15 +52,16 @@ def binary_self_convolve(
     return acc_dist if acc_dist is not None else base_dist
 
 def combine_distributions(
-    dist_1: DiscreteDist,
-    dist_2: DiscreteDist,
+    dist_1: DiscreteDistBase,
+    dist_2: DiscreteDistBase,
     bound_type: BoundType
-) -> DiscreteDist:
+) -> GeneralDiscreteDist:
     """Combine two distributions by tightening bounds via CCDF min/max.
 
     For DOMINATES: returns tighter dominating distribution using pointwise min CCDF.
     For IS_DOMINATED: returns tighter dominated distribution using pointwise max CCDF.
     """
+    ccdf_op: Any
     if bound_type == BoundType.DOMINATES:
         ccdf_op = np.minimum
     elif bound_type == BoundType.IS_DOMINATED:
@@ -81,7 +88,7 @@ def combine_distributions(
         bound_type=bound_type,
     )
 
-    return DiscreteDist(
+    return GeneralDiscreteDist(
         x_array=x_array,
         PMF_array=PMF_array,
         p_neg_inf=p_neg_inf,
@@ -89,8 +96,8 @@ def combine_distributions(
     )
 
 
-def _align_distributions_to_union_grid(dist_1: DiscreteDist,
-                                       dist_2: DiscreteDist) -> tuple[DiscreteDist, DiscreteDist]:
+def _align_distributions_to_union_grid(dist_1: DiscreteDistBase,
+                                       dist_2: DiscreteDistBase) -> tuple[GeneralDiscreteDist, GeneralDiscreteDist]:
     """Return distributions on a shared grid by inserting zero-mass points."""
     x_union = np.unique(np.concatenate((dist_1.x_array, dist_2.x_array)))
     return (
@@ -99,7 +106,7 @@ def _align_distributions_to_union_grid(dist_1: DiscreteDist,
     )
 
 
-def _expand_to_grid(dist: DiscreteDist, grid: NDArray[np.float64]) -> DiscreteDist:
+def _expand_to_grid(dist: DiscreteDistBase, grid: NDArray[np.float64]) -> GeneralDiscreteDist:
     """Insert zero-mass points for missing support values."""
     x = dist.x_array
     pmf = dist.PMF_array
@@ -108,15 +115,15 @@ def _expand_to_grid(dist: DiscreteDist, grid: NDArray[np.float64]) -> DiscreteDi
     if not np.all(grid[indices] == x):
         raise ValueError("Target grid must contain all original support points")
     expanded_pmf[indices] = pmf
-    return DiscreteDist(
+    return GeneralDiscreteDist(
         x_array=grid,
         PMF_array=expanded_pmf,
         p_neg_inf=dist.p_neg_inf,
         p_pos_inf=dist.p_pos_inf
     )
 
-def _CCDF_from_PMF(dist: DiscreteDist) -> NDArray[np.float64]:
-    """Convert DiscreteDist PMF to padded complementary CDF.
+def _CCDF_from_PMF(dist: DiscreteDistBase) -> NDArray[np.float64]:
+    """Convert GeneralDiscreteDist PMF to padded complementary CDF.
 
     Returns [finite_mass + p_pos_inf, finite_mass - p_0 + p_pos_inf, ..., 0]
     for losses [−∞, l_0, l_1, ..., +∞].
@@ -151,3 +158,81 @@ def _kahan_reverse_exclusive_cumsum(padded_probs: NDArray[np.float64]) -> NDArra
         running_sum = t
 
     return ccdf
+
+
+# =============================================================================
+# Distribution Transform Utilities
+# =============================================================================
+
+def exp_linear_to_geometric(dist: LinearDiscreteDist) -> GeometricDiscreteDist:
+    """Apply exp(.) to a linear-grid distribution, producing a geometric-grid distribution."""
+    x_min_exp = float(np.exp(dist.x_min))
+    ratio_exp = float(np.exp(dist.x_gap))
+
+    return GeometricDiscreteDist(
+        x_min=x_min_exp,
+        ratio=ratio_exp,
+        PMF_array=dist.PMF_array.copy(),
+        p_neg_inf=dist.p_neg_inf,
+        p_pos_inf=dist.p_pos_inf,
+    )
+
+
+def log_geometric_to_linear(dist: GeometricDiscreteDist) -> LinearDiscreteDist:
+    """Apply log(.) to a geometric-grid distribution, producing a linear-grid distribution."""
+    x_min_log = float(np.log(dist.x_min))
+    x_gap_log = float(np.log(dist.ratio))
+
+    return LinearDiscreteDist(
+        x_min=x_min_log,
+        x_gap=x_gap_log,
+        PMF_array=dist.PMF_array.copy(),
+        p_neg_inf=dist.p_neg_inf,
+        p_pos_inf=dist.p_pos_inf,
+    )
+
+
+def shift_linear_distribution(dist: LinearDiscreteDist, shift: float) -> LinearDiscreteDist:
+    """Shift linear-grid support by a constant."""
+    if shift == 0.0:
+        return dist
+
+    return LinearDiscreteDist(
+        x_min=dist.x_min + shift,
+        x_gap=dist.x_gap,
+        PMF_array=dist.PMF_array.copy(),
+        p_neg_inf=dist.p_neg_inf,
+        p_pos_inf=dist.p_pos_inf,
+    )
+
+
+def shift_distribution(dist: DiscreteDistBase, shift: float) -> DiscreteDistBase:
+    """Shift support by a constant, preserving linear structure when possible."""
+    if shift == 0.0:
+        return dist
+
+    if isinstance(dist, LinearDiscreteDist):
+        return shift_linear_distribution(dist, shift)
+
+    return GeneralDiscreteDist(
+        x_array=dist.x_array + shift,
+        PMF_array=dist.PMF_array,
+        p_neg_inf=dist.p_neg_inf,
+        p_pos_inf=dist.p_pos_inf,
+    )
+
+
+def negate_reverse_linear_distribution(
+    dist: LinearDiscreteDist,
+    p_neg_inf: float,
+    p_pos_inf: float,
+) -> LinearDiscreteDist:
+    """Map X -> -X and reverse PMF order for linear-grid distributions."""
+    n = dist.PMF_array.size
+    return LinearDiscreteDist(
+        x_min=-(dist.x_min + dist.x_gap * (n - 1)),
+        x_gap=dist.x_gap,
+        PMF_array=np.flip(dist.PMF_array),
+        p_neg_inf=p_neg_inf,
+        p_pos_inf=p_pos_inf,
+    )

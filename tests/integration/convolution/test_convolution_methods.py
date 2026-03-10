@@ -9,11 +9,7 @@ import pytest
 from scipy import stats
 from scipy.fft import next_fast_len
 
-from PLD_accounting.FFT_convolution import FFT_self_convolve
-from PLD_accounting.convolution_API import (
-    self_convolve_discrete_distributions,
-    convolve_discrete_distributions
-)
+from PLD_accounting.FFT_convolution import FFT_self_convolve, FFT_convolve
 from PLD_accounting.distribution_discretization import (
     discretize_continuous_distribution,
     change_spacing_type
@@ -30,7 +26,7 @@ from PLD_accounting.types import (
     PrivacyParams,
     SpacingType,
 )
-from PLD_accounting.discrete_dist import DiscreteDist
+from PLD_accounting.discrete_dist import GeneralDiscreteDist, GeometricDiscreteDist, LinearDiscreteDist
 from PLD_accounting.random_allocation_accounting import (
     _allocation_PMF,
     _compute_conv_params,
@@ -83,13 +79,14 @@ class TestGeometricConvolution:
 
     def test_convolve_two_distributions(self):
         """Test convolving two discrete distributions."""
+        from PLD_accounting.discrete_dist import GeometricDiscreteDist
         x1 = np.array([1.0, 2.0, 4.0])
         pmf1 = np.array([0.3, 0.5, 0.2], dtype=np.float64)
-        dist1 = DiscreteDist(x_array=x1, PMF_array=pmf1)
+        dist1 = GeometricDiscreteDist.from_x_array(x_array=x1, PMF_array=pmf1)
 
         x2 = np.array([0.5, 1.0])
         pmf2 = np.array([0.6, 0.4], dtype=np.float64)
-        dist2 = DiscreteDist(x_array=x2, PMF_array=pmf2)
+        dist2 = GeometricDiscreteDist.from_x_array(x_array=x2, PMF_array=pmf2)
 
         result = geometric_convolve(
             dist_1=dist1,
@@ -109,7 +106,7 @@ class TestGeometricConvolution:
         """Test self-convolution T=2."""
         x = np.array([1.0, 2.0, 4.0])
         pmf = np.array([0.3, 0.5, 0.2], dtype=np.float64)
-        dist = DiscreteDist(x_array=x, PMF_array=pmf)
+        dist = GeometricDiscreteDist.from_x_array(x_array=x, PMF_array=pmf)
 
         result = geometric_self_convolve(
             dist=dist,
@@ -127,7 +124,7 @@ class TestGeometricConvolution:
         # Use geometric grid for geometric convolution (no zero values allowed)
         x = np.geomspace(0.01, 1.0, 201)
         pmf = np.ones(201, dtype=np.float64) / 201
-        dist = DiscreteDist(x_array=x, PMF_array=pmf)
+        dist = GeometricDiscreteDist.from_x_array(x_array=x, PMF_array=pmf)
 
         # Use baseline kernel directly for extreme beta values
         result = geometric_self_convolve(
@@ -186,10 +183,10 @@ class TestGeometricConvolution:
 
 class TestFFTConvolution:
     """Test FFT convolution method."""
-    def _make_linear_dist(self, n: int = 9) -> DiscreteDist:
+    def _make_linear_dist(self, n: int = 9) -> GeneralDiscreteDist:
         x = np.linspace(-1.0, 1.0, n)
         pmf = np.ones(n, dtype=np.float64) / n
-        return DiscreteDist(x_array=x, PMF_array=pmf)
+        return GeneralDiscreteDist(x_array=x, PMF_array=pmf)
 
     def test_fft_vs_geometric_gaussian(self):
         """Compare FFT and geometric convolution on lognormal with strict tolerances."""
@@ -221,12 +218,12 @@ class TestFFTConvolution:
             bound_type=BoundType.DOMINATES
         )
 
-        result_fft = self_convolve_discrete_distributions(
+        result_fft = FFT_self_convolve(
             dist=dist_linear,
             T=2,
             tail_truncation=0.0,
             bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.FFT
+            use_direct=True,
         )
 
         # With strict parameters, mass conservation should be very tight (strict tolerance)
@@ -308,15 +305,15 @@ def test_allocation_pmf_methods_dominate(direction, method):
         """Test that FFT raises error for geometric spacing."""
         x = np.array([1.0, 2.0, 4.0])
         pmf = np.array([0.3, 0.5, 0.2], dtype=np.float64)
-        dist = DiscreteDist(x_array=x, PMF_array=pmf)
+        dist = GeometricDiscreteDist.from_x_array(x_array=x, PMF_array=pmf)
 
         with pytest.raises(ValueError, match="non-uniform bin widths"):
-            self_convolve_discrete_distributions(
+            FFT_self_convolve(
                 dist=dist,
                 T=2,
                 tail_truncation=0.0,
                 bound_type=BoundType.DOMINATES,
-                convolution_method=ConvolutionMethod.FFT
+                use_direct=True,
             )
 
     def test_fft_self_convolve_direct_vs_binary(self):
@@ -360,12 +357,12 @@ def test_allocation_pmf_methods_dominate(direction, method):
         )
 
         # T=16 should complete quickly with FFT
-        result = self_convolve_discrete_distributions(
+        result = FFT_self_convolve(
             dist=dist,
             T=16,
             tail_truncation=0.0,
             bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.FFT
+            use_direct=True,
         )
 
         # Verify mass conservation (strict tolerance - even with T=16, strict params achieve it)
@@ -390,14 +387,13 @@ class TestGeometricSpacing:
         """Test geometric convolution with geometric spacing."""
         x = np.geomspace(0.1, 10.0, 50)
         pmf = np.ones(50, dtype=np.float64) / 50
-        dist = DiscreteDist(x_array=x, PMF_array=pmf)
+        dist = GeometricDiscreteDist.from_x_array(x_array=x, PMF_array=pmf)
 
-        result = self_convolve_discrete_distributions(
+        result = geometric_self_convolve(
             dist=dist,
             T=2,
             tail_truncation=0.05,
             bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.GEOM
         )
 
         # Check result uses geometric spacing
@@ -413,7 +409,7 @@ class TestChangeSpacingType:
         """Test converting linear to geometric spacing."""
         x = np.linspace(1.0, 10.0, 50)
         pmf = np.ones(50, dtype=np.float64) / 50
-        dist = DiscreteDist(x_array=x, PMF_array=pmf)
+        dist = GeneralDiscreteDist(x_array=x, PMF_array=pmf)
 
         result = change_spacing_type(
             dist=dist,
@@ -431,7 +427,7 @@ class TestChangeSpacingType:
         """Test converting geometric to linear spacing."""
         x = np.geomspace(1.0, 10.0, 50)
         pmf = np.ones(50, dtype=np.float64) / 50
-        dist = DiscreteDist(x_array=x, PMF_array=pmf)
+        dist = GeometricDiscreteDist.from_x_array(x_array=x, PMF_array=pmf)
 
         result = change_spacing_type(
             dist=dist,
@@ -449,7 +445,7 @@ class TestChangeSpacingType:
         """Test that spacing conversion conserves mass."""
         x = np.linspace(1.0, 10.0, 100)
         pmf = np.random.dirichlet(np.ones(100)).astype(np.float64)
-        dist = DiscreteDist(x_array=x, PMF_array=pmf)
+        dist = GeneralDiscreteDist(x_array=x, PMF_array=pmf)
 
         result = change_spacing_type(
             dist=dist,

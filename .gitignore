@@ -14,6 +14,7 @@ build/
 
 # Pytest
 .pytest_cache/
+.mypy_cache/
 .coverage
 htmlcov/
 
@@ -33,3 +34,12 @@ Thumbs.db
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb_checkpoints
+
+# Planning and development tracking
+planning/
+
+# Design principles (development documentation)
+docs/DESIGN_PRINCIPLES.md
+
+# Claude Code
+.claude/

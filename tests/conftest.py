@@ -8,7 +8,7 @@ import pytest
 import numpy as np
 
 from PLD_accounting.types import PrivacyParams, AllocationSchemeConfig
-from PLD_accounting.discrete_dist import DiscreteDist
+from PLD_accounting.discrete_dist import GeneralDiscreteDist
 
 # Numba expects a writable cache directory in some environments.
 # Point numba to a workspace-local cache to avoid filesystem permission errors during tests.
@@ -47,7 +47,7 @@ def simple_uniform_dist():
     """Fixture providing simple uniform distribution for testing."""
     x = np.array([1.0, 2.0, 3.0, 4.0])
     pmf = np.array([0.25, 0.25, 0.25, 0.25], dtype=np.float64)
-    return DiscreteDist(x_array=x, PMF_array=pmf)
+    return GeneralDiscreteDist(x_array=x, PMF_array=pmf)
 
 
 @pytest.fixture

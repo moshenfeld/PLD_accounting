@@ -5,7 +5,7 @@ import math
 import numpy as np
 import pytest
 
-from PLD_accounting.discrete_dist import DiscreteDist
+from PLD_accounting.discrete_dist import GeneralDiscreteDist
 from PLD_accounting.subsample_PLD import (
     subsample_PMF,
 )
@@ -19,7 +19,7 @@ from PLD_accounting.types import (
 from PLD_accounting.random_allocation_accounting import _allocation_PMF, _compute_conv_params
 
 
-def _upper_to_lower(dist: DiscreteDist) -> DiscreteDist:
+def _upper_to_lower(dist: GeneralDiscreteDist) -> GeneralDiscreteDist:
     if dist.p_neg_inf > 0:
         raise ValueError("Expected p_neg_inf=0 for upper PLD")
     losses = dist.x_array
@@ -27,8 +27,8 @@ def _upper_to_lower(dist: DiscreteDist) -> DiscreteDist:
     lower_probs = np.zeros_like(probs)
     mask = probs > 0
     lower_probs[mask] = np.exp(np.log(probs[mask]) - losses[mask])
-    sum_prob = np.sum(lower_probs)
-    return DiscreteDist(
+    sum_prob = float(np.sum(lower_probs))
+    return GeneralDiscreteDist(
         x_array=losses,
         PMF_array=lower_probs,
         p_neg_inf=max(0.0, 1.0 - sum_prob),
@@ -36,8 +36,8 @@ def _upper_to_lower(dist: DiscreteDist) -> DiscreteDist:
     )
 
 
-def _negate_distribution(dist: DiscreteDist) -> DiscreteDist:
-    return DiscreteDist(
+def _negate_distribution(dist: GeneralDiscreteDist) -> GeneralDiscreteDist:
+    return GeneralDiscreteDist(
         x_array=-np.flip(dist.x_array),
         PMF_array=np.flip(dist.PMF_array),
         p_neg_inf=dist.p_pos_inf,

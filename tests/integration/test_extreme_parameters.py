@@ -2,17 +2,15 @@
 System tests with extreme parameters.
 
 Tests pushing boundaries: large T, small sigma, many convolutions, etc.
-Runtime: Slow (~2-5 minutes) - use pytest -m "not slow" to skip
 """
 import pytest
 import numpy as np
 from scipy import stats
 from PLD_accounting.types import BoundType, SpacingType, ConvolutionMethod
-from PLD_accounting.discrete_dist import DiscreteDist
+from PLD_accounting.discrete_dist import GeneralDiscreteDist, LinearDiscreteDist, GeometricDiscreteDist
 
-from PLD_accounting.convolution_API import (
-    self_convolve_discrete_distributions
-)
+from PLD_accounting.FFT_convolution import FFT_self_convolve
+from PLD_accounting.geometric_convolution import geometric_self_convolve
 from PLD_accounting.distribution_discretization import (
     discretize_continuous_distribution
 )
@@ -21,7 +19,6 @@ from PLD_accounting.random_allocation_accounting import numerical_allocation_eps
 from tests.test_tolerances import TestTolerances as TOL
 
 
-@pytest.mark.slow
 class TestLargeConvolutions:
     """Test with large number of convolutions."""
 
@@ -38,12 +35,12 @@ class TestLargeConvolutions:
         )
 
         # T=64 still tests large T (log2(64) = 6 convolutions), faster than T=128
-        result = self_convolve_discrete_distributions(
+        result = FFT_self_convolve(
             dist=dist,
             T=64,
             tail_truncation=0.0,
             bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.FFT
+            use_direct=True,
         )
 
         # Verify mass conservation and reasonable result
@@ -56,28 +53,25 @@ class TestLargeConvolutions:
         # but discretization and grid effects reduce observed mean significantly
         assert actual_mean > 0.5 * 64.0  # At least 50% of expected (large T amplifies discretization errors)
 
-    @pytest.mark.slow
     def test_geometric_moderate_t_geometric(self):
         """Test geometric with moderate T and geometric spacing."""
         x = np.geomspace(0.1, 100.0, 80)  # Reduced from 100 for faster runtime
         pmf = np.random.dirichlet(np.ones(80)).astype(np.float64)
-        dist = DiscreteDist(x_array=x, PMF_array=pmf)
+        dist = GeometricDiscreteDist.from_x_array(x_array=x, PMF_array=pmf)
 
         # T=16 still tests moderate T, but twice as fast as T=32
-        result = self_convolve_discrete_distributions(
+        result = geometric_self_convolve(
             dist=dist,
             T=16,
             tail_truncation=0.05,
-            bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.GEOM
-)
+            bound_type=BoundType.DOMINATES
+        )
 
         # Just check completion and mass conservation
         total = np.sum(result.PMF_array) + result.p_neg_inf + result.p_pos_inf
         assert np.isclose(total, 1.0, atol=1e-8)
 
 
-@pytest.mark.slow
 class TestHighPrecisionRequirements:
     """Test scenarios requiring high numerical precision."""
 
@@ -87,14 +81,14 @@ class TestHighPrecisionRequirements:
         x = np.linspace(0.0, 10.0, n)
         # Create many small equal masses
         pmf = np.ones(n, dtype=np.float64) / n
-        dist = DiscreteDist(x_array=x, PMF_array=pmf)
+        dist = LinearDiscreteDist.from_x_array(x_array=x, PMF_array=pmf)
 
-        result = self_convolve_discrete_distributions(
+        result = FFT_self_convolve(
             dist=dist,
             T=4,
             tail_truncation=0.0,
             bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.FFT
+            use_direct=True
         )
 
         # Mass conservation should hold despite many small values
@@ -108,21 +102,20 @@ class TestHighPrecisionRequirements:
         pmf = np.exp(-0.5 * x)
         pmf = pmf / np.sum(pmf)
         pmf = pmf.astype(np.float64)
-        dist = DiscreteDist(x_array=x, PMF_array=pmf)
+        dist = LinearDiscreteDist.from_x_array(x_array=x, PMF_array=pmf)
 
-        result = self_convolve_discrete_distributions(
+        result = FFT_self_convolve(
             dist=dist,
             T=8,
             tail_truncation=0.0,
             bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.FFT
+            use_direct=True
         )
 
         total = np.sum(result.PMF_array) + result.p_neg_inf + result.p_pos_inf
         assert np.isclose(total, 1.0, atol=1e-9)
 
 
-@pytest.mark.slow
 class TestExtremePrivacyParameters:
     """Test sampling schemes with extreme privacy parameters."""
 
@@ -229,7 +222,6 @@ class TestExtremePrivacyParameters:
         assert eps > 0
 
 
-@pytest.mark.slow
 class TestLargeGrids:
     """Test with very large grids."""
 
@@ -263,12 +255,12 @@ class TestLargeGrids:
         )
 
         # FFT should handle large grids efficiently
-        result = self_convolve_discrete_distributions(
+        result = FFT_self_convolve(
             dist=discrete_dist,
             T=8,  # Reduced from 16 for faster runtime
             tail_truncation=0.0,
             bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.FFT
+            use_direct=True,
         )
 
         # Check reasonable result
@@ -285,14 +277,14 @@ class TestStressConvolutions:
         x = np.linspace(0.0, 10.0, 101)
         pmf = np.zeros(101, dtype=np.float64)
         pmf[50] = 1.0  # Spike at x=5
-        dist = DiscreteDist(x_array=x, PMF_array=pmf)
+        dist = LinearDiscreteDist.from_x_array(x_array=x, PMF_array=pmf)
 
-        result = self_convolve_discrete_distributions(
+        result = FFT_self_convolve(
             dist=dist,
             T=3,
             tail_truncation=0.0,
             bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.FFT
+            use_direct=True
         )
 
         # Result should be concentrated around 3*5 = 15
@@ -306,14 +298,14 @@ class TestStressConvolutions:
         # Two peaks
         pmf[20] = 0.5
         pmf[80] = 0.5
-        dist = DiscreteDist(x_array=x, PMF_array=pmf)
+        dist = LinearDiscreteDist.from_x_array(x_array=x, PMF_array=pmf)
 
-        result = self_convolve_discrete_distributions(
+        result = FFT_self_convolve(
             dist=dist,
             T=2,
             tail_truncation=0.0,
             bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.FFT
+            use_direct=True
         )
 
         # Check mass conservation
@@ -325,15 +317,15 @@ class TestStressConvolutions:
         # Uniform distribution
         x = np.linspace(0.0, 1.0, 51)
         pmf = np.ones(51, dtype=np.float64) / 51
-        dist = DiscreteDist(x_array=x, PMF_array=pmf)
+        dist = LinearDiscreteDist.from_x_array(x_array=x, PMF_array=pmf)
 
         # Convolve many times - should approach Gaussian by CLT
-        result = self_convolve_discrete_distributions(
+        result = FFT_self_convolve(
             dist=dist,
             T=16,
             tail_truncation=0.0,
             bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.FFT
+            use_direct=True
         )
 
         # Mean should be T * 0.5
@@ -355,14 +347,13 @@ class TestnumericalStability:
         """Test distribution spanning wide dynamic range."""
         x = np.geomspace(1e-3, 1e3, 200)
         pmf = np.ones(200, dtype=np.float64) / 200
-        dist = DiscreteDist(x_array=x, PMF_array=pmf)
+        dist = GeometricDiscreteDist.from_x_array(x_array=x, PMF_array=pmf)
 
-        result = self_convolve_discrete_distributions(
+        result = geometric_self_convolve(
             dist=dist,
             T=4,
             tail_truncation=0.05,
-            bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.GEOM
+            bound_type=BoundType.DOMINATES
         )
 
         # Check mass conservation despite wide range
@@ -380,9 +371,8 @@ class TestnumericalStability:
         )
         config = AllocationSchemeConfig(
             loss_discretization=0.01,
-            max_grid_FFT=100000,
-            convolution_method=ConvolutionMethod.FFT
-)  # Very fine
+            max_grid_FFT=100000
+        )  # Very fine
 
         # Should complete without numerical issues
         eps = numerical_allocation_epsilon(

@@ -6,7 +6,7 @@ from dp_accounting.pld.privacy_loss_distribution import PrivacyLossDistribution
 
 from PLD_accounting.dp_accounting_support import dp_accounting_pmf_to_discrete_dist, discrete_dist_to_dp_accounting_pmf
 from PLD_accounting.types import Direction, BoundType, SpacingType
-from PLD_accounting.discrete_dist import DiscreteDist
+from PLD_accounting.discrete_dist import *
 from PLD_accounting.core_utils import stable_array_equal, enforce_mass_conservation, compute_bin_width
 from PLD_accounting.distribution_discretization import rediscritize_PMF, discretize_aligned_range
 
@@ -74,21 +74,23 @@ def subsample_PLD(
 
 
 def subsample_PMF(
-    base_pld: DiscreteDist,
+    base_pld: LinearDiscreteDist,
     sampling_prob: float,
     direction: Direction,
     bound_type: BoundType,
-) -> DiscreteDist:
-    """Apply subsampling amplification using the PLD-dual method on a DiscreteDist PMF.
+) -> LinearDiscreteDist:
+    """Apply subsampling amplification using the PLD-dual method on a discrete PMF.
 
     Args:
-        base_pld: Base privacy loss distribution as DiscreteDist
+        base_pld: Base privacy loss distribution (must be LinearDiscreteDist)
         sampling_prob: Sampling probability in (0, 1]
         direction: Direction (REMOVE or ADD)
         bound_type: Whether to compute upper bounds (DOMINATES) or lower bounds (IS_DOMINATED)
 
     Returns:
-        Subsampled privacy loss distribution as DiscreteDist
+        Subsampled privacy loss distribution.
+        For sampling_prob < 1, returns LinearDiscreteDist on the computed target grid.
+        For sampling_prob == 1, returns base_pld unchanged.
     """
     if direction not in (Direction.REMOVE, Direction.ADD):
         raise ValueError("Direction BOTH is invalid for subsampling")
@@ -166,13 +168,13 @@ def calc_subsampled_grid(
     )
 
 
-def _subsample_dist(base_pld: DiscreteDist,
+def _subsample_dist(base_pld: DiscreteDistBase,
                     sampling_prob: float,
                     direction: Direction,
                     bound_type: BoundType,
-                    target_x_array: NDArray[np.float64] = None
-                    ) -> DiscreteDist:
-    """Subsample a single DiscreteDist onto a target grid with domination semantics."""
+                    target_x_array: NDArray[np.float64] | None = None
+                    ) -> LinearDiscreteDist:
+    """Subsample a single distribution onto a linear target grid with domination semantics."""
     if target_x_array is None:
         width = compute_bin_width(base_pld.x_array)
         target_x_array = calc_subsampled_grid(
@@ -221,23 +223,23 @@ def _subsample_dist(base_pld: DiscreteDist,
         expected_pos_inf=expected_pos_inf,
         bound_type=bound_type,
     )
-    return DiscreteDist(
+    return LinearDiscreteDist.from_x_array(
         x_array=target_x_array,
         PMF_array=PMF_out,
         p_neg_inf=p_neg_inf,
-        p_pos_inf=p_pos_inf
+        p_pos_inf=p_pos_inf,
     ).validate_mass_conservation(bound_type)
 
 
 def _subsample_dist_mix(
-    base_pld: DiscreteDist,
-    ref_pld: DiscreteDist,
+    base_pld: DiscreteDistBase,
+    ref_pld: DiscreteDistBase,
     sampling_prob: float,
     direction: Direction,
     bound_type: BoundType,
     target_x_array: NDArray[np.float64] | None = None
-) -> DiscreteDist:
-    """Subsample and mix two DiscreteDist bounds on a shared target grid."""
+) -> LinearDiscreteDist:
+    """Subsample and mix two bounds on a shared linear target grid."""
     if target_x_array is None:
         base_width = compute_bin_width(base_pld.x_array)
         target_x_array = calc_subsampled_grid(
@@ -247,22 +249,13 @@ def _subsample_dist_mix(
             grid_size=sampling_prob,
             direction=direction,
         )
-        ref_endpoints = _stable_subsampling_transformation(
-            x_array=np.array([ref_pld.x_array[0], ref_pld.x_array[-1]], dtype=np.float64),
+        target_x_array = _extend_target_grid_for_reference(
+            target_x_array=target_x_array,
+            ref_pld=ref_pld,
             sampling_prob=sampling_prob,
             direction=direction,
         )
-        min_ref = np.min(ref_endpoints)
-        max_ref = np.max(ref_endpoints)
-        step = target_x_array[1] - target_x_array[0]
-        if min_ref < target_x_array[0]:
-            extra_bins = int(np.ceil((target_x_array[0] - min_ref) / step)) + 1
-            extension = target_x_array[0] - step * np.arange(extra_bins, 0, -1, dtype=np.float64)
-            target_x_array = np.concatenate([extension, target_x_array])
-        if max_ref > target_x_array[-1]:
-            extra_bins = int(np.ceil((max_ref - target_x_array[-1]) / step)) + 1
-            extension = target_x_array[-1] + step * np.arange(1, extra_bins + 1, dtype=np.float64)
-            target_x_array = np.concatenate([target_x_array, extension])
+    assert target_x_array is not None
 
     # Compute the transformed distribution of the two bounding random variables separately
     subsampled_base = _subsample_dist(
@@ -289,8 +282,37 @@ def _subsample_dist_mix(
     return mixed
 
 
-def _mix_distributions(dist_1: DiscreteDist, dist_2: DiscreteDist, weight_first: float, bound_type: BoundType) -> DiscreteDist:
-    """Mix two DiscreteDist objects on the same grid with weight_first for dist_1."""
+def _extend_target_grid_for_reference(
+    target_x_array: NDArray[np.float64],
+    ref_pld: DiscreteDistBase,
+    sampling_prob: float,
+    direction: Direction,
+) -> NDArray[np.float64]:
+    """Extend a target grid so it fully covers the transformed reference support."""
+    ref_endpoints = _stable_subsampling_transformation(
+        x_array=np.array([ref_pld.x_array[0], ref_pld.x_array[-1]], dtype=np.float64),
+        sampling_prob=sampling_prob,
+        direction=direction,
+    )
+    min_ref = np.min(ref_endpoints)
+    max_ref = np.max(ref_endpoints)
+    step = target_x_array[1] - target_x_array[0]
+
+    if min_ref < target_x_array[0]:
+        extra_bins = int(np.ceil((target_x_array[0] - min_ref) / step)) + 1
+        extension = target_x_array[0] - step * np.arange(extra_bins, 0, -1, dtype=np.float64)
+        target_x_array = np.concatenate([extension, target_x_array])
+
+    if max_ref > target_x_array[-1]:
+        extra_bins = int(np.ceil((max_ref - target_x_array[-1]) / step)) + 1
+        extension = target_x_array[-1] + step * np.arange(1, extra_bins + 1, dtype=np.float64)
+        target_x_array = np.concatenate([target_x_array, extension])
+
+    return target_x_array
+
+
+def _mix_distributions(dist_1: DiscreteDistBase, dist_2: DiscreteDistBase, weight_first: float, bound_type: BoundType) -> LinearDiscreteDist:
+    """Mix two distributions on the same grid with weight_first for dist_1."""
     if not stable_array_equal(dist_1.x_array, dist_2.x_array):
         raise ValueError("Distributions must share the same loss grid for mixing")
     if weight_first < 0 or weight_first > 1:
@@ -303,11 +325,11 @@ def _mix_distributions(dist_1: DiscreteDist, dist_2: DiscreteDist, weight_first:
         expected_pos_inf=weight_first * dist_1.p_pos_inf + (1.0 - weight_first) * dist_2.p_pos_inf,
         bound_type=bound_type,
     )
-    return DiscreteDist(
+    return LinearDiscreteDist.from_x_array(
         x_array=dist_1.x_array,
         PMF_array=mixed_probs,
         p_neg_inf=mixed_p_neg_inf,
-        p_pos_inf=mixed_p_pos_inf
+        p_pos_inf=mixed_p_pos_inf,
     ).validate_mass_conservation(bound_type)
 
 
@@ -339,8 +361,8 @@ def _stable_subsampling_transformation(
     return new_x_array if direction == Direction.REMOVE else -new_x_array
 
 
-def _calc_PLD_dual(upper: DiscreteDist) -> DiscreteDist:
-    """Compute the PLD dual Q(l)=P(l)*e^{-l} from an upper-bound DiscreteDist."""
+def _calc_PLD_dual(upper: DiscreteDistBase) -> GeneralDiscreteDist:
+    """Compute the PLD dual Q(l)=P(l)*e^{-l} from an upper-bound distribution."""
     if upper.p_neg_inf > 1e-9:
         raise ValueError(
             f"Input is not a valid upper bound PLD (p_neg_inf={upper.p_neg_inf} > 0)"
@@ -357,7 +379,7 @@ def _calc_PLD_dual(upper: DiscreteDist) -> DiscreteDist:
     sum_prob = math.fsum(map(float, lower_probs))
     p_neg_inf = max(0.0, 1.0 - sum_prob)
     # For the lower bound: p_pos_inf = 0, p_neg_inf chosen to make total mass = 1
-    return DiscreteDist(
+    return GeneralDiscreteDist(
         x_array=losses,
         PMF_array=lower_probs,
         p_neg_inf=p_neg_inf,

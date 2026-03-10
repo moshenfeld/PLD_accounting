@@ -1,7 +1,7 @@
 import numpy as np
 import pytest
 
-from PLD_accounting.discrete_dist import DiscreteDist
+from PLD_accounting.discrete_dist import GeneralDiscreteDist
 from PLD_accounting.subsample_PLD import (
     _stable_subsampling_transformation,
     calc_subsampled_grid,
@@ -10,8 +10,8 @@ from PLD_accounting.subsample_PLD import (
 from PLD_accounting.types import BoundType, Direction
 
 
-def _simple_remove_dist() -> DiscreteDist:
-    return DiscreteDist(
+def _simple_remove_dist() -> GeneralDiscreteDist:
+    return GeneralDiscreteDist(
         x_array=np.array([-1.0, -0.5, 0.0, 0.5], dtype=np.float64),
         PMF_array=np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float64),
         p_neg_inf=0.0,

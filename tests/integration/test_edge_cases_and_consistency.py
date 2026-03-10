@@ -10,17 +10,14 @@ import pytest
 import numpy as np
 from scipy import stats
 
-from PLD_accounting.types import BoundType, SpacingType, ConvolutionMethod
-from PLD_accounting.discrete_dist import DiscreteDist
-from PLD_accounting.convolution_API import (
-    self_convolve_discrete_distributions,
-    convolve_discrete_distributions
-)
+from PLD_accounting.FFT_convolution import FFT_self_convolve, FFT_convolve
+from PLD_accounting.geometric_convolution import geometric_self_convolve, geometric_convolve
+from PLD_accounting.types import BoundType, SpacingType, ConvolutionMethod, PrivacyParams, AllocationSchemeConfig, Direction
+from PLD_accounting.discrete_dist import GeneralDiscreteDist, GeometricDiscreteDist, LinearDiscreteDist
 from PLD_accounting.distribution_discretization import (
     discretize_continuous_distribution,
     change_spacing_type
 )
-from PLD_accounting.types import PrivacyParams, AllocationSchemeConfig, Direction
 from PLD_accounting.random_allocation_accounting import numerical_allocation_epsilon
 from tests.test_tolerances import TestTolerances as TOL
 
@@ -33,13 +30,13 @@ class TestEdgeCasesDistributions:
         x = np.array([1.0])
         pmf = np.array([1.0], dtype=np.float64)
         with pytest.raises(ValueError, match="at least 2 points"):
-            DiscreteDist(x_array=x, PMF_array=pmf)
+            GeneralDiscreteDist(x_array=x, PMF_array=pmf)
 
     def test_two_point_distribution(self):
         """Test minimal non-trivial distribution (2 points)."""
         x = np.array([1.0, 2.0])
         pmf = np.array([0.3, 0.7], dtype=np.float64)
-        dist = DiscreteDist(x_array=x, PMF_array=pmf)
+        dist = GeneralDiscreteDist(x_array=x, PMF_array=pmf)
 
         assert len(dist.x_array) == 2
         assert np.isclose(np.sum(dist.PMF_array), 1.0)
@@ -48,7 +45,7 @@ class TestEdgeCasesDistributions:
         """Test distribution with all mass at infinities."""
         x = np.array([0.0, 1.0])
         pmf = np.array([0.0, 0.0], dtype=np.float64)
-        dist = DiscreteDist(x_array=x, PMF_array=pmf, p_neg_inf=0.4, p_pos_inf=0.6)
+        dist = GeneralDiscreteDist(x_array=x, PMF_array=pmf, p_neg_inf=0.4, p_pos_inf=0.6)
         with pytest.raises(ValueError, match="all mass at infinity"):
             dist.validate_mass_conservation(BoundType.DOMINATES)
 
@@ -56,7 +53,7 @@ class TestEdgeCasesDistributions:
         """Test distribution with all mass at negative infinity."""
         x = np.array([0.0, 1.0])
         pmf = np.array([0.0, 0.0], dtype=np.float64)
-        dist = DiscreteDist(x_array=x, PMF_array=pmf, p_neg_inf=1.0, p_pos_inf=0.0)
+        dist = GeneralDiscreteDist(x_array=x, PMF_array=pmf, p_neg_inf=1.0, p_pos_inf=0.0)
         with pytest.raises(ValueError, match="all mass at infinity"):
             dist.validate_mass_conservation(BoundType.IS_DOMINATED)
 
@@ -64,7 +61,7 @@ class TestEdgeCasesDistributions:
         """Test distribution with all mass at positive infinity."""
         x = np.array([0.0, 1.0])
         pmf = np.array([0.0, 0.0], dtype=np.float64)
-        dist = DiscreteDist(x_array=x, PMF_array=pmf, p_neg_inf=0.0, p_pos_inf=1.0)
+        dist = GeneralDiscreteDist(x_array=x, PMF_array=pmf, p_neg_inf=0.0, p_pos_inf=1.0)
         with pytest.raises(ValueError, match="all mass at infinity"):
             dist.validate_mass_conservation(BoundType.DOMINATES)
 
@@ -74,7 +71,7 @@ class TestEdgeCasesDistributions:
         x = np.linspace(0.0, 10.0, n)
         # Create probabilities that sum to 1 but are very small individually
         pmf = np.ones(n, dtype=np.float64) / n
-        dist = DiscreteDist(x_array=x, PMF_array=pmf)
+        dist = LinearDiscreteDist.from_x_array(x_array=x, PMF_array=pmf)
 
         assert np.isclose(np.sum(dist.PMF_array), 1.0, atol=1e-10)
 
@@ -83,12 +80,11 @@ class TestEdgeCasesDistributions:
         # Smallest ratio that's still geometric
         x = np.geomspace(1.0, 1.1, 50)
         pmf = np.ones(50, dtype=np.float64) / 50
-        dist = DiscreteDist(x_array=x, PMF_array=pmf)
+        dist = GeometricDiscreteDist.from_x_array(x_array=x, PMF_array=pmf)
 
-        result = self_convolve_discrete_distributions(
+        result = geometric_self_convolve(
             dist=dist, T=2, tail_truncation=0.1,
-            bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.GEOM
+            bound_type=BoundType.DOMINATES
         )
         total = np.sum(result.PMF_array) + result.p_neg_inf + result.p_pos_inf
         assert np.isclose(total, 1.0, atol=1e-8)
@@ -106,17 +102,16 @@ class TestEdgeCasesConvolution:
         pmf_det[10] = 0.95  # Most mass in center
         pmf_det[9] = 0.025
         pmf_det[11] = 0.025
-        dist_det = DiscreteDist(x_array=x_det, PMF_array=pmf_det)
+        dist_det = LinearDiscreteDist.from_x_array(x_array=x_det, PMF_array=pmf_det)
 
         # Uniform distribution with same spacing
         x_unif = np.linspace(0.0, 20.0, 21)  # dx=1.0
         pmf_unif = np.ones(21, dtype=np.float64) / 21
-        dist_unif = DiscreteDist(x_array=x_unif, PMF_array=pmf_unif)
+        dist_unif = LinearDiscreteDist.from_x_array(x_array=x_unif, PMF_array=pmf_unif)
 
-        result = convolve_discrete_distributions(
+        result = FFT_convolve(
             dist_1=dist_unif, dist_2=dist_det,
-            tail_truncation=0.0, bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.FFT
+            tail_truncation=0.0, bound_type=BoundType.DOMINATES
         )
 
         # Mass should be conserved
@@ -125,14 +120,14 @@ class TestEdgeCasesConvolution:
 
     def test_self_convolve_t_equals_1(self):
         """Self-convolution with T=1 should return original distribution."""
-        x = np.array([1.0, 2.0, 4.0])
+        x = np.linspace(1.0, 4.0, 3)
         pmf = np.array([0.2, 0.5, 0.3], dtype=np.float64)
-        dist = DiscreteDist(x_array=x, PMF_array=pmf)
+        dist = LinearDiscreteDist.from_x_array(x_array=x, PMF_array=pmf)
 
-        result = self_convolve_discrete_distributions(
+        result = FFT_self_convolve(
             dist=dist, T=1, tail_truncation=0.1,
             bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.GEOM
+            use_direct=True
         )
 
         # Should be identical (after accounting for remapping)
@@ -147,14 +142,13 @@ class TestEdgeCasesConvolution:
             dist=dist_scipy, n_grid=100, tail_truncation=0.05,
             align_to_multiples=True,
             bound_type=BoundType.DOMINATES,
-            spacing_type=SpacingType.LINEAR
+            spacing_type=SpacingType.GEOMETRIC
         )
 
         # T=256 requires log2(256)=8 binary exponentiation steps
-        result = self_convolve_discrete_distributions(
+        result = geometric_self_convolve(
             dist=dist, T=256, tail_truncation=0.0,
-            bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.FFT
+            bound_type=BoundType.DOMINATES
         )
 
         total = np.sum(result.PMF_array) + result.p_neg_inf + result.p_pos_inf
@@ -194,16 +188,14 @@ class TestConsistencyBoundTypes:
             loss_discretization=base_config.loss_discretization,
             tail_truncation=base_config.tail_truncation,
             max_grid_FFT=base_config.max_grid_FFT,
-            max_grid_mult=base_config.max_grid_mult,
-            convolution_method=ConvolutionMethod.FFT
-)
+            max_grid_mult=base_config.max_grid_mult
+        )
         config_mult = AllocationSchemeConfig(
             loss_discretization=base_config.loss_discretization,
             tail_truncation=base_config.tail_truncation,
             max_grid_FFT=base_config.max_grid_FFT,
-            max_grid_mult=base_config.max_grid_mult,
-            convolution_method=ConvolutionMethod.GEOM
-)
+            max_grid_mult=base_config.max_grid_mult
+        )
         config_combined = AllocationSchemeConfig(
             loss_discretization=base_config.loss_discretization,
             tail_truncation=base_config.tail_truncation,
@@ -256,26 +248,26 @@ class TestConsistencyBoundTypes:
 
     def test_convolution_preserves_bound_semantics(self):
         """Test that convolution preserves bound type semantics."""
-        x = np.array([1.0, 2.0, 4.0])
+        x = np.linspace(1.0, 4.0, 3)
         pmf = np.array([0.2, 0.5, 0.3], dtype=np.float64)
-        dist = DiscreteDist(x_array=x, PMF_array=pmf, p_pos_inf=0.0)
+        dist = LinearDiscreteDist.from_x_array(x_array=x, PMF_array=pmf, p_pos_inf=0.0)
 
         # Self-convolve with DOMINATES
-        result = self_convolve_discrete_distributions(
+        result = FFT_self_convolve(
             dist=dist, T=3, tail_truncation=0.1,
             bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.GEOM
+            use_direct=True
         )
 
         # DOMINATES should have no mass at -inf
         assert result.p_neg_inf == 0.0
 
         # Create IS_DOMINATED version
-        dist_is_dom = DiscreteDist(x_array=x, PMF_array=pmf, p_neg_inf=0.0)
-        result_is_dom = self_convolve_discrete_distributions(
+        x_geom = np.geomspace(1.0, 4.0, 3)
+        dist_is_dom = GeometricDiscreteDist.from_x_array(x_array=x_geom, PMF_array=pmf, p_neg_inf=0.0)
+        result_is_dom = geometric_self_convolve(
             dist=dist_is_dom, T=3, tail_truncation=0.1,
-            bound_type=BoundType.IS_DOMINATED,
-            convolution_method=ConvolutionMethod.GEOM
+            bound_type=BoundType.IS_DOMINATED
         )
 
         # IS_DOMINATED should have no mass at +inf
@@ -289,9 +281,8 @@ class TestConsistencyMonotonicity:
         """Epsilon should decrease (better privacy) as sigma increases."""
         config = AllocationSchemeConfig(
             loss_discretization=0.02,
-            max_grid_FFT=50000,
-            convolution_method=ConvolutionMethod.FFT
-)
+            max_grid_FFT=50000
+        )
 
         sigmas = [0.5, 1.0, 2.0, 4.0]
         epsilons = []
@@ -403,16 +394,15 @@ class TestConsistencyConvolutionMethods:
         )
 
         # Convolve with both methods
-        result_fft = self_convolve_discrete_distributions(
+        result_fft = FFT_self_convolve(
             dist=dist_linear, T=4, tail_truncation=0.0,
             bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.FFT
+            use_direct=True,
         )
 
-        result_mult = self_convolve_discrete_distributions(
+        result_mult = geometric_self_convolve(
             dist=dist_geom, T=4, tail_truncation=0.0,
-            bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.GEOM
+            bound_type=BoundType.DOMINATES
         )
 
         # Both should conserve mass
@@ -434,9 +424,8 @@ class TestConsistencyConvolutionMethods:
             loss_discretization=base_config.loss_discretization,
             tail_truncation=base_config.tail_truncation,
             max_grid_FFT=base_config.max_grid_FFT,
-            max_grid_mult=base_config.max_grid_mult,
-            convolution_method=ConvolutionMethod.FFT
-)
+            max_grid_mult=base_config.max_grid_mult
+        )
         config_mult = AllocationSchemeConfig(
             loss_discretization=base_config.loss_discretization,
             tail_truncation=base_config.tail_truncation,
@@ -527,17 +516,16 @@ class TestConsistencyMassConservation:
 
     def test_mass_conservation_through_convolution_chain(self):
         """Mass should be conserved through multiple convolutions."""
-        x = np.array([1.0, 2.0, 4.0, 8.0])
+        x = np.geomspace(1.0, 8.0, 4)
         pmf = np.array([0.1, 0.3, 0.4, 0.2], dtype=np.float64)
-        dist = DiscreteDist(x_array=x, PMF_array=pmf)
+        dist = GeometricDiscreteDist.from_x_array(x_array=x, PMF_array=pmf)
 
         # Chain of convolutions
         result = dist
         for _ in range(3):
-            result = convolve_discrete_distributions(
+            result = geometric_convolve(
                 dist_1=result, dist_2=dist,
-                tail_truncation=0.1, bound_type=BoundType.DOMINATES,
-                convolution_method=ConvolutionMethod.GEOM
+                tail_truncation=0.1, bound_type=BoundType.DOMINATES
             )
 
             total = np.sum(result.PMF_array) + result.p_neg_inf + result.p_pos_inf
@@ -550,25 +538,23 @@ class TestConsistencyAssociativity:
 
     def test_self_convolution_equals_repeated_convolution(self):
         """Self-convolution T times should equal repeated binary convolutions."""
-        x = np.array([1.0, 2.0, 4.0])
+        x = np.geomspace(1.0, 4.0, 3)
         pmf = np.array([0.2, 0.5, 0.3], dtype=np.float64)
-        dist = DiscreteDist(x_array=x, PMF_array=pmf)
+        dist = GeometricDiscreteDist.from_x_array(x_array=x, PMF_array=pmf)
 
         # Self-convolution with T=4
-        result_self = self_convolve_discrete_distributions(
+        result_self = geometric_self_convolve(
             dist=dist, T=4, tail_truncation=0.0,
-            bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.GEOM
+            bound_type=BoundType.DOMINATES
         )
 
         # Repeated binary convolutions
         result_repeated = dist
         for _ in range(3):
-            result_repeated = convolve_discrete_distributions(
+            result_repeated = geometric_convolve(
                 dist_1=result_repeated, dist_2=dist,
-                tail_truncation=0.0, bound_type=BoundType.DOMINATES,
-                convolution_method=ConvolutionMethod.GEOM
-            )
+                tail_truncation=0.0, bound_type=BoundType.DOMINATES
+        )
 
         # Means should be approximately equal
         mean_self = np.sum(result_self.x_array * result_self.PMF_array)
@@ -577,25 +563,23 @@ class TestConsistencyAssociativity:
 
     def test_convolution_order_invariance(self):
         """Convolution should be commutative: dist1 * dist2 = dist2 * dist1."""
-        x1 = np.array([1.0, 2.0, 4.0])
+        x1 = np.geomspace(1.0, 4.0, 3)
         pmf1 = np.array([0.3, 0.4, 0.3], dtype=np.float64)
-        dist1 = DiscreteDist(x_array=x1, PMF_array=pmf1)
+        dist1 = GeometricDiscreteDist.from_x_array(x_array=x1, PMF_array=pmf1)
 
-        x2 = np.array([0.5, 1.0, 2.0])
+        x2 = np.geomspace(0.5, 2.0, 3)
         pmf2 = np.array([0.2, 0.6, 0.2], dtype=np.float64)
-        dist2 = DiscreteDist(x_array=x2, PMF_array=pmf2)
+        dist2 = GeometricDiscreteDist.from_x_array(x_array=x2, PMF_array=pmf2)
 
         # Convolve in both orders
-        result_12 = convolve_discrete_distributions(
+        result_12 = geometric_convolve(
             dist_1=dist1, dist_2=dist2,
-            tail_truncation=0.1, bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.GEOM
+            tail_truncation=0.1, bound_type=BoundType.DOMINATES
         )
 
-        result_21 = convolve_discrete_distributions(
+        result_21 = geometric_convolve(
             dist_1=dist2, dist_2=dist1,
-            tail_truncation=0.1, bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.GEOM
+            tail_truncation=0.1, bound_type=BoundType.DOMINATES
         )
 
         # Means should be equal (commutative property)
@@ -616,9 +600,8 @@ class TestEdgeCasesDirections:
         params = PrivacyParams(sigma=1.0, num_steps=10, num_selected=5, num_epochs=1, delta=1e-5)
         config = AllocationSchemeConfig(
             loss_discretization=0.02,
-            max_grid_FFT=50000,
-            convolution_method=ConvolutionMethod.FFT
-)
+            max_grid_FFT=50000
+        )
 
         eps_remove = numerical_allocation_epsilon(
             params=params, config=config,
@@ -637,9 +620,8 @@ class TestEdgeCasesDirections:
         """
         config = AllocationSchemeConfig(
             loss_discretization=0.025,
-            max_grid_FFT=50000,
-            convolution_method=ConvolutionMethod.FFT
-)
+            max_grid_FFT=50000
+        )
 
         # Moderate subsampling: T = floor(20/4) = 5
         params_moderate = PrivacyParams(sigma=1.0, num_steps=20, num_selected=4, num_epochs=1, delta=1e-5)
@@ -671,12 +653,12 @@ class TestNumericalStability:
         x = np.linspace(0.0, 10.0, 50)
         pmf = np.zeros(50, dtype=np.float64)
         pmf[10:20] = 0.1  # Only middle section has mass
-        dist = DiscreteDist(x_array=x, PMF_array=pmf)
+        dist = LinearDiscreteDist.from_x_array(x_array=x, PMF_array=pmf)
 
-        result = self_convolve_discrete_distributions(
+        result = FFT_self_convolve(
             dist=dist, T=2, tail_truncation=0.0,
             bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.FFT
+            use_direct=True
         )
 
         total = np.sum(result.PMF_array) + result.p_neg_inf + result.p_pos_inf
@@ -702,12 +684,11 @@ class TestNumericalStability:
         """Test distribution spanning many orders of magnitude."""
         x = np.geomspace(1e-6, 1e6, 200)
         pmf = np.ones(200, dtype=np.float64) / 200
-        dist = DiscreteDist(x_array=x, PMF_array=pmf)
+        dist = GeometricDiscreteDist.from_x_array(x_array=x, PMF_array=pmf)
 
-        result = self_convolve_discrete_distributions(
+        result = geometric_self_convolve(
             dist=dist, T=2, tail_truncation=0.1,
-            bound_type=BoundType.DOMINATES,
-            convolution_method=ConvolutionMethod.GEOM
+            bound_type=BoundType.DOMINATES
         )
 
         total = np.sum(result.PMF_array) + result.p_neg_inf + result.p_pos_inf

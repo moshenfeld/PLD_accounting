@@ -14,7 +14,7 @@ Numerical privacy accounting for random allocation and subsampling using Privacy
 ## Repository Structure
 
 - `PLD_accounting/`: core library code (types, discretization, convolution, accounting, subsampling).
-- `tests/`: unit and integration tests (including slow stress tests).
+- `tests/`: unit and integration tests.
 - `usage_example.py`: executable usage examples for common workflows.
 
 ## Requirements
@@ -108,16 +108,9 @@ From repository root:
 pytest -q
 ```
 
-Fast run (skips slow tests):
+With coverage:
 
 ```bash
-pytest -q -m "not slow"
-```
-
-Scripted runner:
-
-```bash
-./tests/run_tests.sh --fast
 ./tests/run_tests.sh --coverage
 ```
 

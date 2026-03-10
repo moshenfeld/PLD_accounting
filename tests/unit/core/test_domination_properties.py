@@ -7,15 +7,13 @@ import math
 import pytest
 import numpy as np
 from scipy import stats
+from PLD_accounting.FFT_convolution import FFT_self_convolve, FFT_convolve
+from PLD_accounting.geometric_convolution import geometric_self_convolve, geometric_convolve
 from PLD_accounting.types import BoundType, SpacingType, ConvolutionMethod, Direction
-from PLD_accounting.discrete_dist import DiscreteDist
-from PLD_accounting.convolution_API import (
-    convolve_discrete_distributions
-)
+from PLD_accounting.discrete_dist import GeneralDiscreteDist, GeometricDiscreteDist, LinearDiscreteDist
 from PLD_accounting.distribution_discretization import (
     discretize_continuous_distribution
 )
-from PLD_accounting.geometric_convolution import geometric_convolve
 from PLD_accounting.core_utils import compute_bin_width
 from PLD_accounting.subsample_PLD import (
     _mix_distributions,
@@ -167,14 +165,14 @@ class TestDominationUnderConvolution:
     def test_convolution_preserves_domination_constraint(self):
         """Test that convolution preserves infinity mass constraints."""
         # Use geometric grids with same ratio for geometric kernel
-        x1 = np.array([1.0, 2.0, 4.0])
+        x1 = np.geomspace(1.0, 4.0, 3)
         pmf1 = np.array([0.3, 0.5, 0.2], dtype=np.float64)
         # DOMINATES: p_neg_inf = 0
-        dist1 = DiscreteDist(x_array=x1, PMF_array=pmf1, p_neg_inf=0.0, p_pos_inf=0.0)
+        dist1 = GeometricDiscreteDist.from_x_array(x_array=x1, PMF_array=pmf1, p_neg_inf=0.0, p_pos_inf=0.0)
 
-        x2 = np.array([0.5, 1.0])
+        x2 = np.geomspace(0.5, 1.0, 2)
         pmf2 = np.array([0.6, 0.4], dtype=np.float64)
-        dist2 = DiscreteDist(x_array=x2, PMF_array=pmf2, p_neg_inf=0.0, p_pos_inf=0.0)
+        dist2 = GeometricDiscreteDist.from_x_array(x_array=x2, PMF_array=pmf2, p_neg_inf=0.0, p_pos_inf=0.0)
 
         result = geometric_convolve(
             dist_1=dist1,
@@ -197,7 +195,7 @@ class TestDominationUnderConvolution:
         x1 = np.geomspace(1.0, 8.0, 3)
         pmf1 = np.array([0.2, 0.5, 0.2], dtype=np.float64)
         # Invalid: DOMINATES with p_neg_inf > 0
-        dist1 = DiscreteDist(x_array=x1, PMF_array=pmf1, p_neg_inf=0.1, p_pos_inf=0.0)
+        dist1 = GeneralDiscreteDist(x_array=x1, PMF_array=pmf1, p_neg_inf=0.1, p_pos_inf=0.0)
 
         # Validation should catch the error
         with pytest.raises(ValueError, match="DOMINATES.*p_neg_inf"):
@@ -210,9 +208,9 @@ class TestRoundingBehavior:
     def test_dominates_rounds_up(self):
         """Test that DOMINATES mode rounds values up to next grid point."""
         # Create distribution with geometric grid for geometric kernel
-        x_in = np.array([1.0, 2.0, 4.0])
+        x_in = np.geomspace(1.0, 4.0, 3)
         pmf_in = np.array([0.3, 0.4, 0.3], dtype=np.float64)
-        dist_in = DiscreteDist(x_array=x_in, PMF_array=pmf_in)
+        dist_in = GeometricDiscreteDist.from_x_array(x_array=x_in, PMF_array=pmf_in)
 
         # Convolve with itself - will create intermediate values
         result = geometric_convolve(
@@ -229,9 +227,9 @@ class TestRoundingBehavior:
     def test_is_dominated_rounds_down(self):
         """Test that IS_DOMINATED mode rounds values down to previous grid point."""
         # Create distribution with geometric grid for geometric kernel
-        x_in = np.array([1.0, 2.0, 4.0])
+        x_in = np.geomspace(1.0, 4.0, 3)
         pmf_in = np.array([0.3, 0.4, 0.3], dtype=np.float64)
-        dist_in = DiscreteDist(x_array=x_in, PMF_array=pmf_in, p_pos_inf=0.0)
+        dist_in = GeometricDiscreteDist.from_x_array(x_array=x_in, PMF_array=pmf_in, p_pos_inf=0.0)
 
         result = geometric_convolve(
             dist_1=dist_in,
@@ -277,13 +275,13 @@ class TestExponentialDistribution:
         assert result.p_pos_inf == 0.0
 
 
-def _build_test_dist(x_array, pmf_array, *, p_neg_inf=0.0, p_pos_inf=0.0) -> DiscreteDist:
+def _build_test_dist(x_array, pmf_array, *, p_neg_inf=0.0, p_pos_inf=0.0) -> GeneralDiscreteDist:
     finite_mass = 1.0 - p_neg_inf - p_pos_inf
     if finite_mass <= 0.0:
         raise ValueError("Infinite masses must leave positive finite mass")
     pmf = np.array(pmf_array, dtype=np.float64)
     pmf = pmf / pmf.sum() * finite_mass
-    return DiscreteDist(
+    return GeneralDiscreteDist(
         x_array=np.array(x_array, dtype=np.float64),
         PMF_array=pmf,
         p_neg_inf=p_neg_inf,

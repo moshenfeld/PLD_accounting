@@ -12,17 +12,12 @@ import pytest
 import numpy as np
 from scipy import stats
 
+from PLD_accounting.FFT_convolution import FFT_self_convolve, FFT_convolve
+from PLD_accounting.geometric_convolution import geometric_self_convolve, geometric_convolve
 from PLD_accounting.types import BoundType, SpacingType, ConvolutionMethod
-from PLD_accounting.discrete_dist import DiscreteDist
-from PLD_accounting.convolution_API import (
-    convolve_discrete_distributions
-)
+from PLD_accounting.discrete_dist import GeometricDiscreteDist
 from PLD_accounting.distribution_discretization import (
     discretize_continuous_distribution
-)
-from PLD_accounting.geometric_convolution import (
-    geometric_convolve,
-    geometric_self_convolve
 )
 from tests.test_tolerances import TestTolerances as TOL
 
@@ -34,11 +29,11 @@ class TestOptimizedConvolution:
         """Optimized kernel should match baseline on simple distributions."""
         x1 = np.array([1.0, 2.0, 4.0])  # Geometric with ratio 2
         pmf1 = np.array([0.3, 0.5, 0.2], dtype=np.float64)
-        dist1 = DiscreteDist(x_array=x1, PMF_array=pmf1)
+        dist1 = GeometricDiscreteDist.from_x_array(x_array=x1, PMF_array=pmf1)
 
         x2 = np.array([0.5, 1.0])  # Geometric with ratio 2
         pmf2 = np.array([0.6, 0.4], dtype=np.float64)
-        dist2 = DiscreteDist(x_array=x2, PMF_array=pmf2)
+        dist2 = GeometricDiscreteDist.from_x_array(x_array=x2, PMF_array=pmf2)
 
         baseline = geometric_convolve(
             dist_1=dist1,
@@ -67,11 +62,11 @@ class TestOptimizedConvolution:
         """Optimized kernel should honor IS_DOMINATED bounds."""
         x1 = np.array([1.0, 2.0, 4.0])  # Geometric with ratio 2
         pmf1 = np.array([0.3, 0.5, 0.2], dtype=np.float64)
-        dist1 = DiscreteDist(x_array=x1, PMF_array=pmf1, p_neg_inf=0.0, p_pos_inf=0.0)
+        dist1 = GeometricDiscreteDist.from_x_array(x_array=x1, PMF_array=pmf1, p_neg_inf=0.0, p_pos_inf=0.0)
 
         x2 = np.array([0.5, 1.0])  # Geometric with ratio 2
         pmf2 = np.array([0.6, 0.4], dtype=np.float64)
-        dist2 = DiscreteDist(x_array=x2, PMF_array=pmf2, p_neg_inf=0.0, p_pos_inf=0.0)
+        dist2 = GeometricDiscreteDist.from_x_array(x_array=x2, PMF_array=pmf2, p_neg_inf=0.0, p_pos_inf=0.0)
 
         result = geometric_convolve(
             dist_1=dist1,
@@ -101,8 +96,8 @@ class TestKernelComparison:
         pmf_scaled = rng.random(n_points).astype(np.float64)
         pmf_scaled /= pmf_scaled.sum()
 
-        dist_base = DiscreteDist(x_array=x_base, PMF_array=pmf_base.astype(np.float64))
-        dist_scaled = DiscreteDist(x_array=scale * x_base, PMF_array=pmf_scaled.astype(np.float64))
+        dist_base = GeometricDiscreteDist.from_x_array(x_array=x_base, PMF_array=pmf_base.astype(np.float64))
+        dist_scaled = GeometricDiscreteDist.from_x_array(x_array=scale * x_base, PMF_array=pmf_scaled.astype(np.float64))
 
         # Compare all three kernels
         basic = geometric_convolve(
@@ -153,8 +148,8 @@ class TestImprovedScaledConvolution:
         pmf_scaled = rng.random(n_points).astype(np.float64)
         pmf_scaled /= pmf_scaled.sum()
 
-        dist_base = DiscreteDist(x_array=x_base, PMF_array=pmf_base.astype(np.float64))
-        dist_scaled = DiscreteDist(x_array=scale * x_base, PMF_array=pmf_scaled.astype(np.float64))
+        dist_base = GeometricDiscreteDist.from_x_array(x_array=x_base, PMF_array=pmf_base.astype(np.float64))
+        dist_scaled = GeometricDiscreteDist.from_x_array(x_array=scale * x_base, PMF_array=pmf_scaled.astype(np.float64))
 
         baseline = geometric_convolve(
             dist_1=dist_scaled,
@@ -189,12 +184,12 @@ class TestGeometricConvolution:
         ratio = 1.1
         x1 = ratio ** np.arange(n_points)
         pmf1 = np.ones(n_points, dtype=np.float64) / n_points
-        dist1 = DiscreteDist(x_array=x1, PMF_array=pmf1)
+        dist1 = GeometricDiscreteDist.from_x_array(x_array=x1, PMF_array=pmf1)
 
         n_points2 = 40
         x2 = 0.5 * (ratio ** np.arange(n_points2))
         pmf2 = np.ones(n_points2, dtype=np.float64) / n_points2
-        dist2 = DiscreteDist(x_array=x2, PMF_array=pmf2)
+        dist2 = GeometricDiscreteDist.from_x_array(x_array=x2, PMF_array=pmf2)
 
         result = geometric_convolve(
             dist_1=dist1,
@@ -223,8 +218,8 @@ class TestGeometricConvolution:
         pmf2 = rng.random(n_points2).astype(np.float64)
         pmf2 /= pmf2.sum()
 
-        dist1 = DiscreteDist(x_array=x1, PMF_array=pmf1.astype(np.float64))
-        dist2 = DiscreteDist(x_array=x2, PMF_array=pmf2.astype(np.float64))
+        dist1 = GeometricDiscreteDist.from_x_array(x_array=x1, PMF_array=pmf1.astype(np.float64))
+        dist2 = GeometricDiscreteDist.from_x_array(x_array=x2, PMF_array=pmf2.astype(np.float64))
 
         basic = geometric_convolve(
             dist_1=dist1, dist_2=dist2, tail_truncation=beta,
@@ -252,12 +247,12 @@ class TestGeometricConvolution:
         ratio = 1.1
         x1 = ratio ** np.arange(n_points)
         pmf1 = np.ones(n_points, dtype=np.float64) / n_points
-        dist1 = DiscreteDist(x_array=x1, PMF_array=pmf1, p_neg_inf=0.0, p_pos_inf=0.0)
+        dist1 = GeometricDiscreteDist.from_x_array(x_array=x1, PMF_array=pmf1, p_neg_inf=0.0, p_pos_inf=0.0)
 
         n_points2 = 40
         x2 = 0.5 * (ratio ** np.arange(n_points2))
         pmf2 = np.ones(n_points2, dtype=np.float64) / n_points2
-        dist2 = DiscreteDist(x_array=x2, PMF_array=pmf2, p_neg_inf=0.0, p_pos_inf=0.0)
+        dist2 = GeometricDiscreteDist.from_x_array(x_array=x2, PMF_array=pmf2, p_neg_inf=0.0, p_pos_inf=0.0)
 
         result = geometric_convolve(
             dist_1=dist1,
@@ -274,12 +269,12 @@ class TestGeometricConvolution:
         """Test that geometric requires same geometric ratio for both inputs."""
         x1 = np.geomspace(1.0, 100.0, 50)
         pmf1 = np.ones(50, dtype=np.float64) / 50
-        dist1 = DiscreteDist(x_array=x1, PMF_array=pmf1)
+        dist1 = GeometricDiscreteDist.from_x_array(x_array=x1, PMF_array=pmf1)
 
         # Different ratio
         x2 = np.geomspace(0.5, 200.0, 40)  # Different ratio
         pmf2 = np.ones(40, dtype=np.float64) / 40
-        dist2 = DiscreteDist(x_array=x2, PMF_array=pmf2)
+        dist2 = GeometricDiscreteDist.from_x_array(x_array=x2, PMF_array=pmf2)
 
         # This should raise an error due to different ratios
         with pytest.raises(ValueError, match="Grid ratios must match"):
@@ -296,10 +291,10 @@ class TestGeometricConvolution:
         x_base = np.geomspace(1.0, 100.0, n_points)
 
         pmf1 = np.ones(n_points, dtype=np.float64) / n_points
-        dist1 = DiscreteDist(x_array=x_base, PMF_array=pmf1)
+        dist1 = GeometricDiscreteDist.from_x_array(x_array=x_base, PMF_array=pmf1)
 
         pmf2 = np.ones(n_points, dtype=np.float64) / n_points
-        dist2 = DiscreteDist(x_array=x_base, PMF_array=pmf2)
+        dist2 = GeometricDiscreteDist.from_x_array(x_array=x_base, PMF_array=pmf2)
 
         result = geometric_convolve(
             dist_1=dist1,

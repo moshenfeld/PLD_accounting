@@ -1,4 +1,5 @@
 import math
+
 import numpy as np
 from numpy.typing import NDArray
 
@@ -94,14 +95,16 @@ def compute_bin_width(x_array: NDArray[np.float64]) -> float:
 
 def stable_isclose(a: float, b: float) -> bool:
     """Consistent closeness check using shared spacing tolerances."""
-    return np.isclose(a, b, rtol=SPACING_RTOL, atol=SPACING_ATOL)
+    return bool(np.isclose(a, b, rtol=SPACING_RTOL, atol=SPACING_ATOL))
 
 def stable_array_equal(a: NDArray[np.float64], b: NDArray[np.float64]) -> bool:
     """Consistent array closeness check using shared spacing tolerances."""
     return a.shape == b.shape and np.allclose(a, b, rtol=SPACING_RTOL, atol=SPACING_ATOL)
 
 def compute_bin_ratio_two_arrays(x_array_1: NDArray[np.float64], x_array_2: NDArray[np.float64]) -> float:
-    """Compute geometric spacing ratio for two grids and return their average."""
+    """
+    Compute geometric spacing ratio for two grids and return their average.
+    """
     r1 = compute_bin_ratio(x_array_1)
     r2 = compute_bin_ratio(x_array_2)
     if not stable_isclose(r1, r2):

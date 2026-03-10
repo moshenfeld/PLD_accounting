@@ -4,21 +4,21 @@ import pytest
 from PLD_accounting.FFT_convolution import FFT_convolve, FFT_self_convolve
 from PLD_accounting.geometric_convolution import geometric_convolve
 from PLD_accounting.types import BoundType
-from PLD_accounting.discrete_dist import DiscreteDist
+from PLD_accounting.discrete_dist import LinearDiscreteDist, GeometricDiscreteDist
 from PLD_accounting.utils import binary_self_convolve
 from tests.test_tolerances import TestTolerances as TOL
 
 
-def _linear_dist(n: int = 5) -> DiscreteDist:
+def _linear_dist(n: int = 5) -> LinearDiscreteDist:
     x = np.linspace(0.0, 1.0, n)
     pmf = np.ones(n, dtype=np.float64) / n
-    return DiscreteDist(x_array=x, PMF_array=pmf)
+    return LinearDiscreteDist.from_x_array(x_array=x, PMF_array=pmf)
 
 
-def _geometric_dist(n: int = 6) -> DiscreteDist:
+def _geometric_dist(n: int = 6) -> GeometricDiscreteDist:
     x = np.geomspace(0.1, 1.0, n)
     pmf = np.ones(n, dtype=np.float64) / n
-    return DiscreteDist(x_array=x, PMF_array=pmf)
+    return GeometricDiscreteDist.from_x_array(x_array=x, PMF_array=pmf)
 
 
 def test_binary_self_convolve_rejects_invalid_t():

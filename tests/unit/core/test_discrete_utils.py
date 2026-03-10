@@ -9,7 +9,7 @@ import warnings
 from scipy import stats
 from PLD_accounting.core_utils import compute_bin_width, compute_bin_ratio, enforce_mass_conservation
 from PLD_accounting.types import BoundType, SpacingType
-from PLD_accounting.discrete_dist import DiscreteDist
+from PLD_accounting.discrete_dist import GeneralDiscreteDist
 from PLD_accounting.distribution_discretization import (
     discretize_aligned_range,
     _compute_discrete_PMF as compute_discrete_PMF,
@@ -219,10 +219,10 @@ class TestPMFRemapToGrid:
 
 
 class TestCCDFComputation:
-    """Test CCDF computation from DiscreteDist."""
+    """Test CCDF computation from GeneralDiscreteDist."""
 
     def test_ccdf_from_pmf_padded(self):
-        dist = DiscreteDist(
+        dist = GeneralDiscreteDist(
             x_array=np.array([0.0, 1.0]),
             PMF_array=np.array([0.25, 0.5]),
             p_neg_inf=0.0,

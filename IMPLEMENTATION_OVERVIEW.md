@@ -1,6 +1,6 @@
 # Implementation Overview
 
-This document explains the architecture and numerical design of this repository, and how each implementation decision supports the intended privacy-bound guarantees.
+This document explains the architecture and numerical design of this repository, and how the implementation supports the intended privacy-bound guarantees.
 
 ## 1. Core Design Goals
 
@@ -108,11 +108,10 @@ The test suite checks:
 - validation and mass-conservation invariants,
 - convolution behavior and backend consistency,
 - subsampling and direction semantics,
-- edge conditions and stress scenarios (including marked slow tests).
+- edge conditions and stress scenarios.
 
-Typical commands:
+Typical command:
 
 ```bash
 pytest -q
-pytest -q -m "not slow"
 ```

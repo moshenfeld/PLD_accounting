@@ -10,7 +10,6 @@ echo ""
 
 # Parse arguments
 COVERAGE=false
-FAST_ONLY=false
 VERBOSE=""
 
 while [[ $# -gt 0 ]]; do
@@ -19,17 +18,13 @@ while [[ $# -gt 0 ]]; do
             COVERAGE=true
             shift
             ;;
-        --fast)
-            FAST_ONLY=true
-            shift
-            ;;
         -v|--verbose)
             VERBOSE="-vv"
             shift
             ;;
         *)
             echo "Unknown option: $1"
-            echo "Usage: $0 [--coverage] [--fast] [-v|--verbose]"
+            echo "Usage: $0 [--coverage] [-v|--verbose]"
             exit 1
             ;;
     esac
@@ -41,11 +36,6 @@ PYTEST_CMD="pytest $VERBOSE"
 if [ "$COVERAGE" = true ]; then
     echo "Running with coverage analysis..."
     PYTEST_CMD="$PYTEST_CMD --cov=../ --cov-report=html --cov-report=term-missing"
-fi
-
-if [ "$FAST_ONLY" = true ]; then
-    echo "Running fast tests only (skipping slow tests)..."
-    PYTEST_CMD="$PYTEST_CMD -m 'not slow'"
 fi
 
 # Run tests
