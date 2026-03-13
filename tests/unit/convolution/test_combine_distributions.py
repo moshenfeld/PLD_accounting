@@ -18,7 +18,7 @@ def test_combine_distributions_aligns_grids_dominate():
     dist_1 = _make_dist([0.0, 1.0], [0.4, 0.5], p_pos_inf=0.1)
     dist_2 = _make_dist([0.5, 1.5], [0.3, 0.6], p_pos_inf=0.1)
 
-    combined = combine_distributions(dist_1, dist_2, bound_type=BoundType.DOMINATES)
+    combined = combine_distributions(dist_1=dist_1, dist_2=dist_2, bound_type=BoundType.DOMINATES)
 
     expected_grid = np.array([0.0, 0.5, 1.0, 1.5], dtype=np.float64)
     assert np.allclose(combined.x_array, expected_grid)
@@ -33,7 +33,10 @@ def test_align_distributions_to_union_grid_preserves_mass():
     dist_1 = _make_dist([0.0, 2.0], [0.2, 0.7], p_pos_inf=0.1)
     dist_2 = _make_dist([1.0, 3.0], [0.3, 0.6], p_pos_inf=0.1)
 
-    aligned_1, aligned_2 = _align_distributions_to_union_grid(dist_1, dist_2)
+    aligned_1, aligned_2 = _align_distributions_to_union_grid(
+        dist_1=dist_1,
+        dist_2=dist_2,
+    )
     expected_grid = np.array([0.0, 1.0, 2.0, 3.0], dtype=np.float64)
     assert np.allclose(aligned_1.x_array, expected_grid)
     assert np.allclose(aligned_2.x_array, expected_grid)
@@ -46,7 +49,7 @@ def test_combine_distributions_aligns_grids_is_dominated():
     dist_1 = _make_dist([0.0, 1.0], [0.4, 0.5], p_neg_inf=0.1)
     dist_2 = _make_dist([0.5, 1.5], [0.3, 0.6], p_neg_inf=0.1)
 
-    combined = combine_distributions(dist_1, dist_2, bound_type=BoundType.IS_DOMINATED)
+    combined = combine_distributions(dist_1=dist_1, dist_2=dist_2, bound_type=BoundType.IS_DOMINATED)
 
     expected_grid = np.array([0.0, 0.5, 1.0, 1.5], dtype=np.float64)
     assert np.allclose(combined.x_array, expected_grid)

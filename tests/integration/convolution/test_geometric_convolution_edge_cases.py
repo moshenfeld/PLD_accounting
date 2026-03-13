@@ -20,7 +20,7 @@ class TestGeometricConvolutionEdgeCases:
         d1 = GeometricDiscreteDist.from_x_array(x_array=x1, PMF_array=p1)
         d2 = GeometricDiscreteDist.from_x_array(x_array=x2, PMF_array=p2)
 
-        result = geometric_convolve(d1, d2, tail_truncation=0.0, bound_type=BoundType.DOMINATES)
+        result = geometric_convolve(dist_1=d1, dist_2=d2, tail_truncation=0.0, bound_type=BoundType.DOMINATES)
         assert np.isclose(result.x_array[0], x1[0] + x2[0])
 
     def test_symmetry(self):
@@ -31,8 +31,8 @@ class TestGeometricConvolutionEdgeCases:
         d1 = GeometricDiscreteDist.from_x_array(x_array=x1, PMF_array=p1)
         d2 = GeometricDiscreteDist.from_x_array(x_array=x2, PMF_array=p2)
 
-        r12 = geometric_convolve(d1, d2, tail_truncation=0.0, bound_type=BoundType.DOMINATES)
-        r21 = geometric_convolve(d2, d1, tail_truncation=0.0, bound_type=BoundType.DOMINATES)
+        r12 = geometric_convolve(dist_1=d1, dist_2=d2, tail_truncation=0.0, bound_type=BoundType.DOMINATES)
+        r21 = geometric_convolve(dist_1=d2, dist_2=d1, tail_truncation=0.0, bound_type=BoundType.DOMINATES)
 
         assert np.allclose(r12.x_array, r21.x_array)
         assert np.allclose(r12.PMF_array, r21.PMF_array)
@@ -44,6 +44,6 @@ class TestGeometricConvolutionEdgeCases:
         d1 = GeometricDiscreteDist.from_x_array(x_array=x, PMF_array=p1)
         d2 = GeometricDiscreteDist.from_x_array(x_array=x, PMF_array=p2)
 
-        result = geometric_convolve(d1, d2, tail_truncation=0.0, bound_type=BoundType.DOMINATES)
+        result = geometric_convolve(dist_1=d1, dist_2=d2, tail_truncation=0.0, bound_type=BoundType.DOMINATES)
         assert result.p_neg_inf == 0.0
         assert result.p_pos_inf <= TOL.MASS_CONSERVATION

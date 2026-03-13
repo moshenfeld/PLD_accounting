@@ -17,11 +17,11 @@ import numpy as np
 from numpy.typing import NDArray
 from typing_extensions import Self
 
-from PLD_accounting.core_utils import (
-    PMF_MASS_TOL,
-    enforce_mass_conservation,
-)
+from PLD_accounting.distribution_utils import PMF_MASS_TOL, compute_bin_ratio, compute_bin_width, enforce_mass_conservation
 from PLD_accounting.types import BoundType
+
+MAX_SAFE_EXP_ARG = math.log(np.finfo(np.float64).max)
+REALIZATION_MOMENT_TOL = 1e-9 
 
 
 # =============================================================================
@@ -52,15 +52,21 @@ class DiscreteDistBase(ABC):
 
     @abstractmethod
     def get_x_array(self) -> NDArray[np.float64]:
-        """Return materialized support points."""
+        """
+        Return materialized support points.
+        """
 
     @abstractmethod
     def get_support_size(self) -> int:
-        """Return support size (finite bins)."""
+        """
+        Return support size (finite bins).
+        """
 
     @property
     def x_array(self) -> NDArray[np.float64]:
-        """Materialized support."""
+        """
+        Materialized support.
+        """
         return self.get_x_array()
 
     def _validate_basic(self) -> None:
@@ -76,7 +82,9 @@ class DiscreteDistBase(ABC):
             raise ValueError("p_pos_inf must be nonnegative")
 
     def validate_mass_conservation(self, bound_type: BoundType) -> Self:
-        """Validate total mass and bound semantics."""
+        """
+        Validate total mass and bound semantics.
+        """
         self._validate_basic()
 
         pmf_sum = math.fsum(map(float, self.PMF_array))
@@ -102,7 +110,9 @@ class DiscreteDistBase(ABC):
         return self
 
     def truncate_edges(self, tail_truncation: float, bound_type: BoundType) -> Self:
-        """Truncate finite tails and move truncated mass according to bound semantics."""
+        """
+        Truncate finite tails and move truncated mass according to bound semantics.
+        """
         if tail_truncation == 0.0:
             nonzero_indices = np.nonzero(self.PMF_array)[0]
             if nonzero_indices.size == 0:
@@ -168,11 +178,15 @@ class DiscreteDistBase(ABC):
         min_ind: int,
         max_ind: int,
     ) -> Self:
-        """Create truncated instance preserving representation semantics."""
+        """
+        Create truncated instance preserving representation semantics.
+        """
 
     @abstractmethod
     def copy(self) -> Self:
-        """Deep-copy this distribution while preserving representation type."""
+        """
+        Deep-copy this distribution while preserving representation type.
+        """
 
 
 # =============================================================================
@@ -181,7 +195,9 @@ class DiscreteDistBase(ABC):
 
 
 class GeneralDiscreteDist(DiscreteDistBase):
-    """General discrete distribution with explicit support values."""
+    """
+    General discrete distribution with explicit support values.
+    """
 
     def __init__(
         self,
@@ -238,7 +254,9 @@ class GeneralDiscreteDist(DiscreteDistBase):
 
 
 class LinearDiscreteDist(DiscreteDistBase):
-    """Linear grid x[i] = x_min + i * x_gap."""
+    """
+    Linear grid x[i] = x_min + i * x_gap.
+    """
 
     def __init__(
         self,
@@ -272,12 +290,7 @@ class LinearDiscreteDist(DiscreteDistBase):
 
         Returns:
             LinearDiscreteDist instance
-
-        Raises:
-            ValueError: If x_array doesn't have uniform spacing
         """
-        from PLD_accounting.core_utils import compute_bin_width
-
         x_gap = compute_bin_width(x_array)
         return cls(
             x_min=float(x_array[0]),
@@ -325,7 +338,9 @@ class LinearDiscreteDist(DiscreteDistBase):
 
 
 class GeometricDiscreteDist(DiscreteDistBase):
-    """Geometric grid x[i] = x_min * ratio^i."""
+    """
+    Geometric grid x[i] = x_min * ratio^i.
+    """
 
     def __init__(
         self,
@@ -361,12 +376,7 @@ class GeometricDiscreteDist(DiscreteDistBase):
 
         Returns:
             GeometricDiscreteDist instance
-
-        Raises:
-            ValueError: If x_array doesn't have geometric spacing
         """
-        from PLD_accounting.core_utils import compute_bin_ratio
-
         ratio = compute_bin_ratio(x_array)
         return cls(
             x_min=float(x_array[0]),
@@ -407,14 +417,92 @@ class GeometricDiscreteDist(DiscreteDistBase):
             p_pos_inf=self.p_pos_inf,
         )
 
-
 # =============================================================================
-# EXPORTS
+# PLD REALIZATION
 # =============================================================================
 
-__all__ = [
-    "DiscreteDistBase",
-    "GeneralDiscreteDist",
-    "LinearDiscreteDist",
-    "GeometricDiscreteDist",
-]
+class PLDRealization(LinearDiscreteDist):
+    """
+    Linear-grid PLD realization in loss space.
+    """
+
+    def __init__(
+        self,
+        x_min: float,
+        x_gap: float,
+        PMF_array: NDArray[np.float64],
+        p_loss_inf: float = 0.0,
+        p_loss_neg_inf: float = 0.0,
+    ) -> None:
+        super().__init__(
+            x_min=x_min,
+            x_gap=x_gap,
+            PMF_array=PMF_array,
+            p_neg_inf=float(p_loss_neg_inf),
+            p_pos_inf=float(p_loss_inf),
+        )
+        self.validate_pld_realization()
+
+    @property
+    def loss_values(self) -> NDArray[np.float64]:
+        return self.get_x_array()
+
+    @property
+    def probabilities(self) -> NDArray[np.float64]:
+        return self.PMF_array
+
+    @property
+    def p_loss_inf(self) -> float:
+        return self.p_pos_inf
+
+    @property
+    def p_loss_neg_inf(self) -> float:
+        return self.p_neg_inf
+
+    @classmethod
+    def from_linear_dist(cls, dist: LinearDiscreteDist) -> "PLDRealization":
+        """
+        Build a validated PLD realization from a linear-grid distribution.
+        """
+        if not isinstance(dist, LinearDiscreteDist):
+            raise TypeError(f"from_linear_dist requires LinearDiscreteDist, got {type(dist)}")
+        return cls(
+            x_min=dist.x_min,
+            x_gap=dist.x_gap,
+            PMF_array=dist.PMF_array,
+            p_loss_inf=dist.p_pos_inf,
+            p_loss_neg_inf=dist.p_neg_inf,
+        )
+
+    def validate_pld_realization(self) -> "PLDRealization":
+        """
+        Validate the properties of PLD-realization:
+            1. E[e^(-X)] <= 1
+            2. p(-inf) = 0
+        """
+        self.validate_mass_conservation(BoundType.DOMINATES)
+
+        if np.any(self.loss_values < -MAX_SAFE_EXP_ARG):
+            exp_moment = np.inf
+        else:
+            exp_moment = math.fsum(
+                float(p) * float(np.exp(-loss))
+                for p, loss in zip(self.probabilities, self.loss_values)
+            )
+        if not np.isfinite(exp_moment):
+            raise ValueError("Exponential moment E[exp(-L)] is infinite, not a valid PLD realization")
+        if exp_moment > 1.0 + REALIZATION_MOMENT_TOL:
+            raise ValueError(
+                f"Exponential moment E[exp(-L)] = {exp_moment:.15f} > 1.0, "
+                "not a valid PLD realization"
+            )
+        return self
+
+    def copy(self) -> "PLDRealization":
+        return PLDRealization(
+            x_min=self.x_min,
+            x_gap=self.x_gap,
+            PMF_array=self.probabilities.copy(),
+            p_loss_inf=self.p_loss_inf,
+            p_loss_neg_inf=self.p_loss_neg_inf,
+        )

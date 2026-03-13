@@ -4,10 +4,10 @@ import numpy as np
 from numba import njit
 from numpy.typing import NDArray
 
-from PLD_accounting.core_utils import *
-from PLD_accounting.discrete_dist import GeometricDiscreteDist
 from PLD_accounting.types import BoundType
-from PLD_accounting.utils import binary_self_convolve
+from PLD_accounting.discrete_dist import GeometricDiscreteDist
+from PLD_accounting.distribution_utils import compute_bin_ratio_two_arrays, enforce_mass_conservation
+from PLD_accounting.utils import binary_self_convolve, convolve_infinite_masses
 
 
 # =============================================================================
@@ -15,7 +15,7 @@ from PLD_accounting.utils import binary_self_convolve
 # =============================================================================
 
 
-def geometric_convolve(
+def geometric_convolve(*,
     dist_1: GeometricDiscreteDist,
     dist_2: GeometricDiscreteDist,
     tail_truncation: float,
@@ -24,30 +24,26 @@ def geometric_convolve(
     """
     Convolve two geometric-grid distributions.
 
-    Structure:
-    1. Validate grids share the same geometric ratio.
-    2. Delegate numeric heavy lifting to _compute_geometric_convolution.
-    3. Handle infinite mass logic (p_inf).
-    4. Construct and truncate the result.
+    Algorithm 4 (`conv`) in Appendix C wrapper.
     """
     # Ensure both inputs share the same growth factor.
-    ratio = compute_bin_ratio_two_arrays(dist_1.x_array, dist_2.x_array)
+    ratio = compute_bin_ratio_two_arrays(x_array_1=dist_1.x_array, x_array_2=dist_2.x_array)
 
     # Core Numeric Convolution
     x_out, pmf_conv = _compute_geometric_convolution(
-        dist_1.x_array,
-        dist_1.PMF_array,
-        dist_2.x_array,
-        dist_2.PMF_array,
-        ratio,
-        bound_type,
+        x1=dist_1.x_array,
+        p1=dist_1.PMF_array,
+        x2=dist_2.x_array,
+        p2=dist_2.PMF_array,
+        r=ratio,
+        bound_type=bound_type,
     )
 
     expected_neg_inf, expected_pos_inf = convolve_infinite_masses(
-        dist_1.p_neg_inf,
-        dist_1.p_pos_inf,
-        dist_2.p_neg_inf,
-        dist_2.p_pos_inf,
+        p_neg_inf_1=dist_1.p_neg_inf,
+        p_pos_inf_1=dist_1.p_pos_inf,
+        p_neg_inf_2=dist_2.p_neg_inf,
+        p_pos_inf_2=dist_2.p_pos_inf,
     )
     pmf_conv, p_neg_inf, p_pos_inf = enforce_mass_conservation(
         PMF_array=pmf_conv,
@@ -66,7 +62,7 @@ def geometric_convolve(
 
 
 
-def geometric_self_convolve(
+def geometric_self_convolve(*,
     dist: GeometricDiscreteDist,
     T: int,
     tail_truncation: float,
@@ -85,12 +81,14 @@ def geometric_self_convolve(
     if not isinstance(self_conv, GeometricDiscreteDist):
         raise TypeError(f"Expected GeometricDiscreteDist from self-convolution, got {type(self_conv)}")
     return self_conv
+
+
 # =============================================================================
 # INTERNAL KERNEL IMPLEMENTATION
 # =============================================================================
 
 
-def _compute_geometric_convolution(
+def _compute_geometric_convolution(*,
     x1: NDArray[np.float64],
     p1: NDArray[np.float64],
     x2: NDArray[np.float64],
@@ -99,7 +97,9 @@ def _compute_geometric_convolution(
     bound_type: BoundType,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """
-    Aligns grids, computes mapping parameters, and invokes the Numba kernel.
+    Align grids, compute bin mapping parameters, and invoke the Numba kernel.
+
+    Algorithm 4 (`conv`) with internal Algorithm 5 (`range-renorm`) in Appendix C.
     """
     # --- A. Standardization (Swap & Pad) ---
     # We normalize such that x_base (x1) starts at the lower value.
@@ -116,9 +116,19 @@ def _compute_geometric_convolution(
     # The Numba kernel assumes arrays of equal length 'n'.
     target_n = max(x1.size, x2.size)
     if x1.size < target_n:
-        x1, p1 = _pad_right_geometric(x1, p1, r, target_n)
+        x1, p1 = _pad_right_geometric(
+            x=x1,
+            p=p1,
+            r=r,
+            target_n=target_n,
+        )
     elif x2.size < target_n:
-        x2, p2 = _pad_right_geometric(x2, p2, r, target_n)
+        x2, p2 = _pad_right_geometric(
+            x=x2,
+            p=p2,
+            r=r,
+            target_n=target_n,
+        )
 
     # Convert to float64 for Numba compatibility
     x_base = x1.astype(np.float64, copy=False)
@@ -167,7 +177,12 @@ def _compute_geometric_convolution(
         raise ValueError(f"Unknown BoundType: {bound_type}")
 
     # --- C. Kernel Execution ---
-    pmf_out = _numba_geometric_kernel(pmf_base, pmf_scaled, delta_lohi, delta_hilo)
+    pmf_out = _numba_geometric_kernel(
+        PMF_base=pmf_base,
+        PMF_scaled=pmf_scaled,
+        delta_lohi=delta_lohi,
+        delta_hilo=delta_hilo,
+    )
 
     # Construct output X grid: x_out = x_base * (1 + scale)
     x_out = x_base * (scale + 1.0)
@@ -175,14 +190,15 @@ def _compute_geometric_convolution(
     return x_out, pmf_out
 
 
-
-def _pad_right_geometric(
+def _pad_right_geometric(*,
     x: NDArray[np.float64],
     p: NDArray[np.float64],
     r: float,
     target_n: int,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Helper: Extend grid to the right to reach target_n using ratio r."""
+    """
+    Helper: Extend grid to the right to reach target_n using ratio r.
+    """
     x = np.asarray(x, dtype=np.float64)
     p = np.asarray(p, dtype=np.float64)
     n = x.size
@@ -201,7 +217,7 @@ def _pad_right_geometric(
 
 
 @njit(cache=True)
-def _numba_geometric_kernel(
+def _numba_geometric_kernel(*,
     PMF_base: NDArray[np.float64],
     PMF_scaled: NDArray[np.float64],
     delta_lohi: NDArray[np.int64],

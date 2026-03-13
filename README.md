@@ -1,207 +1,81 @@
 # PLD_accounting
 
-Numerical privacy accounting for random allocation and subsampling using Privacy Loss Distributions (PLDs).
+`PLD_accounting` is a Python package for tight differential privacy accounting of random allocation and subsampling using Privacy Loss Distributions (PLDs) as described in: [Efficient privacy loss accounting for subsampling and random allocation](https://arxiv.org/pdf/2602.17284)
 
-## What This Repository Provides
+## Purpose
 
-- End-to-end numerical accounting for random allocation privacy guarantees.
-- Direction-aware accounting (`REMOVE`, `ADD`, or `BOTH`) with explicit upper/lower bound semantics.
-- `FFT` convolution for linearly spaced grids.
-- `GEOM` convolution for geometrically spaced positive grids.
-- Subsampling amplification directly on PLD representations.
-- Interop helpers for `dp_accounting` PMF objects.
+- Compute tight upper/lower DP bounds for random allocation.
+- Support both Gaussian mechanisms and explicit PLD realizations.
+- Return `dp_accounting` PLDs for epsilon/delta queries and composition workflows.
 
-## Repository Structure
+## Random Allocation Model
 
-- `PLD_accounting/`: core library code (types, discretization, convolution, accounting, subsampling).
-- `tests/`: unit and integration tests.
-- `usage_example.py`: executable usage examples for common workflows.
+The package accounts for the following sampling pattern:
 
-## Installation
+- Per epoch: choose `k` steps out of `t` uniformly at random.
+- Across training: repeat this for `num_epochs` epochs.
 
-### From TestPyPI (Current)
+## Parameter Mapping
 
-The package is currently available on TestPyPI:
+- `num_steps = t` (total candidate steps per epoch)
+- `num_selected = k` (selected steps per epoch)
+- `num_epochs` (number of repeated epochs)
 
-```bash
-pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple/ PLD_accounting
-```
+Internal composition:
 
-**Note**: The `--extra-index-url` ensures dependencies are installed from the main PyPI.
+- `num_steps_per_round = floor(num_steps / num_selected)`
+- `num_rounds = num_selected * num_epochs`
 
-### From PyPI (After Official Release)
+## API Overview
 
-After the official release, you can install directly:
+### Random Allocation APIs
+
+Gaussian path (most common):
+
+- `gaussian_allocation_epsilon_range(delta, sigma, num_steps, num_selected=1, num_epochs=1, epsilon_accuracy=-1.0)`
+  - Adaptive upper/lower bounds for epsilon.
+- `gaussian_allocation_delta_range(epsilon, sigma, num_steps, num_selected=1, num_epochs=1, delta_accuracy=-1.0)`
+  - Adaptive upper/lower bounds for delta.
+- `gaussian_allocation_epsilon_extended(params, config, bound_type=BoundType.DOMINATES)`
+  - Single epsilon query with explicit discretization/convolution config.
+- `gaussian_allocation_delta_extended(params, config, bound_type=BoundType.DOMINATES)`
+  - Single delta query with explicit discretization/convolution config.
+- `gaussian_allocation_PLD(params, config, bound_type=BoundType.DOMINATES)`
+  - Build a reusable `dp_accounting.PrivacyLossDistribution`.
+
+Realization path (advanced):
+
+- `general_allocation_PLD(num_steps, num_selected, num_epochs, remove_realization, add_realization, config, bound_type=BoundType.DOMINATES)`
+  - Build PLD from explicit `PLDRealization` inputs.
+- `general_allocation_epsilon(delta, num_steps, num_selected, num_epochs, remove_realization, add_realization, config, bound_type=BoundType.DOMINATES)`
+  - Epsilon query from explicit realizations.
+- `general_allocation_delta(epsilon, num_steps, num_selected, num_epochs, remove_realization, add_realization, config, bound_type=BoundType.DOMINATES)`
+  - Delta query from explicit realizations.
+
+Common notes:
+
+- `BoundType.DOMINATES` gives an upper (pessimistic) bound.
+- `BoundType.IS_DOMINATED` gives a lower (optimistic) bound.
+- Builders do not accept `BoundType.BOTH`; build two PLDs if both bounds are needed.
+
+### Subsampling APIs
+
+PLD-based subsampling helpers:
+
+- `subsample_PLD(pld, sampling_probability)`
+  - Applies subsampling amplification to a `dp_accounting` PLD.
+- `subsample_PMF(base_pld, sampling_prob, direction)`
+  - Lower-level helper for `PLDRealization` inputs (REMOVE/ADD direction).
+
+Subsampling helpers use DOMINATES semantics (upper-bound style).
+
+## Install
 
 ```bash
 pip install PLD_accounting
 ```
 
-### From Source
+## Where To Start
 
-Clone the repository and install:
-
-```bash
-git clone https://github.com/moshenfeld/PLD_accounting.git
-cd PLD_accounting
-pip install .
-```
-
-### Development Installation
-
-For local development with editable installation:
-
-```bash
-pip install -e .
-```
-
-Install with test extras:
-
-```bash
-pip install -e ".[test]"
-```
-
-Install with development dependencies:
-
-```bash
-pip install ".[dev]"
-```
-
-## Requirements
-
-- Python >= 3.10
-- numpy >= 1.23
-- scipy >= 1.10
-- numba >= 0.58
-- dp-accounting >= 0.4.3
-
-All dependencies are automatically installed with the package.
-
-## Quick Start
-
-```python
-from PLD_accounting import (
-    PrivacyParams,
-    AllocationSchemeConfig,
-    Direction,
-    BoundType,
-    numerical_allocation_epsilon,
-)
-
-params = PrivacyParams(
-    sigma=1.0,
-    num_steps=1000,
-    num_selected=10,
-    num_epochs=1,
-    delta=1e-6,
-)
-
-config = AllocationSchemeConfig(
-    loss_discretization=0.02,
-    tail_truncation=1e-8,
-    max_grid_FFT=1_000_000,
-)
-
-eps = numerical_allocation_epsilon(
-    params=params,
-    config=config,
-    direction=Direction.BOTH,
-    bound_type=BoundType.DOMINATES,
-)
-print(eps)
-```
-
-Direct import from the dedicated random-allocation API module:
-
-```python
-from PLD_accounting.random_allocation_api import (
-    allocation_PLD,
-    numerical_allocation_epsilon_range,
-    numerical_allocation_epsilon,
-)
-from PLD_accounting.types import AllocationSchemeConfig, BoundType, Direction, PrivacyParams
-
-params = PrivacyParams(
-    sigma=3.0,
-    num_steps=200,
-    num_selected=10,
-    delta=1e-6,
-)
-config = AllocationSchemeConfig(
-    loss_discretization=0.05,
-    tail_truncation=1e-7,
-)
-
-eps = numerical_allocation_epsilon(
-    params=params,
-    config=config,
-    direction=Direction.BOTH,
-    bound_type=BoundType.DOMINATES,
-)
-
-pld = allocation_PLD(
-    params=params,
-    config=config,
-    direction=Direction.BOTH,
-    bound_type=BoundType.DOMINATES,
-)
-
-epsilon_upper, epsilon_lower = numerical_allocation_epsilon_range(
-    sigma=3.0,
-    num_steps=200,
-    delta=1e-6,
-    num_selected=10,
-    epsilon_accuracy=-1,  # any negative value resolves to 10% of the Poisson guess
-)
-print(epsilon_upper, epsilon_lower)
-```
-
-## Main API
-
-- `allocation_PLD(params, config, direction, bound_type)`: returns a `dp_accounting` `PrivacyLossDistribution`.
-- `numerical_allocation_epsilon(params, config, direction, bound_type)`: computes `epsilon` for `params.delta`.
-- `numerical_allocation_delta(params, config, direction, bound_type)`: computes `delta` for `params.epsilon`.
-- `numerical_allocation_epsilon_range(sigma, num_steps, delta, ...)`: adaptively refines resolution and returns `(upper_bound, lower_bound)` for epsilon.
-- `numerical_allocation_delta_range(sigma, num_steps, epsilon, ...)`: adaptively refines resolution and returns `(upper_bound, lower_bound)` for delta.
-- `subsample_PLD(pld, sampling_probability, bound_type)`: applies subsampling amplification to an existing PLD.
-
-## Important Parameter Notes
-
-- `sigma` must be positive and finite.
-- `tail_truncation` must be in `(0, 1)`.
-- `loss_discretization` controls the accuracy/runtime tradeoff; smaller values are tighter but slower and larger-memory.
-- `max_grid_FFT` and `max_grid_mult` cap grid sizes; too-small budgets can invalidate a run.
-- `bound_type=DOMINATES` is pessimistic (upper bound), `IS_DOMINATED` is optimistic (lower bound).
-- Adaptive queries treat any negative `target_accuracy` as a convenience default:
-  - epsilon query: `target_accuracy = 0.10 *` Poisson-estimated epsilon
-  - delta query: `target_accuracy = 0.10 *` Poisson-estimated delta
-- Adaptive initialization now starts from a Poisson-subsampled Gaussian guess with:
-  - sampling probability `num_selected / num_steps`
-  - composition count `num_selected * num_epochs`
-
-## Running Tests
-
-From repository root:
-
-```bash
-pytest -q
-```
-
-With coverage:
-
-```bash
-./tests/run_tests.sh --coverage
-```
-
-Build a wheel/sdist:
-
-```bash
-python -m build
-```
-
-## Examples
-
-- `usage_example.py` includes direct epsilon queries.
-- `usage_example.py` includes PLD construction and repeated epsilon lookups.
-- `usage_example.py` includes adaptive random-allocation queries through `PLD_accounting.random_allocation_api`.
-- `usage_example.py` includes a subsampling + composition workflow.
+- Usage examples: [usage_example.py](usage_example.py)
+- Implementation details: [IMPLEMENTATION_OVERVIEW.md](IMPLEMENTATION_OVERVIEW.md)
