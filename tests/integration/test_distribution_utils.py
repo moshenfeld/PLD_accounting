@@ -1,10 +1,10 @@
 """
-Integration tests for core_utils refactor.
+Integration tests for distribution_utils.
 """
 import numpy as np
 import pytest
 
-from PLD_accounting.core_utils import (
+from PLD_accounting.distribution_utils import (
     SPACING_RTOL,
     SPACING_ATOL,
     compute_bin_ratio,
@@ -17,7 +17,7 @@ import math
 
 
 class TestCoreUtils:
-    """Integration tests for core_utils behavior."""
+    """Integration tests for distribution_utils behavior."""
 
     def test_compute_bin_ratio_geometric(self):
         ratio = 1.5
@@ -50,7 +50,7 @@ class TestCoreUtils:
     def test_enforce_mass_conservation_dominates(self):
         pmf = np.array([0.2, 0.3], dtype=np.float64)
         pmf_out, p_neg_inf, p_pos_inf = enforce_mass_conservation(
-            pmf, expected_neg_inf=0.0, expected_pos_inf=0.0, bound_type=BoundType.DOMINATES
+            PMF_array=pmf, expected_neg_inf=0.0, expected_pos_inf=0.0, bound_type=BoundType.DOMINATES
         )
         assert p_neg_inf == 0.0
         assert np.isclose(p_pos_inf, 0.5)
@@ -59,7 +59,7 @@ class TestCoreUtils:
     def test_enforce_mass_conservation_is_dominated(self):
         pmf = np.array([0.2, 0.3], dtype=np.float64)
         pmf_out, p_neg_inf, p_pos_inf = enforce_mass_conservation(
-            pmf, expected_neg_inf=0.0, expected_pos_inf=0.0, bound_type=BoundType.IS_DOMINATED
+            PMF_array=pmf, expected_neg_inf=0.0, expected_pos_inf=0.0, bound_type=BoundType.IS_DOMINATED
         )
         assert p_pos_inf == 0.0
         assert np.isclose(p_neg_inf, 0.5)
@@ -71,7 +71,7 @@ class TestCoreUtils:
         assert pmf_sum > 1.0 + PMF_MASS_TOL, "Test setup error: PMF should sum to > 1.0"
 
         pmf_out, p_neg_inf, p_pos_inf = enforce_mass_conservation(
-            pmf.copy(), expected_neg_inf=0.0, expected_pos_inf=0.0, bound_type=BoundType.DOMINATES
+            PMF_array=pmf.copy(), expected_neg_inf=0.0, expected_pos_inf=0.0, bound_type=BoundType.DOMINATES
         )
         total = math.fsum(map(float, pmf_out)) + p_neg_inf + p_pos_inf
         assert total <= 1.0 + PMF_MASS_TOL
@@ -81,7 +81,7 @@ class TestCoreUtils:
         excess = 1e-12
         pmf = np.array([0.2, 0.3, 0.5 + excess], dtype=np.float64)
         pmf_out, p_neg_inf, p_pos_inf = enforce_mass_conservation(
-            pmf.copy(), expected_neg_inf=0.0, expected_pos_inf=0.0, bound_type=BoundType.DOMINATES
+            PMF_array=pmf.copy(), expected_neg_inf=0.0, expected_pos_inf=0.0, bound_type=BoundType.DOMINATES
         )
         assert p_neg_inf == 0.0
         assert p_pos_inf >= 0.0
@@ -95,7 +95,7 @@ class TestCoreUtils:
         excess = 1e-12
         pmf = np.array([0.2 + excess, 0.3, 0.5], dtype=np.float64)
         pmf_out, p_neg_inf, p_pos_inf = enforce_mass_conservation(
-            pmf.copy(), expected_neg_inf=0.0, expected_pos_inf=0.0, bound_type=BoundType.IS_DOMINATED
+            PMF_array=pmf.copy(), expected_neg_inf=0.0, expected_pos_inf=0.0, bound_type=BoundType.IS_DOMINATED
         )
         assert p_pos_inf == 0.0
         assert p_neg_inf >= 0.0

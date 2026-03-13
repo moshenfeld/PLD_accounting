@@ -14,13 +14,13 @@ from PLD_accounting.discrete_dist import GeneralDiscreteDist, GeometricDiscreteD
 from PLD_accounting.distribution_discretization import (
     discretize_continuous_distribution
 )
-from PLD_accounting.core_utils import compute_bin_width
+from PLD_accounting.distribution_utils import compute_bin_width
 from PLD_accounting.subsample_PLD import (
     _mix_distributions,
+    _calc_subsampled_grid,
     _stable_subsampling_transformation,
     _subsample_dist,
     _subsample_dist_mix,
-    calc_subsampled_grid,
 )
 from tests.test_tolerances import TestTolerances as TOL
 
@@ -296,21 +296,19 @@ class TestSubsampleDistMix:
     _REF_PMF = np.array([0.15, 0.2, 0.25, 0.2, 0.1, 0.1], dtype=np.float64)
 
     @pytest.mark.parametrize(
-        "bound_type, base_inf, ref_inf",
+        "base_inf, ref_inf",
         [
             (
-                BoundType.DOMINATES,
                 {"p_neg_inf": 0.0, "p_pos_inf": 0.05},
                 {"p_neg_inf": 0.0, "p_pos_inf": 0.03},
             ),
             (
-                BoundType.IS_DOMINATED,
                 {"p_neg_inf": 0.04, "p_pos_inf": 0.0},
                 {"p_neg_inf": 0.02, "p_pos_inf": 0.0},
             ),
         ],
     )
-    def test_matches_sequential_discretization(self, bound_type, base_inf, ref_inf):
+    def test_matches_sequential_discretization(self, base_inf, ref_inf):
         sampling_prob = 0.37
         direction = Direction.REMOVE
         base_dist = _build_test_dist(self._BASE_X, self._BASE_PMF, **base_inf)
@@ -318,31 +316,27 @@ class TestSubsampleDistMix:
 
         result = _subsample_dist_mix(
             base_pld=base_dist,
-            ref_pld=ref_dist,
+            neg_dual_pld=ref_dist,
             sampling_prob=sampling_prob,
             direction=direction,
-            bound_type=bound_type,
         )
 
         base_subsampled = _subsample_dist(
             base_pld=base_dist,
             sampling_prob=sampling_prob,
             direction=direction,
-            bound_type=bound_type,
             target_x_array=result.x_array,
         )
         ref_subsampled = _subsample_dist(
             base_pld=ref_dist,
             sampling_prob=sampling_prob,
             direction=direction,
-            bound_type=bound_type,
             target_x_array=result.x_array,
         )
         coupled = _mix_distributions(
             dist_1=base_subsampled,
             dist_2=ref_subsampled,
             weight_first=sampling_prob,
-            bound_type=bound_type,
         )
 
         np.testing.assert_allclose(result.x_array, coupled.x_array, rtol=1e-12, atol=0.0)
@@ -358,10 +352,9 @@ class TestSubsampleDistMix:
 
         result = _subsample_dist_mix(
             base_pld=base_dist,
-            ref_pld=ref_dist,
+            neg_dual_pld=ref_dist,
             sampling_prob=sampling_prob,
             direction=direction,
-            bound_type=BoundType.DOMINATES,
         )
 
         base_endpoints = _stable_subsampling_transformation(
@@ -393,7 +386,7 @@ class TestSubsampleDistMix:
         direction = Direction.REMOVE
         base_dist = _build_test_dist(self._BASE_X, self._BASE_PMF, p_neg_inf=0.0, p_pos_inf=0.0)
         ref_dist = _build_test_dist(self._REF_X, self._REF_PMF, p_neg_inf=0.0, p_pos_inf=0.0)
-        target_grid = calc_subsampled_grid(
+        target_grid = _calc_subsampled_grid(
             lower_loss=base_dist.x_array[0],
             discretization=compute_bin_width(base_dist.x_array),
             num_buckets=int(base_dist.x_array.size),
@@ -403,10 +396,9 @@ class TestSubsampleDistMix:
 
         result = _subsample_dist_mix(
             base_pld=base_dist,
-            ref_pld=ref_dist,
+            neg_dual_pld=ref_dist,
             sampling_prob=sampling_prob,
             direction=direction,
-            bound_type=BoundType.DOMINATES,
             target_x_array=target_grid,
         )
 

@@ -1,4 +1,6 @@
-"""Adaptive helpers for random-allocation queries."""
+"""
+Adaptive helpers for random-allocation queries.
+"""
 
 from __future__ import annotations
 
@@ -22,31 +24,10 @@ MIN_TAIL_TRUNCATION = 1e-20
 MAX_TAIL_TRUNCATION = 1e-4
 
 
-def _clip_discretization(value: float) -> float:
-    return min(max(value, MIN_DISCRETIZATION), MAX_DISCRETIZATION)
-
-
-def _clip_tail_truncation(value: float) -> float:
-    return min(max(value, MIN_TAIL_TRUNCATION), MAX_TAIL_TRUNCATION)
-
-
-def _apply_refinement_step(
-    *,
-    discretization: float,
-    tail_truncation: float,
-) -> tuple[float, float, bool]:
-    next_discretization = _clip_discretization(discretization / 2)
-    next_tail_truncation = _clip_tail_truncation(tail_truncation / 10)
-    changed = (
-        next_discretization != discretization
-        or next_tail_truncation != tail_truncation
-    )
-    return next_discretization, next_tail_truncation, changed
-
-
 @dataclass
 class AdaptiveResult:
-    """Result from adaptive allocation computation.
+    """
+    Result from adaptive allocation computation.
 
     Attributes:
         upper_bound: Best upper bound found across all iterations.
@@ -71,79 +52,11 @@ class AdaptiveResult:
     tail_truncation: float
     target_accuracy: float
 
+# =============================================================================
+# Public Adaptive API
+# =============================================================================
 
-def estimate_poisson_query(
-    params: PrivacyParams,
-    query_func: Callable[[privacy_loss_distribution.PrivacyLossDistribution], float],
-) -> float:
-    """Estimate the query value with a Poisson-subsampled Gaussian approximation."""
-    sampling_probability = params.num_selected / params.num_steps
-    compose_steps = params.num_selected * params.num_epochs
-
-    pld = privacy_loss_distribution.from_gaussian_mechanism(
-        standard_deviation=params.sigma,
-        sensitivity=1.0,
-        value_discretization_interval=POISSON_GUESS_DISCRETIZATION,
-        pessimistic_estimate=True,
-        sampling_prob=sampling_probability,
-    ).self_compose(compose_steps)
-
-    estimate = float(query_func(pld))
-    if not math.isfinite(estimate) or estimate < 0.0:
-        raise RuntimeError(
-            "Poisson-based adaptive initialization produced an invalid estimate: "
-            f"{estimate!r}"
-        )
-    return estimate
-
-
-def _auto_target_accuracy(
-    *,
-    target_accuracy: float,
-    estimated_value: float,
-) -> tuple[float, bool]:
-    if target_accuracy >= 0.0:
-        if not math.isfinite(target_accuracy):
-            raise RuntimeError(
-                "Adaptive refinement received an invalid target accuracy: "
-                f"{target_accuracy!r}"
-            )
-        return float(target_accuracy), False
-
-    auto_target_accuracy = 0.10 * estimated_value
-    if not math.isfinite(auto_target_accuracy) or auto_target_accuracy < 0.0:
-        raise RuntimeError(
-            "Adaptive refinement produced an invalid automatic target accuracy: "
-            f"{auto_target_accuracy!r}"
-        )
-    return auto_target_accuracy, True
-
-
-def _build_pld_pair(
-    *,
-    params: PrivacyParams,
-    config: AllocationSchemeConfig,
-    pld_builder: Callable[..., privacy_loss_distribution.PrivacyLossDistribution],
-) -> tuple[
-    privacy_loss_distribution.PrivacyLossDistribution,
-    privacy_loss_distribution.PrivacyLossDistribution,
-]:
-    pld_upper = pld_builder(
-        params=params,
-        config=config,
-        direction=Direction.BOTH,
-        bound_type=BoundType.DOMINATES,
-    )
-    pld_lower = pld_builder(
-        params=params,
-        config=config,
-        direction=Direction.BOTH,
-        bound_type=BoundType.IS_DOMINATED,
-    )
-    return pld_upper, pld_lower
-
-
-def adaptive_epsilon_convergence(
+def optimize_allocation_epsilon_range(*,
     params: PrivacyParams,
     target_accuracy: float,
     pld_builder: Callable[..., privacy_loss_distribution.PrivacyLossDistribution],
@@ -152,7 +65,7 @@ def adaptive_epsilon_convergence(
 ) -> AdaptiveResult:
     """Fixed-schedule adaptive refinement for epsilon bounds."""
     if params.delta is None:
-        raise ValueError("adaptive_epsilon_convergence requires params.delta")
+        raise ValueError("optimize_allocation_epsilon_range requires params.delta")
     delta = params.delta
 
     estimated_epsilon = None
@@ -252,7 +165,7 @@ def adaptive_epsilon_convergence(
     )
 
 
-def adaptive_delta_convergence(
+def optimize_allocation_delta_range(*,
     params: PrivacyParams,
     target_accuracy: float,
     pld_builder: Callable[..., privacy_loss_distribution.PrivacyLossDistribution],
@@ -261,7 +174,7 @@ def adaptive_delta_convergence(
 ) -> AdaptiveResult:
     """Fixed-schedule adaptive refinement for delta bounds."""
     if params.epsilon is None:
-        raise ValueError("adaptive_delta_convergence requires params.epsilon")
+        raise ValueError("optimize_allocation_delta_range requires params.epsilon")
     epsilon = params.epsilon
 
     estimated_delta = None
@@ -359,3 +272,93 @@ def adaptive_delta_convergence(
         tail_truncation=tail_truncation,
         target_accuracy=target_accuracy,
     )
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+def estimate_poisson_query(*,
+    params: PrivacyParams,
+    query_func: Callable[[privacy_loss_distribution.PrivacyLossDistribution], float],
+) -> float:
+    """Estimate the query value with a Poisson-subsampled Gaussian approximation."""
+    sampling_probability = params.num_selected / params.num_steps
+    num_rounds = params.num_selected * params.num_epochs
+
+    pld = privacy_loss_distribution.from_gaussian_mechanism(
+        standard_deviation=params.sigma,
+        sensitivity=1.0,
+        value_discretization_interval=POISSON_GUESS_DISCRETIZATION,
+        pessimistic_estimate=True,
+        sampling_prob=sampling_probability,
+    ).self_compose(num_rounds)
+
+    estimate = float(query_func(pld))
+    if not math.isfinite(estimate) or estimate < 0.0:
+        raise RuntimeError(
+            "Poisson-based adaptive initialization produced an invalid estimate: "
+            f"{estimate!r}"
+        )
+    return estimate
+
+
+def _clip_discretization(value: float) -> float:
+    return min(max(value, MIN_DISCRETIZATION), MAX_DISCRETIZATION)
+
+
+def _clip_tail_truncation(value: float) -> float:
+    return min(max(value, MIN_TAIL_TRUNCATION), MAX_TAIL_TRUNCATION)
+
+
+def _apply_refinement_step(*,
+    discretization: float,
+    tail_truncation: float,
+) -> tuple[float, float, bool]:
+    next_discretization = _clip_discretization(discretization / 2)
+    next_tail_truncation = _clip_tail_truncation(tail_truncation / 10)
+    changed = (
+        next_discretization != discretization
+        or next_tail_truncation != tail_truncation
+    )
+    return next_discretization, next_tail_truncation, changed
+
+def _auto_target_accuracy(*,
+    target_accuracy: float,
+    estimated_value: float,
+) -> tuple[float, bool]:
+    if target_accuracy >= 0.0:
+        if not math.isfinite(target_accuracy):
+            raise RuntimeError(
+                "Adaptive refinement received an invalid target accuracy: "
+                f"{target_accuracy!r}"
+            )
+        return float(target_accuracy), False
+
+    auto_target_accuracy = 0.10 * estimated_value
+    if not math.isfinite(auto_target_accuracy) or auto_target_accuracy < 0.0:
+        raise RuntimeError(
+            "Adaptive refinement produced an invalid automatic target accuracy: "
+            f"{auto_target_accuracy!r}"
+        )
+    return auto_target_accuracy, True
+
+
+def _build_pld_pair(*,
+    params: PrivacyParams,
+    config: AllocationSchemeConfig,
+    pld_builder: Callable[..., privacy_loss_distribution.PrivacyLossDistribution],
+) -> tuple[
+    privacy_loss_distribution.PrivacyLossDistribution,
+    privacy_loss_distribution.PrivacyLossDistribution,
+]:
+    pld_upper = pld_builder(
+        params=params,
+        config=config,
+        bound_type=BoundType.DOMINATES,
+    )
+    pld_lower = pld_builder(
+        params=params,
+        config=config,
+        bound_type=BoundType.IS_DOMINATED,
+    )
+    return pld_upper, pld_lower

@@ -7,7 +7,7 @@ import pytest
 import numpy as np
 import warnings
 from scipy import stats
-from PLD_accounting.core_utils import compute_bin_width, compute_bin_ratio, enforce_mass_conservation
+from PLD_accounting.distribution_utils import compute_bin_width, compute_bin_ratio, enforce_mass_conservation
 from PLD_accounting.types import BoundType, SpacingType
 from PLD_accounting.discrete_dist import GeneralDiscreteDist
 from PLD_accounting.distribution_discretization import (
@@ -199,7 +199,7 @@ class TestPMFRemapToGrid:
 
         pmf_out = pmf_remap_to_grid_kernel(x_in, pmf_in, x_out, dominates=True)
         _, _, ppos = enforce_mass_conservation(
-            pmf_out, expected_neg_inf=0.0, expected_pos_inf=0.0, bound_type=BoundType.DOMINATES
+            PMF_array=pmf_out, expected_neg_inf=0.0, expected_pos_inf=0.0, bound_type=BoundType.DOMINATES
         )
         assert ppos >= 0.3
 
@@ -212,7 +212,7 @@ class TestPMFRemapToGrid:
         pmf_out = pmf_remap_to_grid_kernel(x_in, pmf_in, x_out, dominates=True)
         total_in = np.sum(pmf_in)
         pmf_out, pneg, ppos = enforce_mass_conservation(
-            pmf_out, expected_neg_inf=0.0, expected_pos_inf=0.0, bound_type=BoundType.DOMINATES
+            PMF_array=pmf_out, expected_neg_inf=0.0, expected_pos_inf=0.0, bound_type=BoundType.DOMINATES
         )
         total_out = np.sum(pmf_out) + pneg + ppos
         assert np.isclose(total_in, total_out, atol=TOL.MASS_CONSERVATION)

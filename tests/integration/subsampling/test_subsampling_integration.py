@@ -5,7 +5,7 @@ import math
 import numpy as np
 import pytest
 
-from PLD_accounting.discrete_dist import GeneralDiscreteDist
+from PLD_accounting.discrete_dist import GeneralDiscreteDist, LinearDiscreteDist, PLDRealization
 from PLD_accounting.subsample_PLD import (
     subsample_PMF,
 )
@@ -16,7 +16,7 @@ from PLD_accounting.types import (
     Direction,
     PrivacyParams,
 )
-from PLD_accounting.random_allocation_accounting import allocation_PMF, compute_conv_params
+from PLD_accounting.random_allocation_gaussian import allocation_PMF_from_gaussian, compute_conv_params
 
 
 def _upper_to_lower(dist: GeneralDiscreteDist) -> GeneralDiscreteDist:
@@ -42,6 +42,16 @@ def _negate_distribution(dist: GeneralDiscreteDist) -> GeneralDiscreteDist:
         PMF_array=np.flip(dist.PMF_array),
         p_neg_inf=dist.p_pos_inf,
         p_pos_inf=dist.p_neg_inf,
+    )
+
+
+def _as_realization(dist: LinearDiscreteDist) -> PLDRealization:
+    return PLDRealization(
+        x_min=dist.x_min,
+        x_gap=dist.x_gap,
+        PMF_array=dist.PMF_array,
+        p_loss_inf=dist.p_pos_inf,
+        p_loss_neg_inf=dist.p_neg_inf,
     )
 
 
@@ -72,7 +82,7 @@ class TestPLDDualRealisticScenarios:
         )
 
         conv_params = compute_conv_params(params=params, config=config)
-        remove_upper = allocation_PMF(
+        remove_upper = allocation_PMF_from_gaussian(
             conv_params=conv_params,
             direction=Direction.REMOVE,
             bound_type=BoundType.DOMINATES,
@@ -80,10 +90,9 @@ class TestPLDDualRealisticScenarios:
         )
 
         subsampled = subsample_PMF(
-            base_pld=remove_upper,
+            base_pld=_as_realization(remove_upper),
             sampling_prob=0.01,
             direction=Direction.REMOVE,
-            bound_type=BoundType.DOMINATES,
         )
 
         total_mass = np.sum(subsampled.PMF_array) + subsampled.p_neg_inf + subsampled.p_pos_inf
@@ -107,7 +116,7 @@ class TestPLDDualRealisticScenarios:
         )
 
         conv_params = compute_conv_params(params=params, config=config)
-        add_upper = allocation_PMF(
+        add_upper = allocation_PMF_from_gaussian(
             conv_params=conv_params,
             direction=Direction.ADD,
             bound_type=BoundType.DOMINATES,
@@ -115,10 +124,9 @@ class TestPLDDualRealisticScenarios:
         )
 
         subsampled = subsample_PMF(
-            base_pld=add_upper,
+            base_pld=_as_realization(add_upper),
             sampling_prob=0.01,
             direction=Direction.ADD,
-            bound_type=BoundType.DOMINATES,
         )
 
         total_mass = np.sum(subsampled.PMF_array) + subsampled.p_neg_inf + subsampled.p_pos_inf
@@ -145,7 +153,7 @@ class TestPLDDualRealisticScenarios:
         conv_params = compute_conv_params(params=params, config=config)
 
         for direction in [Direction.REMOVE, Direction.ADD]:
-            upper = allocation_PMF(
+            upper = allocation_PMF_from_gaussian(
                 conv_params=conv_params,
                 direction=direction,
                 bound_type=BoundType.DOMINATES,
@@ -153,10 +161,9 @@ class TestPLDDualRealisticScenarios:
             )
 
             subsampled = subsample_PMF(
-                base_pld=upper,
+                base_pld=_as_realization(upper),
                 sampling_prob=sampling_prob,
                 direction=direction,
-                bound_type=BoundType.DOMINATES,
             )
 
             total_mass = np.sum(subsampled.PMF_array) + subsampled.p_neg_inf + subsampled.p_pos_inf

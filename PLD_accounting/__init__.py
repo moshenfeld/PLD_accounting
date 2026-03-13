@@ -1,13 +1,23 @@
-"""Public entry points for random-allocation privacy accounting."""
+"""
+Public entry points for random-allocation privacy accounting.
+"""
 
+from PLD_accounting.discrete_dist import PLDRealization
 from PLD_accounting.random_allocation_api import (
-    allocation_PLD,
-    numerical_allocation_delta_range,
-    numerical_allocation_delta,
-    numerical_allocation_epsilon_range,
-    numerical_allocation_epsilon,
+    gaussian_allocation_PLD,
+    general_allocation_PLD,
+    gaussian_allocation_delta_range,
+    gaussian_allocation_delta_extended,
+    gaussian_allocation_epsilon_range,
+    gaussian_allocation_epsilon_extended,
+    general_allocation_delta,
+    general_allocation_epsilon,
 )
-from PLD_accounting.random_allocation_accounting import allocation_PMF, compute_conv_params
+from PLD_accounting.random_allocation_gaussian import (
+    allocation_PMF_from_gaussian,
+    compute_conv_params,
+)
+from PLD_accounting.random_allocation_accounting import allocation_PMF_from_realization
 from PLD_accounting.subsample_PLD import subsample_PLD, subsample_PMF
 from PLD_accounting.types import (
     AllocationSchemeConfig,
@@ -17,21 +27,3 @@ from PLD_accounting.types import (
     PrivacyParams,
     SpacingType,
 )
-
-__all__ = [
-    "AllocationSchemeConfig",
-    "BoundType",
-    "ConvolutionMethod",
-    "Direction",
-    "PrivacyParams",
-    "SpacingType",
-    "allocation_PMF",
-    "allocation_PLD",
-    "compute_conv_params",
-    "numerical_allocation_delta_range",
-    "numerical_allocation_delta",
-    "numerical_allocation_epsilon_range",
-    "numerical_allocation_epsilon",
-    "subsample_PLD",
-    "subsample_PMF",
-]

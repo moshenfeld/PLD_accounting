@@ -8,41 +8,38 @@ import numpy as np
 
 from dp_accounting.pld.pld_pmf import DensePLDPmf, PLDPmf, SparsePLDPmf
 
-from PLD_accounting.discrete_dist import LinearDiscreteDist
+from PLD_accounting.discrete_dist import LinearDiscreteDist, PLDRealization
 
 
 # ============================================================================
-# Translation Functions: discrete distributions <-> dp_accounting
+# Translation Functions: PLD realizations <-> dp_accounting
 # ============================================================================
 
-def discrete_dist_to_dp_accounting_pmf(dist: LinearDiscreteDist, pessimistic_estimate: bool = True) -> DensePLDPmf:
-    """Convert a dense linear discrete distribution to dp_accounting PMF.
+def linear_dist_to_dp_accounting_pmf(*,
+    dist: LinearDiscreteDist,
+    pessimistic_estimate: bool = True,
+) -> DensePLDPmf:
+    """Convert a linear-grid loss PMF to a dp_accounting PMF.
 
     Args:
-        dist: Must be LinearDiscreteDist
+        dist: Linear-grid loss distribution compatible with dp_accounting
         pessimistic_estimate: Whether to use pessimistic estimate in dp_accounting
 
-    Returns:
-        DensePLDPmf object
-
-    Raises:
-        TypeError: If dist is not a LinearDiscreteDist
-
     Notes:
-        - Infinity masses are handled via p_pos_inf
+        - Infinity mass is handled via p_pos_inf / p_loss_inf
         - The dp_accounting library requires uniformly-spaced linear grids
-        - x_min must be aligned to x_gap multiples
+        - `loss_values[0]` must be aligned to the spacing multiples
     """
     if not isinstance(dist, LinearDiscreteDist):
         raise TypeError(
-            f"discrete_dist_to_dp_accounting_pmf requires LinearDiscreteDist, got {type(dist)}. "
+            f"linear_dist_to_dp_accounting_pmf requires LinearDiscreteDist, got {type(dist)}. "
             f"The dp_accounting library requires uniformly-spaced linear grids. "
             f"Use change_spacing_type() to convert to linear if needed."
         )
 
     base_index = int(np.rint(dist.x_min / dist.x_gap))
     if not np.isclose(base_index * dist.x_gap, dist.x_min, atol=1e-12, rtol=1e-8):
-        raise ValueError("LinearDiscreteDist x_min is not aligned to x_gap multiples")
+        raise ValueError("PLDRealization x_min is not aligned to x_gap multiples")
     return DensePLDPmf(
         discretization=dist.x_gap,
         lower_loss=base_index,
@@ -52,14 +49,14 @@ def discrete_dist_to_dp_accounting_pmf(dist: LinearDiscreteDist, pessimistic_est
     )
 
 
-
-def dp_accounting_pmf_to_discrete_dist(pmf: PLDPmf) -> LinearDiscreteDist:
-    """Convert dp_accounting PMF to a dense linear distribution.
+def dp_accounting_pmf_to_pld_realization(pmf: PLDPmf) -> PLDRealization:
+    """
+    Convert dp_accounting PMF to a linear-grid PLD realization.
 
     Notes:
-        - Infinity mass from dp_accounting becomes p_pos_inf in returned distribution
-        - p_neg_inf is set to 0 (not used in privacy loss distributions)
-        - SparsePLDPmf inputs are densified to LinearDiscreteDist
+        - Infinity mass from dp_accounting becomes p_loss_inf in the returned realization
+        - p_loss_neg_inf is set to 0 because dp_accounting PLDs are PLD realizations
+        - SparsePLDPmf inputs are densified to PLDRealization
     """
 
     # Extract dense loss grid and probabilities from PMF
@@ -70,12 +67,12 @@ def dp_accounting_pmf_to_discrete_dist(pmf: PLDPmf) -> LinearDiscreteDist:
         if sum_probs > 0.0:
             probs = probs * (finite_target / sum_probs)
 
-        return LinearDiscreteDist(
+        return PLDRealization(
             x_min=float(pmf._lower_loss) * pmf._discretization,
             x_gap=pmf._discretization,
             PMF_array=probs,
-            p_neg_inf=0.0,
-            p_pos_inf=pmf._infinity_mass,
+            p_loss_inf=pmf._infinity_mass,
+            p_loss_neg_inf=0.0,
         )
     elif isinstance(pmf, SparsePLDPmf):
         loss_probs = pmf._loss_probs.copy()
@@ -100,12 +97,12 @@ def dp_accounting_pmf_to_discrete_dist(pmf: PLDPmf) -> LinearDiscreteDist:
         for idx, prob in zip(loss_indices, probs_sparse):
             probs_dense[int(idx - min_index)] = float(prob)
 
-        return LinearDiscreteDist(
+        return PLDRealization(
             x_min=float(min_index) * pmf._discretization,
             x_gap=pmf._discretization,
             PMF_array=probs_dense,
-            p_neg_inf=0.0,
-            p_pos_inf=pmf._infinity_mass,
+            p_loss_inf=pmf._infinity_mass,
+            p_loss_neg_inf=0.0,
         )
     else:
         raise AttributeError(f"Unrecognized PMF format: {type(pmf)}. Expected DensePLDPmf or SparsePLDPmf.")

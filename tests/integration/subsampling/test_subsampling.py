@@ -13,10 +13,10 @@ from dp_accounting.pld import privacy_loss_distribution
 
 from PLD_accounting.subsample_PLD import (
     subsample_PMF,
-    _calc_PLD_dual,
 )
-from PLD_accounting.discrete_dist import GeneralDiscreteDist
-from PLD_accounting.types import Direction, BoundType
+from PLD_accounting.discrete_dist import GeneralDiscreteDist, LinearDiscreteDist, PLDRealization
+from PLD_accounting.utils import calc_pld_dual, negate_reverse_linear_distribution
+from PLD_accounting.types import Direction
 from tests.integration.subsampling.analytic_gaussian import gaussian_pld
 
 
@@ -97,41 +97,90 @@ def _negate_distribution(dist: GeneralDiscreteDist) -> GeneralDiscreteDist:
     )
 
 
-class TestPLDDualTransformation:
-    """Tests for the PLD dual transformation Q(l) = P(l) * e^{-l}."""
+def _as_realization(dist: LinearDiscreteDist) -> PLDRealization:
+    return PLDRealization(
+        x_min=dist.x_min,
+        x_gap=dist.x_gap,
+        PMF_array=dist.PMF_array,
+        p_loss_inf=dist.p_pos_inf,
+        p_loss_neg_inf=dist.p_neg_inf,
+    )
 
-    def test_upper_to_lower_basic(self):
+
+def _realization_from_loss_values(
+    loss_values: np.ndarray,
+    probabilities: np.ndarray,
+    p_loss_inf: float = 0.0,
+    p_loss_neg_inf: float = 0.0,
+) -> PLDRealization:
+    return _as_realization(
+        LinearDiscreteDist.from_x_array(
+            x_array=loss_values,
+            PMF_array=probabilities,
+            p_neg_inf=p_loss_neg_inf,
+            p_pos_inf=p_loss_inf,
+        )
+    )
+
+
+class TestPLDDualTransformation:
+    """Tests for PLD dual extraction and explicit negation."""
+
+    def test_calc_pld_dual_matches_paper_definition(self):
         losses = np.array([0.0, 0.5, 1.0, 1.5, 2.0])
         probs = np.array([0.1, 0.2, 0.3, 0.25, 0.1])
 
-        upper = GeneralDiscreteDist(
-            x_array=losses,
-            PMF_array=probs,
-            p_neg_inf=0.0,
-            p_pos_inf=0.05
+        upper = _realization_from_loss_values(
+            loss_values=losses,
+            probabilities=probs,
+            p_loss_inf=0.05,
         )
 
-        lower = _calc_PLD_dual(upper)
+        dual = calc_pld_dual(upper)
 
-        expected_lower = probs * np.exp(-losses)
-        assert np.allclose(lower.PMF_array, expected_lower, rtol=1e-10)
+        # Paper Definition 3.1 defines D(L) on the negated support with a +inf atom.
+        paper_dual_losses = -losses[::-1]
+        paper_dual_probs = probs[::-1] * np.exp(-losses[::-1])
+        paper_dual_p_pos_inf = 1.0 - float(np.sum(paper_dual_probs))
 
-        total_mass = np.sum(lower.PMF_array) + lower.p_neg_inf + lower.p_pos_inf
+        assert np.allclose(dual.x_array, paper_dual_losses, rtol=1e-12, atol=1e-12)
+        assert np.allclose(dual.PMF_array, paper_dual_probs, rtol=1e-12, atol=1e-12)
+        assert dual.p_pos_inf == pytest.approx(paper_dual_p_pos_inf, abs=1e-12)
+        assert dual.p_neg_inf == pytest.approx(0.0, abs=1e-12)
+
+        # External remove-direction code explicitly negates to get aligned -D(L).
+        dual_negated = negate_reverse_linear_distribution(dual)
+        assert np.allclose(dual_negated.x_array, losses, rtol=1e-12, atol=1e-12)
+        assert np.allclose(dual_negated.PMF_array, probs * np.exp(-losses), rtol=1e-12, atol=1e-12)
+        assert dual_negated.p_neg_inf == pytest.approx(paper_dual_p_pos_inf, abs=1e-12)
+        assert dual_negated.p_pos_inf == pytest.approx(0.0, abs=1e-12)
+
+    def test_dual_mass_conservation_basic(self):
+        losses = np.array([0.0, 0.5, 1.0, 1.5, 2.0])
+        probs = np.array([0.1, 0.2, 0.3, 0.25, 0.1])
+        upper = _realization_from_loss_values(
+            loss_values=losses,
+            probabilities=probs,
+            p_loss_inf=0.05,
+        )
+
+        dual = calc_pld_dual(upper)
+        total_mass = np.sum(dual.PMF_array) + dual.p_neg_inf + dual.p_pos_inf
         assert abs(total_mass - 1.0) < 1e-9
-        assert lower.p_pos_inf == 0.0
+        assert dual.p_neg_inf == 0.0
 
-    def test_upper_to_lower_rejects_invalid_upper(self):
-        invalid_upper = GeneralDiscreteDist(
+    def test_calc_pld_dual_rejects_non_realization_input(self):
+        invalid_upper = LinearDiscreteDist.from_x_array(
             x_array=np.array([0.0, 1.0]),
             PMF_array=np.array([0.5, 0.4]),
             p_neg_inf=0.1,
-            p_pos_inf=0.0
+            p_pos_inf=0.0,
         )
 
-        with pytest.raises(ValueError, match="not a valid upper bound"):
-            _calc_PLD_dual(invalid_upper)
+        with pytest.raises(TypeError, match="requires PLDRealization"):
+            calc_pld_dual(invalid_upper)
 
-    def test_upper_to_lower_mass_conservation(self):
+    def test_calc_pld_dual_mass_conservation(self):
         test_cases = [
             (np.array([0.0, 1.0, 2.0]), np.array([0.3, 0.5, 0.15]), 0.05),
             (np.linspace(0, 3, 20), np.ones(20) / 21.0, 0.01),
@@ -139,15 +188,16 @@ class TestPLDDualTransformation:
         ]
 
         for losses, probs, p_pos_inf in test_cases:
-            upper = GeneralDiscreteDist(
-                x_array=losses,
-                PMF_array=probs,
-                p_neg_inf=0.0,
-                p_pos_inf=p_pos_inf
+            finite_target = 1.0 - p_pos_inf
+            probs = probs / np.sum(probs) * finite_target
+            upper = _realization_from_loss_values(
+                loss_values=losses,
+                probabilities=probs,
+                p_loss_inf=p_pos_inf,
             )
 
-            lower = _calc_PLD_dual(upper)
-            total_mass = np.sum(lower.PMF_array) + lower.p_neg_inf + lower.p_pos_inf
+            dual = calc_pld_dual(upper)
+            total_mass = np.sum(dual.PMF_array) + dual.p_neg_inf + dual.p_pos_inf
             assert abs(total_mass - 1.0) < 1e-9
 
 
@@ -161,18 +211,16 @@ class TestSubsampleDistDual:
         dual_sum = np.sum(probs * np.exp(-losses))
         assert dual_sum <= 1.0
 
-        base_dist = GeneralDiscreteDist(
-            x_array=losses,
-            PMF_array=probs,
-            p_neg_inf=0.0,
-            p_pos_inf=0.05
+        base_dist = _realization_from_loss_values(
+            loss_values=losses,
+            probabilities=probs,
+            p_loss_inf=0.05,
         )
 
         subsampled = subsample_PMF(
             base_pld=base_dist,
             sampling_prob=0.5,
             direction=Direction.REMOVE,
-            bound_type=BoundType.DOMINATES
         )
 
         total_mass = (
@@ -185,18 +233,16 @@ class TestSubsampleDistDual:
 
     def test_subsample_PMF_mass_conservation_add(self):
         losses = np.linspace(0.0, 3.0, 50)
-        add_upper = GeneralDiscreteDist(
-            x_array=-losses[::-1],
-            PMF_array=np.ones(50)[::-1] / 52.0,
-            p_neg_inf=0.02,
-            p_pos_inf=0.0
+        add_upper = _realization_from_loss_values(
+            loss_values=losses,
+            probabilities=np.full(50, 0.98 / 50.0),
+            p_loss_inf=0.02,
         )
 
         subsampled = subsample_PMF(
             base_pld=add_upper,
             sampling_prob=0.4,
             direction=Direction.ADD,
-            bound_type=BoundType.IS_DOMINATED
         )
 
         total_mass = (
@@ -210,34 +256,20 @@ class TestSubsampleDistDual:
     @pytest.mark.parametrize("sampling_prob", [0.01, 0.1, 0.5, 0.8])
     @pytest.mark.parametrize("direction", [Direction.REMOVE, Direction.ADD])
     def test_subsample_PMF_various_params(self, sampling_prob, direction):
-        if direction == Direction.REMOVE:
-            losses = np.linspace(0.0, 3.0, 30)
-            dist = GeneralDiscreteDist(
-                x_array=losses,
-                PMF_array=np.ones(30) / 32.0,
-                p_neg_inf=0.0,
-                p_pos_inf=0.02
-            )
-            bound_type = BoundType.DOMINATES
-        else:
-            losses = np.linspace(0.0, 3.0, 30)
-            dist = GeneralDiscreteDist(
-                x_array=-losses[::-1],
-                PMF_array=np.ones(30)[::-1] / 32.0,
-                p_neg_inf=0.02,
-                p_pos_inf=0.0
-            )
-            bound_type = BoundType.IS_DOMINATED
+        losses = np.linspace(0.0, 3.0, 30)
+        dist = _realization_from_loss_values(
+            loss_values=losses,
+            probabilities=np.full(30, 0.98 / 30.0),
+            p_loss_inf=0.02,
+        )
 
         subsampled = subsample_PMF(
             base_pld=dist,
             sampling_prob=sampling_prob,
             direction=direction,
-            bound_type=bound_type,
         )
 
         total_mass = np.sum(subsampled.PMF_array) + subsampled.p_neg_inf + subsampled.p_pos_inf
         assert abs(total_mass - 1.0) < 1e-6
 
         assert np.sum(subsampled.PMF_array > 1e-10) > 0
-

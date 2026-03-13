@@ -3,20 +3,18 @@ from numba import njit
 from numpy.typing import NDArray
 from scipy import stats
 
-from PLD_accounting.core_utils import enforce_mass_conservation
-from PLD_accounting.discrete_dist import *
-from PLD_accounting.utils import (
-    exp_linear_to_geometric,
-    log_geometric_to_linear,
-)
+from PLD_accounting.distribution_utils import enforce_mass_conservation
+from PLD_accounting.discrete_dist import DiscreteDistBase, GeometricDiscreteDist, LinearDiscreteDist
 from PLD_accounting.types import BoundType, SpacingType
 
-# =============================================================================
-# Continuous distribution discretization
-# =============================================================================
 TAIL_SWITCH = 1e-10
 MIN_GRID_SIZE = 100
-def discretize_continuous_distribution(
+
+# =============================================================================
+# Public API: Continuous Distribution Discretization
+# =============================================================================
+
+def discretize_continuous_distribution(*,
     dist: stats.rv_continuous,
     tail_truncation: float,
     bound_type: BoundType,
@@ -46,44 +44,7 @@ def discretize_continuous_distribution(
         spacing_type=spacing_type,
     )
 
-def _discretize_continuous_to_grid(
-    dist: stats.rv_continuous,
-    tail_truncation: float,
-    spacing_type: SpacingType,
-    n_grid: int,
-    align_to_multiples: bool,
-) -> NDArray[np.float64]:
-    """
-    Generate grid covering the quantile range defined by tail_truncation.
-    """
-    if n_grid <= 0:
-        raise ValueError(
-            "n_grid must be positive"
-        )
-
-    # Determine support bounds via quantiles
-    x_min = dist.ppf(tail_truncation)
-    x_max = dist.isf(tail_truncation)
-    if not np.isfinite(x_min) or not np.isfinite(x_max):
-        raise ValueError(f"Quantiles not finite: x_min={x_min}, x_max={x_max}")
-
-    x_array = discretize_aligned_range(
-        x_min=x_min,
-        x_max=x_max,
-        spacing_type=spacing_type,
-        align_to_multiples=align_to_multiples,
-        n_grid=n_grid,
-    )
-    # Truncate grid to stay strictly within the distribution's support
-    support_min, support_max = dist.support()
-    if np.isfinite(support_min):
-        x_array = x_array[x_array > support_min]
-    if np.isfinite(support_max):
-        x_array = x_array[x_array < support_max]
-    return x_array
-
-
-def discretize_continuous_to_pmf(
+def discretize_continuous_to_pmf(*,
     dist: stats.rv_continuous,
     x_array: NDArray[np.float64],
     bound_type: BoundType,
@@ -140,7 +101,7 @@ def discretize_continuous_to_pmf(
 
     raise ValueError(f"Invalid spacing_type: {spacing_type}")
 
-def discretize_aligned_range(
+def discretize_aligned_range(*,
     x_min: float,
     x_max: float,
     spacing_type: SpacingType,
@@ -161,7 +122,7 @@ def discretize_aligned_range(
         raise ValueError(f"x_max must be greater than x_min, got x_min={x_min}, x_max={x_max}")
     if spacing_type == SpacingType.GEOMETRIC and x_min <= 0:
         raise ValueError(f"Geometric spacing requires positive values, got x_min={x_min}, x_max={x_max}")
-    
+
     # Compute missing parameter
     if n_grid is not None:
         if n_grid < MIN_GRID_SIZE:
@@ -196,134 +157,22 @@ def discretize_aligned_range(
             n_grid = int(np.ceil((x_max - x_min) / discretization)) + 1
         return x_min + discretization * np.arange(n_grid, dtype=np.float64)
 
-@njit(cache=True)
-def _adaptive_bins_from_cdf(cdf: NDArray[np.float64], tail_truncation: float) -> NDArray[np.float64]:
-    """Adaptive binning from CDF with mass accumulation.
-
-    Accumulates mass from CDF increments until threshold is reached, then assigns
-    accumulated mass to current bin. All mass is conserved - no mass is discarded.
-    """
-    n = cdf.size
-    bin_probs = np.zeros(n - 1, dtype=np.float64)
-    accumulated_mass = 0.0
-    last_assignment_cdf = cdf[0]
-
-    for i in range(n - 1):
-        # Current increment in CDF
-        current_increment = cdf[i + 1] - cdf[i]
-        accumulated_mass += current_increment
-
-        if accumulated_mass >= tail_truncation:
-            # Assign accumulated mass to this bin
-            bin_probs[i] = accumulated_mass
-            accumulated_mass = 0.0
-            last_assignment_cdf = cdf[i + 1]
-
-    # Assign any remaining accumulated mass to the last bin
-    if accumulated_mass > 0.0:
-        bin_probs[n - 2] += accumulated_mass
-
-    return bin_probs
-
-
-@njit(cache=True)
-def _adaptive_bins_from_sf(sf: NDArray[np.float64], tail_truncation: float) -> NDArray[np.float64]:
-    """Adaptive binning from survival function with mass accumulation.
-
-    Accumulates mass from SF increments until threshold is reached, then assigns
-    accumulated mass to current bin. All mass is conserved - no mass is discarded.
-    Processes from right to left (high to low x values).
-    """
-    n = sf.size
-    bin_probs = np.zeros(n - 1, dtype=np.float64)
-    accumulated_mass = 0.0
-    last_assignment_sf = sf[-1]
-
-    for i in range(n - 2, -1, -1):
-        # Current increment in SF (going backwards)
-        current_increment = sf[i] - sf[i + 1]
-        accumulated_mass += current_increment
-
-        if accumulated_mass >= tail_truncation:
-            # Assign accumulated mass to this bin
-            bin_probs[i] = accumulated_mass
-            accumulated_mass = 0.0
-            last_assignment_sf = sf[i]
-
-    # Assign any remaining accumulated mass to the first bin
-    if accumulated_mass > 0.0:
-        bin_probs[0] += accumulated_mass
-
-    return bin_probs
-
-def _stable_cdf_and_sf(dist: stats.rv_continuous,
-                       x_array: NDArray[np.float64]) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    median = dist.median()
-    cdf = np.empty_like(x_array, dtype=np.float64)
-    sf = np.empty_like(x_array, dtype=np.float64)
-
-    mask_left = x_array < median
-    if np.any(mask_left):
-        logcdf_vals = dist.logcdf(x_array[mask_left])
-        cdf[mask_left] = np.exp(logcdf_vals)
-        sf[mask_left] = -np.expm1(logcdf_vals)
-
-    mask_right = ~mask_left
-    if np.any(mask_right):
-        logsf_vals = dist.logsf(x_array[mask_right])
-        sf[mask_right] = np.exp(logsf_vals)
-        cdf[mask_right] = -np.expm1(logsf_vals)
-
-    cdf = np.clip(cdf, 0.0, 1.0)
-    sf = np.clip(sf, 0.0, 1.0)
-    return cdf, sf
-
-
-def _compute_discrete_PMF(
-    dist: stats.rv_continuous,
-    x_array: NDArray[np.float64],
+def change_spacing_type(*,
+    dist: DiscreteDistBase,
+    tail_truncation: float,
+    loss_discretization: float,
+    spacing_type: SpacingType,
     bound_type: BoundType,
-    PMF_min_increment: float
-) -> tuple[NDArray[np.float64], float, float]:
-    """
-    Compute bin probabilities using adaptive CDF/SF increments with logcdf/logsf stability.
-    PMF_min_increment controls the minimum CDF/SF increment that becomes a bin mass.
-    """
-    cdf, sf = _stable_cdf_and_sf(dist, x_array)
-    p_left = cdf[0]
-    p_right = sf[-1]
-    PMF_min_increment = max(0.0, PMF_min_increment)
-
-    if bound_type == BoundType.DOMINATES:
-        # Suppress intermediate debug logging.
-        bin_probs = _adaptive_bins_from_cdf(cdf, PMF_min_increment)
-    elif bound_type == BoundType.IS_DOMINATED:
-        # Suppress intermediate debug logging.
-        bin_probs = _adaptive_bins_from_sf(sf, PMF_min_increment)
-    else:
-        raise ValueError(f"Unknown BoundType: {bound_type}")
-
-    return bin_probs, p_left, p_right
-
-# =============================================================================
-# Change spacing type of discrete distributions
-# =============================================================================
-
-def change_spacing_type(dist: DiscreteDistBase,
-                        tail_truncation: float,
-                        loss_discretization: float,
-                        spacing_type: SpacingType,
-                        bound_type: BoundType) -> LinearDiscreteDist | GeometricDiscreteDist:
-    """Convert distribution to different grid spacing (linear ↔ geometric).
+) -> LinearDiscreteDist | GeometricDiscreteDist:
+    """Convert distribution fixed grid spacing (linear or geometric).
 
     Remaps PMF onto a new grid with the requested spacing and discretization.
     Implementation trims zero/tail regions, computes new grid size, then remaps
     using domination-aware rounding (e.g., linear grids for dp_accounting output).
 
-    Returns:
-        Dense linear distribution if spacing_type is LINEAR,
-        Dense geometric distribution if spacing_type is GEOMETRIC.
+    Algorithm 6 (`disc-dist`) in Appendix C.
     """
+    # Quantile-truncation 
     trunc_dist = dist.copy().truncate_edges(
         tail_truncation=tail_truncation / 2,
         bound_type=bound_type
@@ -332,6 +181,7 @@ def change_spacing_type(dist: DiscreteDistBase,
     x_array = trunc_dist.x_array
     x_min = x_array[0]
     x_max = x_array[-1]
+
     x_array_out = discretize_aligned_range(
         x_min=x_min,
         x_max=x_max,
@@ -339,11 +189,13 @@ def change_spacing_type(dist: DiscreteDistBase,
         align_to_multiples=True,
         discretization=loss_discretization,
     )
+
     PMF_out = rediscritize_PMF(
         x_array=x_array,
         PMF_array=trunc_dist.PMF_array,
         x_array_out=x_array_out,
         dominates=(bound_type == BoundType.DOMINATES))
+
     PMF_out, p_neg_inf, p_pos_inf = enforce_mass_conservation(
         PMF_array=PMF_out,
         expected_neg_inf=dist.p_neg_inf,
@@ -368,13 +220,15 @@ def change_spacing_type(dist: DiscreteDistBase,
         ).validate_mass_conservation(bound_type)
 
     raise ValueError(f"Invalid spacing_type: {spacing_type}")
+
 @njit(cache=True)
-def rediscritize_PMF(x_array: NDArray[np.float64],
-                  PMF_array: NDArray[np.float64],
-                  x_array_out: NDArray[np.float64],
-                  dominates: bool,
-                  tail_truncation: float = 0.0
-                  ) -> NDArray[np.float64]:
+def rediscritize_PMF(
+    x_array: NDArray[np.float64],
+    PMF_array: NDArray[np.float64],
+    x_array_out: NDArray[np.float64],
+    dominates: bool,
+    tail_truncation: float = 0.0,
+) -> NDArray[np.float64]:
     """Remap PMF onto new grid with domination-aware rounding.
 
     Maps each probability mass to output grid position based on domination semantics.
@@ -437,3 +291,169 @@ def rediscritize_PMF(x_array: NDArray[np.float64],
                 PMF_out[idx] = t
 
     return PMF_out
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+def _discretize_continuous_to_grid(*,
+    dist: stats.rv_continuous,
+    tail_truncation: float,
+    spacing_type: SpacingType,
+    n_grid: int,
+    align_to_multiples: bool,
+) -> NDArray[np.float64]:
+    """
+    Generate grid covering the quantile range defined by tail_truncation.
+    """
+    if n_grid <= 0:
+        raise ValueError(
+            "n_grid must be positive"
+        )
+
+    # Determine support bounds via quantiles
+    x_min = dist.ppf(tail_truncation)
+    x_max = dist.isf(tail_truncation)
+    if not np.isfinite(x_min) or not np.isfinite(x_max):
+        raise ValueError(f"Quantiles not finite: x_min={x_min}, x_max={x_max}")
+
+    x_array = discretize_aligned_range(
+        x_min=x_min,
+        x_max=x_max,
+        spacing_type=spacing_type,
+        align_to_multiples=align_to_multiples,
+        n_grid=n_grid,
+    )
+    # Truncate grid to stay strictly within the distribution's support
+    support_min, support_max = dist.support()
+    if np.isfinite(support_min):
+        x_array = x_array[x_array > support_min]
+    if np.isfinite(support_max):
+        x_array = x_array[x_array < support_max]
+    return x_array
+
+@njit(cache=True)
+def _adaptive_bins_from_cdf(*,
+    cdf: NDArray[np.float64],
+    tail_truncation: float,
+) -> NDArray[np.float64]:
+    """Adaptive binning from CDF with mass accumulation.
+
+    Accumulates mass from CDF increments until threshold is reached, then assigns
+    accumulated mass to current bin. All mass is conserved - no mass is discarded.
+    """
+    n = cdf.size
+    bin_probs = np.zeros(n - 1, dtype=np.float64)
+    accumulated_mass = 0.0
+    last_assignment_cdf = cdf[0]
+
+    for i in range(n - 1):
+        # Current increment in CDF
+        current_increment = cdf[i + 1] - cdf[i]
+        accumulated_mass += current_increment
+
+        if accumulated_mass >= tail_truncation:
+            # Assign accumulated mass to this bin
+            bin_probs[i] = accumulated_mass
+            accumulated_mass = 0.0
+            last_assignment_cdf = cdf[i + 1]
+
+    # Assign any remaining accumulated mass to the last bin
+    if accumulated_mass > 0.0:
+        bin_probs[n - 2] += accumulated_mass
+
+    return bin_probs
+
+
+@njit(cache=True)
+def _adaptive_bins_from_sf(*,
+    sf: NDArray[np.float64],
+    tail_truncation: float,
+) -> NDArray[np.float64]:
+    """Adaptive binning from survival function with mass accumulation.
+
+    Accumulates mass from SF increments until threshold is reached, then assigns
+    accumulated mass to current bin. All mass is conserved - no mass is discarded.
+    Processes from right to left (high to low x values).
+    """
+    n = sf.size
+    bin_probs = np.zeros(n - 1, dtype=np.float64)
+    accumulated_mass = 0.0
+    last_assignment_sf = sf[-1]
+
+    for i in range(n - 2, -1, -1):
+        # Current increment in SF (going backwards)
+        current_increment = sf[i] - sf[i + 1]
+        accumulated_mass += current_increment
+
+        if accumulated_mass >= tail_truncation:
+            # Assign accumulated mass to this bin
+            bin_probs[i] = accumulated_mass
+            accumulated_mass = 0.0
+            last_assignment_sf = sf[i]
+
+    # Assign any remaining accumulated mass to the first bin
+    if accumulated_mass > 0.0:
+        bin_probs[0] += accumulated_mass
+
+    return bin_probs
+
+def _stable_cdf_and_sf(*,
+    dist: stats.rv_continuous,
+    x_array: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    median = dist.median()
+    cdf = np.empty_like(x_array, dtype=np.float64)
+    sf = np.empty_like(x_array, dtype=np.float64)
+
+    mask_left = x_array < median
+    if np.any(mask_left):
+        logcdf_vals = dist.logcdf(x_array[mask_left])
+        cdf[mask_left] = np.exp(logcdf_vals)
+        sf[mask_left] = -np.expm1(logcdf_vals)
+
+    mask_right = ~mask_left
+    if np.any(mask_right):
+        logsf_vals = dist.logsf(x_array[mask_right])
+        sf[mask_right] = np.exp(logsf_vals)
+        cdf[mask_right] = -np.expm1(logsf_vals)
+
+    cdf = np.clip(cdf, 0.0, 1.0)
+    sf = np.clip(sf, 0.0, 1.0)
+    return cdf, sf
+
+
+def _compute_discrete_PMF(*,
+    dist: stats.rv_continuous,
+    x_array: NDArray[np.float64],
+    bound_type: BoundType,
+    PMF_min_increment: float,
+) -> tuple[NDArray[np.float64], float, float]:
+    """
+    Compute bin probabilities using adaptive CDF/SF increments with logcdf/logsf stability.
+    PMF_min_increment controls the minimum CDF/SF increment that becomes a bin mass.
+    """
+    cdf, sf = _stable_cdf_and_sf(
+        dist=dist,
+        x_array=x_array,
+    )
+    p_left = cdf[0]
+    p_right = sf[-1]
+    PMF_min_increment = max(0.0, PMF_min_increment)
+
+    if bound_type == BoundType.DOMINATES:
+        # Suppress intermediate debug logging.
+        bin_probs = _adaptive_bins_from_cdf(
+            cdf=cdf,
+            tail_truncation=PMF_min_increment,
+        )
+    elif bound_type == BoundType.IS_DOMINATED:
+        # Suppress intermediate debug logging.
+        bin_probs = _adaptive_bins_from_sf(
+            sf=sf,
+            tail_truncation=PMF_min_increment,
+        )
+    else:
+        raise ValueError(f"Unknown BoundType: {bound_type}")
+
+    return bin_probs, p_left, p_right

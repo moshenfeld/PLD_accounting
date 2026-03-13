@@ -9,7 +9,7 @@ import numpy as np
 from dp_accounting.pld import privacy_loss_distribution
 
 from PLD_accounting.types import PrivacyParams, AllocationSchemeConfig, Direction
-from PLD_accounting.random_allocation_api import allocation_PLD, numerical_allocation_epsilon
+from PLD_accounting.random_allocation_api import gaussian_allocation_PLD, gaussian_allocation_epsilon_extended
 from PLD_accounting.types import ConvolutionMethod, BoundType
 
 
@@ -81,10 +81,9 @@ class TestAllocationPLDconv:
             convolution_method=ConvolutionMethod.GEOM
         )
 
-        pld = allocation_PLD(
+        pld = gaussian_allocation_PLD(
             params=params,
             config=config_with_method,
-            direction=Direction.REMOVE,
             bound_type=BoundType.DOMINATES
         )
 
@@ -119,10 +118,9 @@ class TestAllocationPLDconv:
             convolution_method=ConvolutionMethod.GEOM
         )
 
-        pld_geometric = allocation_PLD(
+        pld_geometric = gaussian_allocation_PLD(
             params=params,
             config=config_mult,
-            direction=Direction.REMOVE,
             bound_type=BoundType.DOMINATES
         )
 
@@ -133,10 +131,9 @@ class TestAllocationPLDconv:
             convolution_method=ConvolutionMethod.FFT
         )
 
-        pld_fft = allocation_PLD(
+        pld_fft = gaussian_allocation_PLD(
             params=params,
             config=config_fft,
-            direction=Direction.REMOVE,
             bound_type=BoundType.DOMINATES
         )
 
@@ -147,7 +144,7 @@ class TestAllocationPLDconv:
         assert np.isclose(eps_geometric, eps_fft, rtol=0.1)
 
     def test_allocation_epsilon_wrapper(self):
-        """Test numerical_allocation_epsilon wrapper."""
+        """Test gaussian_allocation_epsilon_extended wrapper."""
         params = PrivacyParams(
             sigma=1.0,
             num_steps=10,
@@ -162,10 +159,9 @@ class TestAllocationPLDconv:
             convolution_method=ConvolutionMethod.GEOM
 )
 
-        epsilon = numerical_allocation_epsilon(
+        epsilon = gaussian_allocation_epsilon_extended(
             params=params,
             config=config,
-            direction=Direction.REMOVE,
             bound_type=BoundType.DOMINATES
         )
 
@@ -196,10 +192,9 @@ class TestAllocationPLDconv:
             max_grid_mult=2000,
             convolution_method=method
         )
-        pld = allocation_PLD(
+        pld = gaussian_allocation_PLD(
             params=params,
             config=config,
-            direction=Direction.REMOVE,
             bound_type=BoundType.DOMINATES
         )
         epsilon = pld.get_epsilon_for_delta(params.delta)
@@ -221,10 +216,9 @@ class TestAllocationPLDconv:
             max_grid_mult=2000,
             convolution_method=ConvolutionMethod.BEST_OF_TWO
         )
-        pld = allocation_PLD(
+        pld = gaussian_allocation_PLD(
             params=params,
             config=config,
-            direction=Direction.REMOVE,
             bound_type=BoundType.DOMINATES
         )
         # Verify that the result is valid
@@ -245,10 +239,9 @@ class TestAllocationPLDconv:
                 num_epochs=1,
                 delta=1e-5
             )
-            eps = numerical_allocation_epsilon(
+            eps = gaussian_allocation_epsilon_extended(
                 params=params,
                 config=config,
-                direction=Direction.REMOVE
             )
             eps_list.append(eps)
 
@@ -268,10 +261,9 @@ class TestAllocationPLDconv:
                 num_epochs=num_epochs,
                 delta=1e-5
             )
-            eps = numerical_allocation_epsilon(
+            eps = gaussian_allocation_epsilon_extended(
                 params=params,
                 config=config,
-                direction=Direction.REMOVE
             )
             eps_list.append(eps)
 
@@ -355,11 +347,10 @@ class TestPoissonPLD:
             sampling_prob=1.0,
         )
 
-        eps_allocation = numerical_allocation_epsilon(
+        eps_allocation = gaussian_allocation_epsilon_extended(
             params=params,
             config=config,
             
-            direction=Direction.REMOVE
         )
 
         # Both should give reasonable values
@@ -391,10 +382,9 @@ class TestDirectionSemantics:
             convolution_method=ConvolutionMethod.GEOM
         )
 
-        pld = allocation_PLD(
+        pld = gaussian_allocation_PLD(
             params=params,
             config=config_with_method,
-            direction=Direction.REMOVE,
             bound_type=BoundType.DOMINATES
         )
 
@@ -413,10 +403,9 @@ class TestDirectionSemantics:
         config = AllocationSchemeConfig(loss_discretization=0.02, tail_truncation=0.1, max_grid_FFT=100000)
 
         # dp_accounting PLD requires pmf_remove, so use Direction.BOTH to get both directions
-        pld = allocation_PLD(
+        pld = gaussian_allocation_PLD(
             params=params,
             config=config,
-            direction=Direction.BOTH,
             bound_type=BoundType.DOMINATES
         )
         # Check PLD is valid dp_accounting object with add direction
@@ -441,18 +430,16 @@ class TestDirectionSemantics:
             convolution_method=ConvolutionMethod.FFT
         )
 
-        eps_remove = numerical_allocation_epsilon(
+        eps_remove = gaussian_allocation_epsilon_extended(
             params=params,
             config=config,
             
-            direction=Direction.REMOVE
         )
 
-        eps_both = numerical_allocation_epsilon(
+        eps_both = gaussian_allocation_epsilon_extended(
             params=params,
             config=config,
             
-            direction=Direction.BOTH
         )
 
         # BOTH should give larger epsilon than REMOVE (worst case)
@@ -475,10 +462,9 @@ class TestDiscretizationSensitivity:
         eps_list = []
         for disc in [0.2, 0.1, 0.05]:
             config = AllocationSchemeConfig(loss_discretization=disc, tail_truncation=1e-6, max_grid_FFT=100000)
-            eps = numerical_allocation_epsilon(
+            eps = gaussian_allocation_epsilon_extended(
                 params=params,
                 config=config,
-                direction=Direction.REMOVE
             )
             eps_list.append(eps)
 
@@ -499,10 +485,9 @@ class TestDiscretizationSensitivity:
         config = AllocationSchemeConfig(loss_discretization=100.0, max_grid_FFT=100000)  # Extremely coarse
 
         # Even with coarse discretization, we should return a finite epsilon (clamped grid).
-        eps = numerical_allocation_epsilon(
+        eps = gaussian_allocation_epsilon_extended(
             params=params,
             config=config,
-            direction=Direction.REMOVE
         )
         assert np.isfinite(eps)
 
@@ -523,11 +508,10 @@ class TestSmallParameters:
         )
         config = AllocationSchemeConfig(loss_discretization=0.01, tail_truncation=0.1, max_grid_FFT=100000)
 
-        eps = numerical_allocation_epsilon(
+        eps = gaussian_allocation_epsilon_extended(
             params=params,
             config=config,
             
-            direction=Direction.REMOVE
         )
         assert eps > 0
 
@@ -547,11 +531,10 @@ class TestSmallParameters:
             convolution_method=ConvolutionMethod.FFT
         )
 
-        eps = numerical_allocation_epsilon(
+        eps = gaussian_allocation_epsilon_extended(
             params=params,
             config=config,
             
-            direction=Direction.REMOVE
         )
         # Should give small epsilon (but discretization affects exact value)
         assert eps < 2.0
@@ -572,11 +555,10 @@ class TestSmallParameters:
             convolution_method=ConvolutionMethod.FFT
         )
 
-        eps = numerical_allocation_epsilon(
+        eps = gaussian_allocation_epsilon_extended(
             params=params,
             config=config,
             
-            direction=Direction.REMOVE
         )
         # Smaller delta requires larger epsilon
         assert eps > 0

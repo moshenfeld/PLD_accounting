@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 import numpy as np
-from PLD_accounting.core_utils import PMF_MASS_TOL
+from PLD_accounting.distribution_utils import PMF_MASS_TOL
 from PLD_accounting.types import BoundType, SpacingType, ConvolutionMethod
 from PLD_accounting.discrete_dist import (
     GeneralDiscreteDist,

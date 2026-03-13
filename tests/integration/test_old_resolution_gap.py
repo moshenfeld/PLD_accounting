@@ -3,7 +3,7 @@
 import pytest
 
 from PLD_accounting import AllocationSchemeConfig, PrivacyParams
-from PLD_accounting.random_allocation_api import numerical_allocation_epsilon
+from PLD_accounting.random_allocation_api import gaussian_allocation_epsilon_extended
 from PLD_accounting.types import BoundType
 
 TARGET_FACTOR = 2.0
@@ -38,12 +38,12 @@ def test_old_epsilon_gap_is_positive_and_below_target(
         tail_truncation=min(delta / 10.0, 1e-7),
     )
 
-    dominates = numerical_allocation_epsilon(
+    dominates = gaussian_allocation_epsilon_extended(
         params=params,
         config=config,
         bound_type=BoundType.DOMINATES,
     )
-    is_dominated = numerical_allocation_epsilon(
+    is_dominated = gaussian_allocation_epsilon_extended(
         params=params,
         config=config,
         bound_type=BoundType.IS_DOMINATED,

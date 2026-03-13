@@ -24,36 +24,36 @@ def _geometric_dist(n: int = 6) -> GeometricDiscreteDist:
 def test_binary_self_convolve_rejects_invalid_t():
     dist = _linear_dist()
     with pytest.raises(ValueError, match="T must be >= 1"):
-        binary_self_convolve(dist, 0, 0.0, BoundType.DOMINATES, FFT_convolve)
+        binary_self_convolve(dist=dist, T=0, tail_truncation=0.0, bound_type=BoundType.DOMINATES, convolve=FFT_convolve)
 
 
 def test_binary_self_convolve_t1_identity():
     dist = _linear_dist()
-    result = binary_self_convolve(dist, 1, 0.0, BoundType.DOMINATES, FFT_convolve)
+    result = binary_self_convolve(dist=dist, T=1, tail_truncation=0.0, bound_type=BoundType.DOMINATES, convolve=FFT_convolve)
     assert np.allclose(result.x_array, dist.x_array)
     assert np.allclose(result.PMF_array, dist.PMF_array)
 
 
 def test_binary_self_convolve_matches_direct_fft_t2():
     dist = _linear_dist()
-    result = binary_self_convolve(dist, 2, 0.0, BoundType.DOMINATES, FFT_convolve)
-    direct = FFT_convolve(dist, dist, 0.0, BoundType.DOMINATES)
+    result = binary_self_convolve(dist=dist, T=2, tail_truncation=0.0, bound_type=BoundType.DOMINATES, convolve=FFT_convolve)
+    direct = FFT_convolve(dist_1=dist, dist_2=dist, tail_truncation=0.0, bound_type=BoundType.DOMINATES)
     assert np.allclose(result.x_array, direct.x_array)
     assert np.allclose(result.PMF_array, direct.PMF_array, atol=1e-12)
 
 
 def test_binary_self_convolve_matches_repeated_geometric():
     dist = _geometric_dist()
-    result = binary_self_convolve(dist, 3, 0.0, BoundType.DOMINATES, geometric_convolve)
-    repeated = geometric_convolve(dist, dist, 0.0, BoundType.DOMINATES)
-    repeated = geometric_convolve(repeated, dist, 0.0, BoundType.DOMINATES)
+    result = binary_self_convolve(dist=dist, T=3, tail_truncation=0.0, bound_type=BoundType.DOMINATES, convolve=geometric_convolve)
+    repeated = geometric_convolve(dist_1=dist, dist_2=dist, tail_truncation=0.0, bound_type=BoundType.DOMINATES)
+    repeated = geometric_convolve(dist_1=repeated, dist_2=dist, tail_truncation=0.0, bound_type=BoundType.DOMINATES)
     assert np.allclose(result.x_array, repeated.x_array)
     assert np.allclose(result.PMF_array, repeated.PMF_array, atol=1e-12)
 
 
 def test_binary_self_convolve_preserves_mass_fft():
     dist = _linear_dist()
-    result = binary_self_convolve(dist, 5, 0.0, BoundType.DOMINATES, FFT_convolve)
+    result = binary_self_convolve(dist=dist, T=5, tail_truncation=0.0, bound_type=BoundType.DOMINATES, convolve=FFT_convolve)
     total = np.sum(result.PMF_array) + result.p_neg_inf + result.p_pos_inf
     assert np.isclose(total, 1.0, atol=TOL.MASS_CONSERVATION)
 
@@ -67,8 +67,8 @@ def test_fft_self_convolve_direct_vs_binary():
     with conserved mass.
     """
     dist = _linear_dist(n=9)
-    direct = FFT_self_convolve(dist, 7, 0.0, BoundType.DOMINATES, use_direct=True)
-    binary = FFT_self_convolve(dist, 7, 0.0, BoundType.DOMINATES, use_direct=False)
+    direct = FFT_self_convolve(dist=dist, T=7, tail_truncation=0.0, bound_type=BoundType.DOMINATES, use_direct=True)
+    binary = FFT_self_convolve(dist=dist, T=7, tail_truncation=0.0, bound_type=BoundType.DOMINATES, use_direct=False)
 
     # Verify both results have conserved mass
     direct_mass = np.sum(direct.PMF_array) + direct.p_neg_inf + direct.p_pos_inf

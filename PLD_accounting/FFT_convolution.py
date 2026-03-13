@@ -9,54 +9,26 @@ from scipy.signal import fftconvolve
 
 from dp_accounting.pld.common import compute_self_convolve_bounds
 
-from PLD_accounting.core_utils import (
-    convolve_infinite_masses,
-    enforce_mass_conservation,
-    self_convolve_infinite_mass,
-    stable_isclose,
-)
-from PLD_accounting.discrete_dist import (
-    LinearDiscreteDist,
-)
 from PLD_accounting.types import BoundType
-from PLD_accounting.utils import binary_self_convolve
+from PLD_accounting.discrete_dist import LinearDiscreteDist
+from PLD_accounting.distribution_utils import enforce_mass_conservation, stable_isclose
+from PLD_accounting.utils import binary_self_convolve, convolve_infinite_masses, self_convolve_infinite_mass
 
-
-def calc_FFT_window_size(pmf: np.ndarray, T: int, tail_truncation: float) -> tuple[int, int]:
-    """Calculate FFT window bounds for T-fold self-convolution with fallback."""
-    # `compute_self_convolve_bounds` gives a Chernoff-style window [L, U] that
-    # should contain all but `tail_truncation` mass of the T-fold convolution.
-    L, U = compute_self_convolve_bounds(pmf, T, tail_truncation)
-    window_size = U - L + 1
-
-    if not (0 < window_size < float("inf")):
-        L = 0
-        n = len(pmf)
-        # Fallback to the exact full-support FFT length when the bound becomes
-        # numerically unusable for extreme truncation parameters.
-        window_size = T * (n - 1) + 1
-        warnings.warn(
-            "calc_FFT_window_size: Chernoff bounds failed "
-            f"(tail_truncation={tail_truncation:.3e}, T={T}). "
-            f"Using fallback L=0, window_size={window_size:,} (n={n})."
-        )
-
-    return int(L), int(window_size)
-
-
-def FFT_convolve(
+def FFT_convolve(*,
     dist_1: LinearDiscreteDist,
     dist_2: LinearDiscreteDist,
     tail_truncation: float,
     bound_type: BoundType,
 ) -> LinearDiscreteDist:
-    """Convolve two linear-grid distributions via FFT."""
+    """
+    Convolve two linear-grid distributions via FFT.
+    """
     if not isinstance(dist_1, LinearDiscreteDist) or not isinstance(dist_2, LinearDiscreteDist):
         raise TypeError("FFT_convolve requires LinearDiscreteDist inputs")
 
     if not np.any(dist_1.PMF_array) or not np.any(dist_2.PMF_array):
         raise ValueError("FFT convolution requires nonzero finite mass in both inputs")
-    if not stable_isclose(dist_1.x_gap, dist_2.x_gap):
+    if not stable_isclose(a=dist_1.x_gap, b=dist_2.x_gap):
         raise ValueError(f"Grid spacing must match: w1={dist_1.x_gap:.12g} vs w2={dist_2.x_gap:.12g}")
 
     width = dist_1.x_gap
@@ -86,10 +58,10 @@ def FFT_convolve(
     conv_PMF *= finite_prob_1 * finite_prob_2 / current_finite_mass
 
     expected_neg_inf, expected_pos_inf = convolve_infinite_masses(
-        dist_1.p_neg_inf,
-        dist_1.p_pos_inf,
-        dist_2.p_neg_inf,
-        dist_2.p_pos_inf,
+        p_neg_inf_1=dist_1.p_neg_inf,
+        p_pos_inf_1=dist_1.p_pos_inf,
+        p_neg_inf_2=dist_2.p_neg_inf,
+        p_pos_inf_2=dist_2.p_pos_inf,
     )
     conv_PMF, p_neg_inf, p_pos_inf = enforce_mass_conservation(
         PMF_array=conv_PMF,
@@ -107,14 +79,16 @@ def FFT_convolve(
     ).truncate_edges(tail_truncation, bound_type)
 
 
-def FFT_self_convolve(
+def FFT_self_convolve(*,
     dist: LinearDiscreteDist,
     T: int,
     tail_truncation: float,
     bound_type: BoundType,
     use_direct: bool,
 ) -> LinearDiscreteDist:
-    """T-fold self-convolution via FFT with optional direct exponentiation path."""
+    """
+    T-fold self-convolution via FFT with optional direct exponentiation path.
+    """
     if not isinstance(dist, LinearDiscreteDist):
         raise TypeError("FFT_self_convolve requires LinearDiscreteDist input")
 
@@ -138,7 +112,7 @@ def FFT_self_convolve(
     return self_conv
 
 
-def _fft_self_convolve_direct(
+def _fft_self_convolve_direct(*,
     dist: LinearDiscreteDist,
     T: int,
     tail_truncation: float,
@@ -154,7 +128,7 @@ def _fft_self_convolve_direct(
     normalized_PMF = dist.PMF_array / finite_mass
     tail_truncation_rescaled = tail_truncation / finite_mass
 
-    L, window_size = calc_FFT_window_size(normalized_PMF, T, tail_truncation_rescaled)
+    L, window_size = _calc_FFT_window_size(pmf=normalized_PMF, T=T, tail_truncation=tail_truncation_rescaled)
 
     fft_size = next_fast_len(max(window_size, dist.PMF_array.size))
     raw_conv = irfft(rfft(dist.PMF_array, n=fft_size) ** T, n=fft_size)
@@ -163,7 +137,7 @@ def _fft_self_convolve_direct(
     # that window to index 0 so truncation logic can work in-place.
     rolled_conv = np.roll(raw_conv, -L)
 
-    conv_neg_inf, conv_pos_inf = self_convolve_infinite_mass(dist.p_neg_inf, dist.p_pos_inf, T)
+    conv_neg_inf, conv_pos_inf = self_convolve_infinite_mass(p_neg_inf=dist.p_neg_inf, p_pos_inf=dist.p_pos_inf, T=T)
     if bound_type == BoundType.DOMINATES:
         # For an upper bound, any dropped left-tail mass is pushed to +inf.
         cumsum = np.cumsum(rolled_conv)
@@ -203,3 +177,27 @@ def _fft_self_convolve_direct(
         p_neg_inf=p_neg_inf_final,
         p_pos_inf=p_pos_inf_final,
     ).truncate_edges(0.0, bound_type)
+
+
+def _calc_FFT_window_size(*, pmf: np.ndarray, T: int, tail_truncation: float) -> tuple[int, int]:
+    """
+    Calculate FFT window bounds for T-fold self-convolution with fallback.
+    """
+    # `compute_self_convolve_bounds` gives a Chernoff-style window [L, U] that
+    # should contain all but `tail_truncation` mass of the T-fold convolution.
+    L, U = compute_self_convolve_bounds(pmf, T, tail_truncation)
+    window_size = U - L + 1
+
+    if not (0 < window_size < float("inf")):
+        L = 0
+        n = len(pmf)
+        # Fallback to the exact full-support FFT length when the bound becomes
+        # numerically unusable for extreme truncation parameters.
+        window_size = T * (n - 1) + 1
+        warnings.warn(
+            "calc_FFT_window_size: Chernoff bounds failed "
+            f"(tail_truncation={tail_truncation:.3e}, T={T}). "
+            f"Using fallback L=0, window_size={window_size:,} (n={n})."
+        )
+
+    return int(L), int(window_size)

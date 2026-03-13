@@ -25,10 +25,12 @@ from PLD_accounting.types import (
     BoundType,
 )
 from PLD_accounting.random_allocation_api import (
-    allocation_PLD,
-    numerical_allocation_epsilon,
-    numerical_allocation_epsilon_range,
+    gaussian_allocation_PLD,
+    general_allocation_PLD,
+    gaussian_allocation_epsilon_extended,
+    gaussian_allocation_epsilon_range,
 )
+from PLD_accounting.discrete_dist import PLDRealization
 from PLD_accounting.subsample_PLD import subsample_PLD
 
 
@@ -49,7 +51,7 @@ print("=" * 70)
 print("Example 1: Simple Adaptive API (Recommended Starting Point)")
 print("=" * 70)
 
-epsilon_upper, epsilon_lower = numerical_allocation_epsilon_range(
+epsilon_upper, epsilon_lower = gaussian_allocation_epsilon_range(
     sigma=3.0,
     num_steps=100,
     delta=1e-6,
@@ -120,7 +122,7 @@ config = AllocationSchemeConfig(
     max_grid_mult=50_000,         # Maximum grid size for convolution
 )
 
-epsilon = numerical_allocation_epsilon(
+epsilon = gaussian_allocation_epsilon_extended(
     params=params,
     config=config,
     direction=Direction.BOTH,      # Analyze both ADD and REMOVE
@@ -147,7 +149,7 @@ print("\n" + "=" * 70)
 print("Example 3: Reusable PLD for Multiple Delta Values")
 print("=" * 70)
 
-pld = allocation_PLD(
+pld = gaussian_allocation_PLD(
     params=params,
     config=config,
     direction=Direction.BOTH,
@@ -172,7 +174,7 @@ print(f"  ε=2.0  →  δ={pld.get_delta_for_epsilon(2.0):.2e}")
 #   3. Composition across multiple rounds
 #
 # Privacy Accounting Pipeline:
-#   base_pld   = allocation_PLD(...)           # One training round
+#   base_pld   = gaussian_allocation_PLD(...)  # One training round
 #        ↓
 #   subsampled = subsample_PLD(base_pld, q)    # Amplify by subsampling
 #        ↓
@@ -220,7 +222,7 @@ preamble_params = PrivacyParams(
 
 print("Computing privacy guarantee:")
 print(f"  [1/4] Computing base PLD for one round...")
-base_pld = allocation_PLD(
+base_pld = gaussian_allocation_PLD(
     params=preamble_params,
     config=config_preamble,
     direction=Direction.BOTH,
@@ -230,7 +232,6 @@ print(f"  [2/4] Applying subsampling amplification (q={q})...")
 subsampled = subsample_PLD(
     pld=base_pld,
     sampling_probability=q,
-    bound_type=BoundType.DOMINATES,
 )
 
 print(f"  [3/4] Composing across {num_rounds} rounds...")
@@ -241,6 +242,79 @@ eps_preamble = composed.get_epsilon_for_delta(delta)
 
 print(f"\n✓ Final privacy guarantee: (ε={eps_preamble:.4f}, δ={delta:.0e})")
 print(f"  Full parameters: σ={sigma}, t={num_steps}, k={num_selected}, q={q}, R={num_rounds}")
+
+
+# ===========================================================================
+# Example 5: Direct Realization-Based Accounting
+#
+# If you already have a discrete PLD realization, you can bypass the Gaussian
+# parameterization entirely. This is the baseline Phase 3 interface.
+# ===========================================================================
+
+print("\n" + "=" * 70)
+print("Example 5: Explicit PLD Realizations")
+print("=" * 70)
+
+remove_realization = PLDRealization(
+    x_min=0.0,
+    x_gap=0.5,
+    PMF_array=np.array([0.3, 0.25, 0.2, 0.15, 0.1]),
+)
+
+realization_pld = general_allocation_PLD(
+    num_steps=3,
+    num_selected=1,
+    num_epochs=1,
+    config=AllocationSchemeConfig(
+        loss_discretization=0.05,
+        tail_truncation=1e-8,
+    ),
+    remove_realization=remove_realization,
+)
+
+realization_delta = 1e-5
+realization_epsilon = realization_pld.get_epsilon_for_delta(realization_delta)
+print(f"\nRemove-direction realization:")
+print(f"  δ={realization_delta:.0e}  →  ε={realization_epsilon:.4f}")
+print(f"  ε=2.0  →  δ={realization_pld.get_delta_for_epsilon(2.0):.2e}")
+
+
+# ===========================================================================
+# Example 6: Realization-Based Accounting with Both Directions
+#
+# Providing both REMOVE and ADD realizations gives the same style of PLD object
+# as the Gaussian path, but the source mechanism is an explicit PLD realization.
+# ===========================================================================
+
+print("\n" + "=" * 70)
+print("Example 6: Explicit REMOVE + ADD Realizations")
+print("=" * 70)
+
+add_realization = PLDRealization(
+    x_min=0.0,
+    x_gap=1.0,
+    PMF_array=np.array([0.5, 0.3, 0.2]),
+)
+
+realization_pld_both = general_allocation_PLD(
+    num_steps=2,
+    num_selected=1,
+    num_epochs=1,
+    config=AllocationSchemeConfig(),
+    remove_realization=PLDRealization(
+        x_min=0.0,
+        x_gap=1.0,
+        PMF_array=np.array([0.5, 0.3, 0.2]),
+    ),
+    add_realization=add_realization,
+)
+
+both_epsilon = realization_pld_both.get_epsilon_for_delta(1e-5)
+print(f"\nBoth directions from realizations:")
+print(f"  δ=1e-5  →  ε={both_epsilon:.4f}")
+print("  Note: remove-only custom realizations can legitimately return ε=inf")
+print("  for sufficiently small δ; that indicates an extreme tail query, not")
+print("  a failure to build the PLD.")
 
 print("\n" + "=" * 70)
 print("All examples completed!")

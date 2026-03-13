@@ -15,7 +15,7 @@ from PLD_accounting.distribution_discretization import (
     discretize_continuous_distribution
 )
 from PLD_accounting.types import PrivacyParams, AllocationSchemeConfig, Direction
-from PLD_accounting.random_allocation_api import numerical_allocation_epsilon
+from PLD_accounting.random_allocation_api import gaussian_allocation_epsilon_extended
 from tests.test_tolerances import TestTolerances as TOL
 
 
@@ -135,10 +135,9 @@ class TestExtremePrivacyParameters:
             convolution_method=ConvolutionMethod.FFT
 )
 
-        eps = numerical_allocation_epsilon(
+        eps = gaussian_allocation_epsilon_extended(
             params=params,
             config=config,
-            direction=Direction.REMOVE
 )
 
         # Should give small epsilon
@@ -161,10 +160,9 @@ class TestExtremePrivacyParameters:
             convolution_method=ConvolutionMethod.FFT
 )
 
-        eps = numerical_allocation_epsilon(
+        eps = gaussian_allocation_epsilon_extended(
             params=params,
             config=config,
-            direction=Direction.REMOVE
 )
 
         # Should give large epsilon
@@ -187,10 +185,9 @@ class TestExtremePrivacyParameters:
 )
 
         # Should complete with FFT
-        eps = numerical_allocation_epsilon(
+        eps = gaussian_allocation_epsilon_extended(
             params=params,
             config=config,
-            direction=Direction.REMOVE
 )
 
         assert eps > 0
@@ -213,10 +210,9 @@ class TestExtremePrivacyParameters:
             convolution_method=ConvolutionMethod.FFT
 )
 
-        eps = numerical_allocation_epsilon(
+        eps = gaussian_allocation_epsilon_extended(
             params=params,
             config=config,
-            direction=Direction.REMOVE
 )
 
         assert eps > 0
@@ -375,10 +371,9 @@ class TestnumericalStability:
         )  # Very fine
 
         # Should complete without numerical issues
-        eps = numerical_allocation_epsilon(
+        eps = gaussian_allocation_epsilon_extended(
             params=params,
             config=config,
-            direction=Direction.REMOVE
 )
 
         assert eps > 0

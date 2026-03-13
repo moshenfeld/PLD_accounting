@@ -6,11 +6,14 @@ from numpy.typing import NDArray
 from PLD_accounting.types import BoundType
 
 PMF_MASS_TOL = 10 * np.finfo(float).eps  # total-mass tolerance (10× machine epsilon)
-
 SPACING_ATOL = 1e-12
 SPACING_RTOL = 1e-6
 
-def enforce_mass_conservation(
+# =============================================================================
+# Public Utility Functions
+# =============================================================================
+
+def enforce_mass_conservation(*,
     PMF_array: NDArray[np.float64],
     expected_neg_inf: float,
     expected_pos_inf: float,
@@ -66,8 +69,34 @@ def enforce_mass_conservation(
         f"{bound_type}. Must be BoundType.DOMINATES or BoundType.IS_DOMINATED."
     )
 
+def compute_bin_ratio_two_arrays(*, x_array_1: NDArray[np.float64], x_array_2: NDArray[np.float64]) -> float:
+    """
+    Compute geometric spacing ratio for two grids and return their average.
+    """
+    r1 = compute_bin_ratio(x_array_1)
+    r2 = compute_bin_ratio(x_array_2)
+    if not stable_isclose(a=r1, b=r2):
+        raise ValueError(f"Grid ratios must match: ratio_1={r1:.12g}, ratio_2={r2:.12g}")
+    return (r1 + r2) / 2
+
+def compute_bin_width_two_arrays(*, x_array_1: NDArray[np.float64], x_array_2: NDArray[np.float64]) -> float:
+    """
+    Compute linear spacing width for two grids and return their average.
+    """
+    w1 = compute_bin_width(x_array_1)
+    w2 = compute_bin_width(x_array_2)
+    if not stable_isclose(a=w1, b=w2):
+        raise ValueError(f"Grid spacing must match: w1={w1:.12g} vs w2={w2:.12g}")
+    return (w1 + w2) / 2
+
+# =============================================================================
+# Grid Spacing Utilities
+# =============================================================================
+
 def compute_bin_ratio(x_array: NDArray[np.float64]) -> float:
-    """Compute geometric spacing ratio for a grid."""
+    """
+    Compute geometric spacing ratio for a grid.
+    """
     if np.any(x_array <= 0):
         raise ValueError("Cannot compute geometric bin ratio for non-positive values")
     log_ratios = np.log(x_array[1:] / x_array[:-1])
@@ -81,7 +110,9 @@ def compute_bin_ratio(x_array: NDArray[np.float64]) -> float:
     return np.exp(med_log_ratio)
 
 def compute_bin_width(x_array: NDArray[np.float64]) -> float:
-    """Compute linear spacing width for a grid."""
+    """
+    Compute linear spacing width for a grid.
+    """
     if x_array.size < 2:
         raise ValueError("Cannot compute width with less than 2 bins")
     diffs = np.diff(x_array)
@@ -93,45 +124,14 @@ def compute_bin_width(x_array: NDArray[np.float64]) -> float:
         )
     return median_diff
 
-def stable_isclose(a: float, b: float) -> bool:
-    """Consistent closeness check using shared spacing tolerances."""
+def stable_isclose(*, a: float, b: float) -> bool:
+    """
+    Consistent closeness check using shared spacing tolerances.
+    """
     return bool(np.isclose(a, b, rtol=SPACING_RTOL, atol=SPACING_ATOL))
 
-def stable_array_equal(a: NDArray[np.float64], b: NDArray[np.float64]) -> bool:
-    """Consistent array closeness check using shared spacing tolerances."""
+def stable_array_equal(*, a: NDArray[np.float64], b: NDArray[np.float64]) -> bool:
+    """
+    Consistent array closeness check using shared spacing tolerances.
+    """
     return a.shape == b.shape and np.allclose(a, b, rtol=SPACING_RTOL, atol=SPACING_ATOL)
-
-def compute_bin_ratio_two_arrays(x_array_1: NDArray[np.float64], x_array_2: NDArray[np.float64]) -> float:
-    """
-    Compute geometric spacing ratio for two grids and return their average.
-    """
-    r1 = compute_bin_ratio(x_array_1)
-    r2 = compute_bin_ratio(x_array_2)
-    if not stable_isclose(r1, r2):
-        raise ValueError(f"Grid ratios must match: ratio_1={r1:.12g}, ratio_2={r2:.12g}")
-    return (r1 + r2) / 2
-
-def compute_bin_width_two_arrays(x_array_1: NDArray[np.float64], x_array_2: NDArray[np.float64]) -> float:
-    """Compute linear spacing width for two grids and return their average."""
-    w1 = compute_bin_width(x_array_1)
-    w2 = compute_bin_width(x_array_2)
-    if not stable_isclose(w1, w2):
-        raise ValueError(f"Grid spacing must match: w1={w1:.12g} vs w2={w2:.12g}")
-    return (w1 + w2) / 2
-
-def convolve_infinite_masses(
-    p_neg_inf_1: float,
-    p_pos_inf_1: float,
-    p_neg_inf_2: float,
-    p_pos_inf_2: float
-) -> tuple[float, float]:
-    """Combine infinite masses for two independent distributions, using stable union probability."""
-    p_neg_inf = float(np.clip(-np.expm1(np.log1p(-p_neg_inf_1) + np.log1p(-p_neg_inf_2)), 0.0, 1.0))
-    p_pos_inf = float(np.clip(-np.expm1(np.log1p(-p_pos_inf_1) + np.log1p(-p_pos_inf_2)), 0.0, 1.0))
-    return p_neg_inf, p_pos_inf
-
-def self_convolve_infinite_mass(p_neg_inf: float, p_pos_inf: float, T: int) -> tuple[float, float]:
-    """Compute infinite masses for T-fold self-convolution."""
-    p_neg_inf = float(np.clip(-np.expm1(T * np.log1p(-p_neg_inf)), 0.0, 1.0))
-    p_pos_inf = float(np.clip(-np.expm1(T * np.log1p(-p_pos_inf)), 0.0, 1.0))
-    return p_neg_inf, p_pos_inf

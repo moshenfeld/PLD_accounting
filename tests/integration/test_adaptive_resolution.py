@@ -9,25 +9,25 @@ import PLD_accounting.random_allocation_api as random_allocation_api_module
 from PLD_accounting import (
     AllocationSchemeConfig,
     PrivacyParams,
-    numerical_allocation_delta,
-    numerical_allocation_delta_range,
-    numerical_allocation_epsilon,
-    numerical_allocation_epsilon_range,
+    gaussian_allocation_delta_extended,
+    gaussian_allocation_delta_range,
+    gaussian_allocation_epsilon_extended,
+    gaussian_allocation_epsilon_range,
 )
 from PLD_accounting.adaptive_random_allocation import (
     AdaptiveResult,
-    adaptive_delta_convergence,
-    adaptive_epsilon_convergence,
+    optimize_allocation_delta_range,
+    optimize_allocation_epsilon_range,
     estimate_poisson_query,
 )
 from PLD_accounting.random_allocation_api import (
-    allocation_PLD as allocation_pld_api,
-    numerical_allocation_delta as numerical_allocation_delta_api,
-    numerical_allocation_delta_range as numerical_allocation_delta_range_api,
-    numerical_allocation_epsilon as numerical_allocation_epsilon_api,
-    numerical_allocation_epsilon_range as numerical_allocation_epsilon_range_api,
+    gaussian_allocation_PLD as allocation_pld_api,
+    gaussian_allocation_delta_extended as gaussian_allocation_delta_extended_api,
+    gaussian_allocation_delta_range as gaussian_allocation_delta_range_api,
+    gaussian_allocation_epsilon_extended as gaussian_allocation_epsilon_extended_api,
+    gaussian_allocation_epsilon_range as gaussian_allocation_epsilon_range_api,
 )
-from PLD_accounting.random_allocation_accounting import allocation_PMF, compute_conv_params
+from PLD_accounting.random_allocation_gaussian import allocation_PMF_from_gaussian, compute_conv_params
 from PLD_accounting.types import BoundType, ConvolutionMethod, Direction
 
 
@@ -64,7 +64,7 @@ def _run_real_epsilon_adaptive(
         delta=delta,
     )
 
-    return adaptive_epsilon_convergence(
+    return optimize_allocation_epsilon_range(
         params=params,
         target_accuracy=epsilon_accuracy,
         pld_builder=allocation_pld_api,
@@ -88,7 +88,7 @@ def _run_real_delta_adaptive(
         epsilon=epsilon,
     )
 
-    return adaptive_delta_convergence(
+    return optimize_allocation_delta_range(
         params=params,
         target_accuracy=delta_accuracy,
         pld_builder=allocation_pld_api,
@@ -97,7 +97,7 @@ def _run_real_delta_adaptive(
 
 class TestAdaptivePublicApi:
     def test_epsilon_range_returns_tuple(self):
-        bounds = numerical_allocation_epsilon_range(
+        bounds = gaussian_allocation_epsilon_range(
             sigma=2.0,
             num_steps=20,
             delta=1e-6,
@@ -111,7 +111,7 @@ class TestAdaptivePublicApi:
         assert bounds[0] >= bounds[1]
 
     def test_delta_range_returns_tuple(self):
-        bounds = numerical_allocation_delta_range(
+        bounds = gaussian_allocation_delta_range(
             sigma=2.0,
             num_steps=20,
             epsilon=1.0,
@@ -130,7 +130,7 @@ class TestAdaptivePublicApi:
         delta = 1e-5
         epsilon_accuracy = 5e-2
 
-        upper_bound, lower_bound = numerical_allocation_epsilon_range(
+        upper_bound, lower_bound = gaussian_allocation_epsilon_range(
             sigma=sigma,
             num_steps=num_steps,
             delta=delta,
@@ -142,7 +142,7 @@ class TestAdaptivePublicApi:
             loss_discretization=1e-2,
             tail_truncation=1e-8,
         )
-        epsilon_fine = numerical_allocation_epsilon(params=params, config=config_fine)
+        epsilon_fine = gaussian_allocation_epsilon_extended(params=params, config=config_fine)
 
         assert upper_bound >= epsilon_fine >= lower_bound
         assert upper_bound - lower_bound < epsilon_accuracy
@@ -153,7 +153,7 @@ class TestAdaptivePublicApi:
         epsilon = 1.0
         delta_accuracy = 1e-4
 
-        upper_bound, lower_bound = numerical_allocation_delta_range(
+        upper_bound, lower_bound = gaussian_allocation_delta_range(
             sigma=sigma,
             num_steps=num_steps,
             epsilon=epsilon,
@@ -165,7 +165,7 @@ class TestAdaptivePublicApi:
             loss_discretization=1e-2,
             tail_truncation=1e-8,
         )
-        delta_fine_upper = numerical_allocation_delta(params=params, config=config_fine)
+        delta_fine_upper = gaussian_allocation_delta_extended(params=params, config=config_fine)
         assert np.isfinite(delta_fine_upper)
         assert upper_bound >= lower_bound >= 0.0
         assert upper_bound - lower_bound < delta_accuracy
@@ -195,7 +195,7 @@ class TestAdaptivePublicApi:
             convolution_method=ConvolutionMethod.GEOM,
         )
 
-        dist = allocation_PMF(
+        dist = allocation_PMF_from_gaussian(
             conv_params=compute_conv_params(params=params, config=config),
             direction=Direction.REMOVE,
             bound_type=BoundType.DOMINATES,
@@ -208,7 +208,7 @@ class TestAdaptivePublicApi:
     def test_default_target_accuracy_is_forwarded_for_internal_initialization(self, monkeypatch):
         captured: dict[str, float] = {}
 
-        def fake_adaptive_epsilon_convergence(
+        def fake_optimize_allocation_epsilon_range(
             *,
             params,
             target_accuracy,
@@ -217,9 +217,9 @@ class TestAdaptivePublicApi:
             captured["target_accuracy"] = target_accuracy
             return _stub_result(target_accuracy=0.07, value=0.7)
 
-        monkeypatch.setattr(random_allocation_api_module, "adaptive_epsilon_convergence", fake_adaptive_epsilon_convergence)
+        monkeypatch.setattr(random_allocation_api_module, "optimize_allocation_epsilon_range", fake_optimize_allocation_epsilon_range)
 
-        value = numerical_allocation_epsilon_range(
+        value = gaussian_allocation_epsilon_range(
             sigma=5.0,
             num_steps=10,
             delta=1e-6,
@@ -231,7 +231,7 @@ class TestAdaptivePublicApi:
     def test_default_target_accuracy_is_forwarded_for_internal_delta_initialization(self, monkeypatch):
         captured: dict[str, float] = {}
 
-        def fake_adaptive_delta_convergence(
+        def fake_optimize_allocation_delta_range(
             *,
             params,
             target_accuracy,
@@ -240,9 +240,9 @@ class TestAdaptivePublicApi:
             captured["target_accuracy"] = target_accuracy
             return _stub_result(target_accuracy=4e-2, value=0.4)
 
-        monkeypatch.setattr(random_allocation_api_module, "adaptive_delta_convergence", fake_adaptive_delta_convergence)
+        monkeypatch.setattr(random_allocation_api_module, "optimize_allocation_delta_range", fake_optimize_allocation_delta_range)
 
-        value = numerical_allocation_delta_range(
+        value = gaussian_allocation_delta_range(
             sigma=5.0,
             num_steps=10,
             epsilon=1.0,
@@ -262,10 +262,10 @@ class TestAdaptivePublicApi:
                     return 0.9
                 raise AssertionError(f"unexpected delta: {delta_value}")
 
-        def fake_builder(*, params, config, direction, bound_type):
+        def fake_builder(*, params, config, bound_type):
             return FakePLD()
 
-        result = adaptive_epsilon_convergence(
+        result = optimize_allocation_epsilon_range(
             params=params,
             target_accuracy=0.5,
             initial_discretization=0.2,
@@ -287,10 +287,10 @@ class TestAdaptivePublicApi:
                     return 0.2
                 raise AssertionError(f"unexpected epsilon: {epsilon_value}")
 
-        def fake_builder(*, params, config, direction, bound_type):
+        def fake_builder(*, params, config, bound_type):
             return FakePLD()
 
-        result = adaptive_delta_convergence(
+        result = optimize_allocation_delta_range(
             params=params,
             target_accuracy=0.2,
             initial_discretization=0.1,
@@ -304,7 +304,7 @@ class TestAdaptivePublicApi:
     def test_num_selected_and_epochs_are_forwarded(self, monkeypatch):
         captured: dict[str, object] = {}
 
-        def fake_adaptive_epsilon_convergence(
+        def fake_optimize_allocation_epsilon_range(
             *,
             params,
             target_accuracy,
@@ -313,9 +313,9 @@ class TestAdaptivePublicApi:
             captured["params"] = params
             return _stub_result(target_accuracy=target_accuracy)
 
-        monkeypatch.setattr(random_allocation_api_module, "adaptive_epsilon_convergence", fake_adaptive_epsilon_convergence)
+        monkeypatch.setattr(random_allocation_api_module, "optimize_allocation_epsilon_range", fake_optimize_allocation_epsilon_range)
 
-        numerical_allocation_epsilon_range(
+        gaussian_allocation_epsilon_range(
             sigma=2.0,
             num_steps=20,
             delta=1e-6,
@@ -328,10 +328,10 @@ class TestAdaptivePublicApi:
         assert captured["params"].num_epochs == 2
 
     def test_api_module_exports_main_functions(self):
-        assert numerical_allocation_epsilon_range_api is numerical_allocation_epsilon_range
-        assert numerical_allocation_delta_range_api is numerical_allocation_delta_range
-        assert numerical_allocation_epsilon_api is numerical_allocation_epsilon
-        assert numerical_allocation_delta_api is numerical_allocation_delta
+        assert gaussian_allocation_epsilon_range_api is gaussian_allocation_epsilon_range
+        assert gaussian_allocation_delta_range_api is gaussian_allocation_delta_range
+        assert gaussian_allocation_epsilon_extended_api is gaussian_allocation_epsilon_extended
+        assert gaussian_allocation_delta_extended_api is gaussian_allocation_delta_extended
         assert callable(allocation_pld_api)
 
 
@@ -368,7 +368,7 @@ class TestAdaptiveIntegrationConvergence:
             num_epochs=num_epochs,
             delta=delta,
         )
-        epsilon_fine = numerical_allocation_epsilon(
+        epsilon_fine = gaussian_allocation_epsilon_extended(
             params=params,
             config=AllocationSchemeConfig(
                 loss_discretization=1e-2,
@@ -414,7 +414,7 @@ class TestAdaptiveIntegrationConvergence:
             num_epochs=num_epochs,
             epsilon=epsilon,
         )
-        delta_fine_upper = numerical_allocation_delta(
+        delta_fine_upper = gaussian_allocation_delta_extended(
             params=params,
             config=AllocationSchemeConfig(
                 loss_discretization=1e-2,
@@ -440,7 +440,7 @@ class TestAdaptiveIntegrationConvergence:
             delta=1e-5,
             epsilon_accuracy=2e-2,
         )
-        public = numerical_allocation_epsilon_range(
+        public = gaussian_allocation_epsilon_range(
             sigma=1.5,
             num_steps=10,
             num_selected=1,
@@ -461,7 +461,7 @@ class TestAdaptiveIntegrationConvergence:
             epsilon=0.9,
             delta_accuracy=5e-5,
         )
-        public = numerical_allocation_delta_range(
+        public = gaussian_allocation_delta_range(
             sigma=1.7,
             num_steps=10,
             num_selected=1,
@@ -485,12 +485,12 @@ class TestAdaptiveConvergence:
             def get_epsilon_for_delta(self, delta_value: float) -> float:
                 return self.value
 
-        def fake_builder(*, params, config, direction, bound_type):
+        def fake_builder(*, params, config, bound_type):
             if bound_type == BoundType.DOMINATES:
                 return FakePLD(0.55)
             return FakePLD(0.545)
 
-        result = adaptive_epsilon_convergence(
+        result = optimize_allocation_epsilon_range(
             params=params,
             target_accuracy=1e-2,
             initial_discretization=0.1,
@@ -516,7 +516,7 @@ class TestAdaptiveConvergence:
 
         call_count = {"dominates": 0, "dominated": 0}
 
-        def fake_builder(*, params, config, direction, bound_type):
+        def fake_builder(*, params, config, bound_type):
             if bound_type == BoundType.DOMINATES:
                 call_count["dominates"] += 1
                 return FakePLD(1.0 if call_count["dominates"] == 1 else 0.54)
@@ -528,7 +528,7 @@ class TestAdaptiveConvergence:
             lambda **_: 0.01,
         )
 
-        result = adaptive_epsilon_convergence(
+        result = optimize_allocation_epsilon_range(
             params=params,
             target_accuracy=-1.0,
             pld_builder=fake_builder,
@@ -540,11 +540,11 @@ class TestAdaptiveConvergence:
     def test_propagates_builder_errors(self):
         params = PrivacyParams(sigma=2.0, num_steps=20, delta=1e-6)
 
-        def fake_builder(*, params, config, direction, bound_type):
+        def fake_builder(*, params, config, bound_type):
             raise RuntimeError("boom")
 
         with pytest.raises(RuntimeError, match="boom"):
-            adaptive_epsilon_convergence(
+            optimize_allocation_epsilon_range(
                 params=params,
                 target_accuracy=1e-2,
                 initial_discretization=0.1,
@@ -563,7 +563,7 @@ class TestAdaptiveConvergence:
             def get_epsilon_for_delta(self, delta_value: float) -> float:
                 return self.value
 
-        def fake_builder(*, params, config, direction, bound_type):
+        def fake_builder(*, params, config, bound_type):
             if bound_type == BoundType.DOMINATES:
                 call_count["dominates"] += 1
                 if call_count["dominates"] == 1:
@@ -575,7 +575,7 @@ class TestAdaptiveConvergence:
                 return FakePLD(0.54)
             return FakePLD(0.541)
 
-        result = adaptive_epsilon_convergence(
+        result = optimize_allocation_epsilon_range(
             params=params,
             target_accuracy=1e-2,
             initial_discretization=0.1,
@@ -597,12 +597,12 @@ class TestAdaptiveConvergence:
             def get_epsilon_for_delta(self, delta_value: float) -> float:
                 return self.value
 
-        def fake_builder(*, params, config, direction, bound_type):
+        def fake_builder(*, params, config, bound_type):
             if bound_type == BoundType.DOMINATES:
                 return FakePLD(0.53)
             return FakePLD(0.54)
 
-        result = adaptive_epsilon_convergence(
+        result = optimize_allocation_epsilon_range(
             params=params,
             target_accuracy=1e-6,
             initial_discretization=0.1,
@@ -623,14 +623,14 @@ class TestAdaptiveConvergence:
             def get_epsilon_for_delta(self, delta_value: float) -> float:
                 return self.value
 
-        def fake_builder(*, params, config, direction, bound_type):
+        def fake_builder(*, params, config, bound_type):
             if bound_type == BoundType.DOMINATES:
                 return FakePLD(1.0)
             return FakePLD(0.0)
 
         with warnings.catch_warnings(record=True) as caught:
             warnings.simplefilter("always")
-            result = adaptive_epsilon_convergence(
+            result = optimize_allocation_epsilon_range(
                 params=params,
                 target_accuracy=1e-12,
                 initial_discretization=0.1,
@@ -651,12 +651,12 @@ class TestAdaptiveConvergence:
             def get_epsilon_for_delta(self, delta_value: float) -> float:
                 return self.value
 
-        def fake_builder(*, params, config, direction, bound_type):
+        def fake_builder(*, params, config, bound_type):
             if bound_type == BoundType.DOMINATES:
                 return FakePLD(0.55)
             return FakePLD(0.545)
 
-        result = adaptive_epsilon_convergence(
+        result = optimize_allocation_epsilon_range(
             params=params,
             target_accuracy=1e-2,
             initial_discretization=0.2,
@@ -678,7 +678,7 @@ class TestAdaptiveConvergence:
             def get_epsilon_for_delta(self, delta_value: float) -> float:
                 return self.value
 
-        def fake_builder(*, params, config, direction, bound_type):
+        def fake_builder(*, params, config, bound_type):
             configs.append(config)
             if len(configs) <= 2:
                 return FakePLD(1.0 if bound_type == BoundType.DOMINATES else 0.0)
@@ -686,7 +686,7 @@ class TestAdaptiveConvergence:
                 return FakePLD(0.9 if bound_type == BoundType.DOMINATES else 0.0)
             return FakePLD(0.8 if bound_type == BoundType.DOMINATES else 0.0)
 
-        result = adaptive_epsilon_convergence(
+        result = optimize_allocation_epsilon_range(
             params=params,
             target_accuracy=1e-12,
             initial_discretization=0.2,
@@ -709,7 +709,7 @@ class TestPoissonAdaptiveEstimate:
 
         class FakePLD:
             def self_compose(self, steps: int):
-                captured["compose_steps"] = steps
+                captured["num_rounds"] = steps
                 return self
 
         def fake_from_gaussian_mechanism(**kwargs):
@@ -738,4 +738,4 @@ class TestPoissonAdaptiveEstimate:
         assert np.isclose(estimate, 0.25)
         assert np.isclose(captured["standard_deviation"], 3.0)
         assert np.isclose(captured["sampling_prob"], 10 / 200)
-        assert captured["compose_steps"] == 40
+        assert captured["num_rounds"] == 40

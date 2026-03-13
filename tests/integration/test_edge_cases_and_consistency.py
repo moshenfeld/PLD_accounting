@@ -18,7 +18,7 @@ from PLD_accounting.distribution_discretization import (
     discretize_continuous_distribution,
     change_spacing_type
 )
-from PLD_accounting.random_allocation_api import numerical_allocation_epsilon
+from PLD_accounting.random_allocation_api import gaussian_allocation_epsilon_extended
 from tests.test_tolerances import TestTolerances as TOL
 
 
@@ -205,9 +205,8 @@ class TestConsistencyBoundTypes:
 )
 
         # Compute epsilon with REMOVE direction (uses DOMINATES internally)
-        eps_remove = numerical_allocation_epsilon(
+        eps_remove = gaussian_allocation_epsilon_extended(
             params=params, config=config_fft,
-            direction=Direction.REMOVE
 )
 
         # Both should produce valid, positive, finite epsilon values
@@ -289,9 +288,8 @@ class TestConsistencyMonotonicity:
 
         for sigma in sigmas:
             params = PrivacyParams(sigma=sigma, num_steps=10, num_selected=5, num_epochs=1, delta=1e-5)
-            eps = numerical_allocation_epsilon(
+            eps = gaussian_allocation_epsilon_extended(
                 params=params, config=config,
-                direction=Direction.REMOVE
 )
             epsilons.append(eps)
 
@@ -320,9 +318,8 @@ class TestConsistencyMonotonicity:
                 num_epochs=num_epochs,
                 delta=params_base.delta
             )
-            eps = numerical_allocation_epsilon(
+            eps = gaussian_allocation_epsilon_extended(
                 params=params, config=config,
-                direction=Direction.REMOVE
 )
             epsilons.append(eps)
 
@@ -356,9 +353,8 @@ class TestConsistencyMonotonicity:
                 num_selected=2,
                 num_epochs=1, delta=1e-5
             )
-            eps = numerical_allocation_epsilon(
+            eps = gaussian_allocation_epsilon_extended(
                 params=params, config=config,
-                direction=Direction.REMOVE
 )
             epsilons.append(eps)
 
@@ -442,19 +438,16 @@ class TestConsistencyConvolutionMethods:
 )
 
         # Get epsilon with all three methods
-        eps_fft = numerical_allocation_epsilon(
+        eps_fft = gaussian_allocation_epsilon_extended(
             params=params, config=config_fft,
-            direction=Direction.REMOVE
 )
 
-        eps_mult = numerical_allocation_epsilon(
+        eps_mult = gaussian_allocation_epsilon_extended(
             params=params, config=config_mult,
-            direction=Direction.REMOVE
 )
 
-        eps_combined = numerical_allocation_epsilon(
+        eps_combined = gaussian_allocation_epsilon_extended(
             params=params, config=config_combined,
-            direction=Direction.REMOVE
 )
 
         # All should be positive and finite
@@ -466,6 +459,40 @@ class TestConsistencyConvolutionMethods:
         min_eps = min(eps_fft, eps_mult)
         max_eps = max(eps_fft, eps_mult)
         assert min_eps * 0.9 <= eps_combined <= max_eps * 1.1
+
+    def test_geom_method_regression_no_infinite_epsilon(self):
+        """GEOM/BEST_OF_TWO should not become vacuous for a moderate Gaussian case."""
+        params = PrivacyParams(
+            sigma=1.0,
+            num_steps=10,
+            num_selected=2,
+            num_epochs=1,
+            delta=1e-6,
+        )
+
+        config_fft = AllocationSchemeConfig(
+            loss_discretization=1e-2,
+            tail_truncation=1e-6,
+            convolution_method=ConvolutionMethod.FFT,
+        )
+        config_geom = AllocationSchemeConfig(
+            loss_discretization=1e-2,
+            tail_truncation=1e-6,
+            convolution_method=ConvolutionMethod.GEOM,
+        )
+        config_best = AllocationSchemeConfig(
+            loss_discretization=1e-2,
+            tail_truncation=1e-6,
+            convolution_method=ConvolutionMethod.BEST_OF_TWO,
+        )
+
+        eps_fft = gaussian_allocation_epsilon_extended(params=params, config=config_fft)
+        eps_geom = gaussian_allocation_epsilon_extended(params=params, config=config_geom)
+        eps_best = gaussian_allocation_epsilon_extended(params=params, config=config_best)
+
+        assert np.isfinite(eps_fft)
+        assert np.isfinite(eps_geom)
+        assert np.isfinite(eps_best)
 
 
 class TestConsistencyMassConservation:
@@ -603,9 +630,8 @@ class TestEdgeCasesDirections:
             max_grid_FFT=50000
         )
 
-        eps_remove = numerical_allocation_epsilon(
+        eps_remove = gaussian_allocation_epsilon_extended(
             params=params, config=config,
-            direction=Direction.REMOVE
 )
 
         # Both should be positive, finite, and in reasonable range
@@ -625,16 +651,14 @@ class TestEdgeCasesDirections:
 
         # Moderate subsampling: T = floor(20/4) = 5
         params_moderate = PrivacyParams(sigma=1.0, num_steps=20, num_selected=4, num_epochs=1, delta=1e-5)
-        eps_moderate = numerical_allocation_epsilon(
+        eps_moderate = gaussian_allocation_epsilon_extended(
             params=params_moderate, config=config,
-            direction=Direction.REMOVE
 )
 
         # Lower subsampling (more privacy amplification): T = floor(100/10) = 10
         params_low = PrivacyParams(sigma=1.0, num_steps=100, num_selected=10, num_epochs=1, delta=1e-5)
-        eps_low = numerical_allocation_epsilon(
+        eps_low = gaussian_allocation_epsilon_extended(
             params=params_low, config=config,
-            direction=Direction.REMOVE
 )
 
         # Both should be positive and finite
@@ -673,9 +697,8 @@ class TestNumericalStability:
             convolution_method=ConvolutionMethod.FFT
 )  # Very small
 
-        eps = numerical_allocation_epsilon(
+        eps = gaussian_allocation_epsilon_extended(
             params=params, config=config,
-            direction=Direction.REMOVE
 )
 
         assert eps > 0 and np.isfinite(eps)

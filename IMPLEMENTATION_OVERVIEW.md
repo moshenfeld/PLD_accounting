@@ -1,101 +1,156 @@
 # Implementation Overview
 
-This document explains the conceptual architecture and design approach of PLD_accounting. For installation, API reference, and code examples, see [README.md](README.md).
+This document describes the internal structure of `PLD_accounting` and how the implementation maps to the paper's random-allocation setting.
 
-## Repository Structure
+For user-facing examples, see [README.md](README.md) and [usage_example.py](usage_example.py).
 
-The codebase is organized into focused modules:
+## Paper-Aligned Semantics
 
-### Core Library (`PLD_accounting/`)
+The package follows the `k`-out-of-`t` random-allocation language:
 
-- **`types.py`**: Core type definitions (`BoundType`, `Direction`, `PrivacyParams`, etc.)
-- **`discrete_dist.py`**: Internal distribution representation with explicit mass tracking
-- **`distribution_discretization.py`**: Continuous-to-discrete conversion with domination-aware rounding
-- **`convolution_API.py`**: Dispatcher for composition operations
-- **`FFT_convolution.py`**: Linear-grid convolution via FFT
-- **`geometric_convolution.py`**: Multiplicative-grid convolution for positive supports
-- **`random_allocation_accounting.py`**: Core accounting logic for random allocation mechanisms
-- **`random_allocation_api.py`**: High-level user-facing API (adaptive queries, epsilon/delta computation)
-- **`adaptive_random_allocation.py`**: Adaptive resolution refinement for tight bounds
-- **`subsample_PLD.py`**: Subsampling amplification in PLD space
-- **`dp_accounting_support.py`**: Interop layer with Google's `dp_accounting` library
-- **`core_utils.py`**: Numerical utilities (mass conservation, compensated summation)
-- **`utils.py`**: General utilities (binary exponentiation, etc.)
+- In each epoch, a record participates in `k` selected steps out of `t` total steps.
+- This is repeated for `num_epochs` epochs.
 
-### Testing (`tests/`)
+API parameter mapping:
 
-- **`unit/`**: Unit tests for individual functions and modules
-- **`integration/`**: End-to-end workflow tests
-- **`regression/`**: Backward compatibility tests
+- `num_steps = t`
+- `num_selected = k`
+- `num_epochs = number of epochs`
 
-### Examples
+In code, this decomposition is implemented in
+`decompose_allocation_compositions()` in
+`PLD_accounting/random_allocation_accounting.py`:
 
-- **`usage_example.py`**: Executable examples demonstrating common workflows
+- `num_steps_per_round = floor(num_steps / num_selected)`
+- `num_rounds = num_selected * num_epochs`
 
-## Conceptual Architecture
+This is the composition structure used by both Gaussian and realization paths.
 
-PLD_accounting computes privacy guarantees by representing privacy loss as discrete probability distributions and maintaining rigorous upper/lower bounds throughout all numerical operations. The key insight is that by tracking the full distribution rather than using analytical bounds, we achieve significantly tighter privacy guarantees.
+## High-Level Pipeline
 
-## How It Works
+1. Public API validates inputs and builds PMFs for REMOVE and ADD directions.
+2. Per-round random-allocation PMFs are computed in loss-space via exp-space convolution helpers.
+3. Per-round PMFs are composed across `num_rounds`.
+4. Final PMFs are converted to `dp_accounting.PrivacyLossDistribution`.
+5. Epsilon/delta queries are answered on that PLD object.
 
-### Privacy Bounds
+Both input modes share this shape:
 
-The library maintains two types of bounds throughout all computations:
+- Gaussian mode: starts from analytic log-normal factors.
+- Realization mode: starts from user-provided `PLDRealization`.
 
-- **Upper Bounds (DOMINATES)**: Conservative/pessimistic bounds on privacy loss
-- **Lower Bounds (IS_DOMINATED)**: Optimistic bounds on privacy loss
+## File Map
 
-These bounds ensure that the computed privacy guarantees are rigorous and verifiable.
+| File | Responsibility |
+|---|---|
+| `PLD_accounting/__init__.py` | Public exports. |
+| `PLD_accounting/types.py` | Enums and configs (`PrivacyParams`, `AllocationSchemeConfig`, `BoundType`, etc.). |
+| `PLD_accounting/random_allocation_api.py` | Public entry points for Gaussian and realization accounting. |
+| `PLD_accounting/random_allocation_accounting.py` | Shared realization-based composition helpers and final composition logic. |
+| `PLD_accounting/random_allocation_gaussian.py` | Gaussian-specific factor construction and convolution method selection. |
+| `PLD_accounting/adaptive_random_allocation.py` | Adaptive upper/lower range refinement for epsilon/delta queries. |
+| `PLD_accounting/discrete_dist.py` | Distribution classes (`LinearDiscreteDist`, `GeometricDiscreteDist`, `PLDRealization`, etc.). |
+| `PLD_accounting/distribution_discretization.py` | Continuous-to-discrete conversion and spacing changes (linear/geometric). |
+| `PLD_accounting/FFT_convolution.py` | FFT-based convolution and self-convolution on linear grids. |
+| `PLD_accounting/geometric_convolution.py` | Convolution and self-convolution on geometric grids. |
+| `PLD_accounting/utils.py` | PLD transforms (`exp`, `log`, dual, negate-reverse, composition helpers). |
+| `PLD_accounting/distribution_utils.py` | Numerical utilities (mass conservation, spacing checks, stable comparisons). |
+| `PLD_accounting/dp_accounting_support.py` | Conversion between internal PMFs and `dp_accounting` PMFs/PLDs. |
+| `PLD_accounting/subsample_PLD.py` | PLD-level subsampling amplification helpers (DOMINATES-only path). |
 
-### Privacy Loss Distributions
+## Public API Surface
 
-Privacy loss is represented as discrete probability distributions over a grid of possible loss values. The library:
+Defined in `PLD_accounting/random_allocation_api.py`:
 
-1. Constructs discrete approximations from continuous random variables
-2. Applies privacy-relevant transformations
-3. Composes distributions across multiple operations
-4. Converts results to standard epsilon-delta privacy parameters
+- Gaussian path:
+  - `gaussian_allocation_PLD(...)`
+  - `gaussian_allocation_epsilon_extended(...)`
+  - `gaussian_allocation_delta_extended(...)`
+  - `gaussian_allocation_epsilon_range(...)`
+  - `gaussian_allocation_delta_range(...)`
+- Realization path:
+  - `general_allocation_PLD(...)`
+  - `general_allocation_epsilon(...)`
+  - `general_allocation_delta(...)`
 
-### Numerical Guarantees
+Notes:
 
-The implementation maintains several critical properties:
+- PLD builders reject `BoundType.BOTH`; users build separate DOMINATES and IS_DOMINATED PLDs.
+- Realization-based allocation requires `ConvolutionMethod.GEOM`.
 
-- **Mass Conservation**: Probability mass is preserved across all operations
-- **Tail Semantics**: Explicit tracking of probability mass at infinite endpoints
-- **Stable Computation**: Uses compensated summation and log-space arithmetic to maintain numerical stability
-- **Bound Consistency**: Ensures upper/lower bound semantics are preserved through all transformations
+## Core Composition Modules
 
-### Convolution Methods
+### `random_allocation_accounting.py`
 
-The library offers multiple convolution strategies with different performance characteristics:
+This is the shared composition core for realization-based accounting and shared finalize helpers.
 
-- **GEOM**: Optimized for multiplicative grids and positive supports
-- **FFT**: Efficient for linear-grid compositions with many rounds
-- **COMBINED/BEST_OF_TWO**: Hybrid approaches that combine methods to achieve tighter bounds
+Key functions:
 
-## Privacy Guarantees
+- `decompose_allocation_compositions(...)`:
+  Converts `(num_steps, num_selected, num_epochs)` into
+  `(num_steps_per_round, num_rounds)`.
+- `allocation_PMF_from_realization(...)`:
+  Builds per-direction PMF from a `PLDRealization`.
+- `log_mean_exp_remove(...)` and `log_mean_exp_add(...)`:
+  Implement the exp-space convolution core used by Appendix C algorithms.
+- `finalize_allocation_composition(...)`:
+  Regrid, compose across `num_rounds`, and regrid to output discretization.
+- `compose_pld_from_pmfs(...)`:
+  Converts internal PMFs into a `dp_accounting` PLD object.
 
-The library provides rigorous differential privacy guarantees by:
+### `random_allocation_gaussian.py`
 
-1. Maintaining explicit bound directions (upper/lower) at every stage
-2. Using domination-aware rounding and truncation
-3. Preserving tail behavior through explicit infinity-mass tracking
-4. Ensuring all numerical operations maintain bound consistency
+Gaussian-specific path that constructs factors analytically, then reuses shared composition logic.
 
-Each computation stage produces a controlled approximation that remains consistent with the intended privacy guarantee semantics.
+Key functions:
 
-## Subsampling
+- `compute_conv_params(...)`: derives grid sizes, truncation budgets, and
+  `(num_steps_per_round, num_rounds)`.
+- `allocation_PMF_from_gaussian(...)`: dispatches by direction and convolution method (`FFT`, `GEOM`, `BEST_OF_TWO`, `COMBINED`), then finalizes composition.
+- Internal builders:
+  - `_allocation_PMF_remove_fft(...)`
+  - `_allocation_PMF_remove_geom(...)`
+  - `_allocation_PMF_add_fft(...)`
+  - `_allocation_PMF_add_geom(...)`
 
-Subsampling is handled directly in privacy loss distribution space using:
+## Adaptive Refinement
 
-- Stable loss transforms for subsample probabilities
-- Dual-based construction for proper mixture handling
-- Grid remapping with bound-aware rounding
+`PLD_accounting/adaptive_random_allocation.py` computes upper/lower ranges by iteratively refining:
 
-This ensures subsampling integrates seamlessly with the composition machinery.
+- `loss_discretization` (halved each step)
+- `tail_truncation` (divided by 10 each step)
 
-## API Integration
+Entry points:
 
-The library provides a thin compatibility layer with Google's `dp_accounting` library, converting internal `DiscreteDist` representations to standard `PrivacyLossDistribution` objects. This allows users to leverage existing tooling while benefiting from the tighter bounds computed by this library.
+- `optimize_allocation_epsilon_range(...)`
+- `optimize_allocation_delta_range(...)`
 
-For usage examples and API details, see [README.md](README.md).
+The module tracks best upper/lower bounds across iterations and returns `AdaptiveResult`.
+
+## Subsampling Integration
+
+`PLD_accounting/subsample_PLD.py` provides:
+
+- `subsample_PLD(pld, sampling_probability)`
+- `subsample_PMF(base_pld, sampling_prob, direction)`
+
+This module implements PLD-based subsampling amplification (Appendix C mapping) and uses DOMINATES semantics.
+
+## Numerical Invariants
+
+Across the codebase:
+
+- Infinity atoms (`p_neg_inf`, `p_pos_inf`) are represented explicitly.
+- Mass conservation is enforced after discretization and convolution.
+- Bound semantics are preserved during regridding/truncation:
+  - `BoundType.DOMINATES` for upper bounds
+  - `BoundType.IS_DOMINATED` for lower bounds
+- Loss-space and exp-space transforms are explicit (`exp_linear_to_geometric`, `log_geometric_to_linear`).
+
+## Practical Extension Points
+
+- New mechanisms can be added by producing valid `PLDRealization` inputs and
+  using `general_allocation_PLD(...)`.
+- Gaussian method tuning is controlled by `AllocationSchemeConfig` and
+  `ConvolutionMethod`.
+- Additional accounting workflows can compose returned `dp_accounting` PLDs directly.
