@@ -1,76 +1,144 @@
+"""Geometric-grid convolution for privacy loss distributions."""
+
 from __future__ import annotations
+
+import math
 
 import numpy as np
 from numba import njit
 from numpy.typing import NDArray
 
-from PLD_accounting.types import BoundType
-from PLD_accounting.discrete_dist import GeometricDiscreteDist
-from PLD_accounting.distribution_utils import compute_bin_ratio_two_arrays, enforce_mass_conservation
-from PLD_accounting.utils import binary_self_convolve, convolve_infinite_masses
+from PLD_accounting.discrete_dist import DenseDiscreteDist, Domain
+from PLD_accounting.distribution_utils import (
+    enforce_mass_conservation,
+    stable_isclose,
+)
+from PLD_accounting.types import BoundType, SpacingType
+from PLD_accounting.utils import (
+    binary_self_convolve,
+    convolve_boundary_masses,
+)
+from PLD_accounting.validation import validate_bound_type
 
+# Rounding tolerance for grid bin mapping — must stay at machine-epsilon scale
+# to avoid misrouting mass between bins.
+_GRID_ROUNDING_TOL = 10 * np.finfo(np.float64).eps
 
 # =============================================================================
 # PUBLIC API
 # =============================================================================
 
 
-def geometric_convolve(*,
-    dist_1: GeometricDiscreteDist,
-    dist_2: GeometricDiscreteDist,
+def geometric_convolve(
+    *,
+    dist_1: DenseDiscreteDist,
+    dist_2: DenseDiscreteDist,
     tail_truncation: float,
     bound_type: BoundType,
-) -> GeometricDiscreteDist:
-    """
-    Convolve two geometric-grid distributions.
+) -> DenseDiscreteDist:
+    """Convolve two geometric-grid distributions.
 
     Algorithm 4 (`conv`) in Appendix C wrapper.
+    For POSITIVES-domain distributions the 0 atom is neutral (not absorbing),
+    so cross-terms (0 + finite and finite + 0) are added to the finite PMF.
     """
+    # Input validation
+    if not (
+        isinstance(dist_1, DenseDiscreteDist)
+        and dist_1.spacing_type == SpacingType.GEOMETRIC
+        and dist_1.domain == Domain.POSITIVES
+    ) or not (
+        isinstance(dist_2, DenseDiscreteDist)
+        and dist_2.spacing_type == SpacingType.GEOMETRIC
+        and dist_2.domain == Domain.POSITIVES
+    ):
+        raise TypeError(
+            "geometric_convolve requires geometric DenseDiscreteDist inputs on "
+            f"Domain.POSITIVES; got dist_1={type(dist_1).__name__} "
+            f"(spacing={dist_1.spacing_type}, domain={dist_1.domain}), "
+            f"dist_2={type(dist_2).__name__} "
+            f"(spacing={dist_2.spacing_type}, domain={dist_2.domain})"
+        )
+    if tail_truncation < 0:
+        raise ValueError(f"tail_truncation must be non-negative, got {tail_truncation}")
+
     # Ensure both inputs share the same growth factor.
-    ratio = compute_bin_ratio_two_arrays(x_array_1=dist_1.x_array, x_array_2=dist_2.x_array)
+    if not stable_isclose(a=dist_1.step, b=dist_2.step):
+        raise ValueError(
+            f"Grid ratios must match: ratio_1={dist_1.step:.12g}, ratio_2={dist_2.step:.12g}"
+        )
+    ratio = dist_1.step
 
     # Core Numeric Convolution
     x_out, pmf_conv = _compute_geometric_convolution(
         x1=dist_1.x_array,
-        p1=dist_1.PMF_array,
+        p1=dist_1.prob_arr,
         x2=dist_2.x_array,
-        p2=dist_2.PMF_array,
+        p2=dist_2.prob_arr,
         r=ratio,
         bound_type=bound_type,
     )
 
-    expected_neg_inf, expected_pos_inf = convolve_infinite_masses(
-        p_neg_inf_1=dist_1.p_neg_inf,
-        p_pos_inf_1=dist_1.p_pos_inf,
-        p_neg_inf_2=dist_2.p_neg_inf,
-        p_pos_inf_2=dist_2.p_pos_inf,
+    # Add cross-terms from the 0 atom
+    x_out_0 = float(x_out[0])
+    pmf_conv = _add_single_zero_atom_cross_term(
+        pmf_conv=pmf_conv,
+        x_arr=dist_2.x_array,
+        prob_arr=dist_2.prob_arr,
+        zero_prob=dist_1.p_min,
+        x_out_0=x_out_0,
+        r=ratio,
+        bound_type=bound_type,
     )
-    pmf_conv, p_neg_inf, p_pos_inf = enforce_mass_conservation(
-        PMF_array=pmf_conv,
-        expected_neg_inf=expected_neg_inf,
-        expected_pos_inf=expected_pos_inf,
+    pmf_conv = _add_single_zero_atom_cross_term(
+        pmf_conv=pmf_conv,
+        x_arr=dist_1.x_array,
+        prob_arr=dist_1.prob_arr,
+        zero_prob=dist_2.p_min,
+        x_out_0=x_out_0,
+        r=ratio,
         bound_type=bound_type,
     )
 
-    return GeometricDiscreteDist(
+    expected_p_min, expected_p_max = convolve_boundary_masses(
+        dist_1.p_min, dist_1.p_max, dist_2.p_min, dist_2.p_max, dist_1.domain
+    )
+
+    pmf_conv, p_min, p_max = enforce_mass_conservation(
+        prob_arr=pmf_conv,
+        expected_p_min=expected_p_min,
+        expected_p_max=expected_p_max,
+        bound_type=bound_type,
+    )
+
+    return DenseDiscreteDist(
         x_min=float(x_out[0]),
-        ratio=ratio,
-        PMF_array=pmf_conv,
-        p_neg_inf=p_neg_inf,
-        p_pos_inf=p_pos_inf,
+        step=ratio,
+        prob_arr=pmf_conv,
+        p_min=p_min,
+        p_max=p_max,
+        spacing_type=SpacingType.GEOMETRIC,
+        domain=Domain.POSITIVES,
     ).truncate_edges(tail_truncation, bound_type)
 
 
-
-def geometric_self_convolve(*,
-    dist: GeometricDiscreteDist,
+def geometric_self_convolve(
+    *,
+    dist: DenseDiscreteDist,
     T: int,
     tail_truncation: float,
     bound_type: BoundType,
-) -> GeometricDiscreteDist:
-    """
-    Self-convolve distribution T times using binary exponentiation.
-    """
+) -> DenseDiscreteDist:
+    """Self-convolve distribution T times using binary exponentiation."""
+    # Input validation
+    if not (isinstance(dist, DenseDiscreteDist) and dist.spacing_type == SpacingType.GEOMETRIC):
+        raise TypeError(f"dist must be DenseDiscreteDist, got {type(dist)}")
+    validate_bound_type(bound_type)
+    if T < 1:
+        raise ValueError(f"T must be >= 1, got {T}")
+    if tail_truncation < 0:
+        raise ValueError(f"tail_truncation must be non-negative, got {tail_truncation}")
+
     self_conv = binary_self_convolve(
         dist=dist,
         T=T,
@@ -78,8 +146,10 @@ def geometric_self_convolve(*,
         bound_type=bound_type,
         convolve=geometric_convolve,
     )
-    if not isinstance(self_conv, GeometricDiscreteDist):
-        raise TypeError(f"Expected GeometricDiscreteDist from self-convolution, got {type(self_conv)}")
+    if not (
+        isinstance(self_conv, DenseDiscreteDist) and self_conv.spacing_type == SpacingType.GEOMETRIC
+    ):
+        raise TypeError(f"Expected DenseDiscreteDist from self-convolution, got {type(self_conv)}")
     return self_conv
 
 
@@ -88,7 +158,8 @@ def geometric_self_convolve(*,
 # =============================================================================
 
 
-def _compute_geometric_convolution(*,
+def _compute_geometric_convolution(
+    *,
     x1: NDArray[np.float64],
     p1: NDArray[np.float64],
     x2: NDArray[np.float64],
@@ -96,8 +167,7 @@ def _compute_geometric_convolution(*,
     r: float,
     bound_type: BoundType,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """
-    Align grids, compute bin mapping parameters, and invoke the Numba kernel.
+    """Align grids, compute bin mapping parameters, and invoke the Numba kernel.
 
     Algorithm 4 (`conv`) with internal Algorithm 5 (`range-renorm`) in Appendix C.
     """
@@ -163,7 +233,7 @@ def _compute_geometric_convolution(*,
     # Rounding strategy
     delta_lohi = np.zeros(n, dtype=np.int64)
     delta_hilo = np.zeros(n, dtype=np.int64)
-    rounding_eps = 1e-16
+    rounding_eps = _GRID_ROUNDING_TOL
 
     if bound_type == BoundType.DOMINATES:
         # Pessimistic: Round UP
@@ -190,15 +260,14 @@ def _compute_geometric_convolution(*,
     return x_out, pmf_out
 
 
-def _pad_right_geometric(*,
+def _pad_right_geometric(
+    *,
     x: NDArray[np.float64],
     p: NDArray[np.float64],
     r: float,
     target_n: int,
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """
-    Helper: Extend grid to the right to reach target_n using ratio r.
-    """
+    """Extend grid to the right to reach target_n using ratio r."""
     x = np.asarray(x, dtype=np.float64)
     p = np.asarray(p, dtype=np.float64)
     n = x.size
@@ -217,15 +286,17 @@ def _pad_right_geometric(*,
 
 
 @njit(cache=True)
-def _numba_geometric_kernel(*,
+def _numba_geometric_kernel(
+    *,
     PMF_base: NDArray[np.float64],
     PMF_scaled: NDArray[np.float64],
     delta_lohi: NDArray[np.int64],
     delta_hilo: NDArray[np.int64],
 ) -> NDArray[np.float64]:
-    """
-    Core convolution loop.
+    """Core convolution loop.
+
     Calculates Z = X + Y by iterating over the difference 'd' between indices.
+
     """
     n = PMF_base.size
     pmf_out = np.zeros(n, dtype=np.float64)
@@ -259,5 +330,68 @@ def _numba_geometric_kernel(*,
                 t = pmf_out[k2] + y
                 comp[k2] = (t - pmf_out[k2]) - y
                 pmf_out[k2] = t
+
+    return pmf_out
+
+
+def _add_single_zero_atom_cross_term(
+    *,
+    pmf_conv: NDArray[np.float64],
+    x_arr: NDArray[np.float64],
+    prob_arr: NDArray[np.float64],
+    zero_prob: float,
+    x_out_0: float,
+    r: float,
+    bound_type: BoundType,
+) -> NDArray[np.float64]:
+    """Map one family of 0+finite cross-terms onto the fixed output grid."""
+    if zero_prob == 0.0:
+        return pmf_conv
+
+    return _numba_add_single_zero_atom_cross_term(
+        pmf_out=pmf_conv,
+        x_vals=np.asarray(x_arr, dtype=np.float64),
+        prob_arr=np.asarray(prob_arr, dtype=np.float64),
+        zero_prob=float(zero_prob),
+        x_out_0=float(x_out_0),
+        log_r=float(math.log(r)),
+        dominates=(bound_type == BoundType.DOMINATES),
+    )
+
+
+@njit(cache=True)
+def _numba_add_single_zero_atom_cross_term(
+    *,
+    pmf_out: NDArray[np.float64],
+    x_vals: NDArray[np.float64],
+    prob_arr: NDArray[np.float64],
+    zero_prob: float,
+    x_out_0: float,
+    log_r: float,
+    dominates: bool,
+) -> NDArray[np.float64]:
+    """Core loop for one 0+finite cross-term family."""
+    n = pmf_out.size
+
+    for i in range(prob_arr.size):
+        weight = prob_arr[i] * zero_prob
+        if weight == 0.0:
+            continue
+
+        x = x_vals[i]
+        if x <= 0.0:
+            continue
+
+        frac_k = math.log(x / x_out_0) / log_r
+        if dominates:
+            k = int(math.ceil(frac_k - _GRID_ROUNDING_TOL))
+        else:
+            k = int(math.floor(frac_k + _GRID_ROUNDING_TOL))
+
+        if 0 <= k < n:
+            pmf_out[k] += weight
+        elif k < 0 and dominates:
+            # Upper-bound rounding maps sub-grid mass to the first finite bin.
+            pmf_out[0] += weight
 
     return pmf_out

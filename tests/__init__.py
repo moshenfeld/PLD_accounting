@@ -1,5 +1,4 @@
-"""
-Test suite for random allocation PLD project.
+"""Test suite for the PLD_accounting package.
 
 Test organization:
 - unit/: Unit tests for individual functions and classes

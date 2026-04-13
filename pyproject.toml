@@ -40,6 +40,7 @@ dependencies = [
   "scipy>=1.10",
   "numba>=0.58",
   "dp-accounting>=0.4.3",
+  "random_allocation>=1.0.4",
   "typing-extensions>=4.0",
 ]
 

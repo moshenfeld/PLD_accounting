@@ -38,11 +38,9 @@ Gaussian path (most common):
 
 - `gaussian_allocation_epsilon_range(delta, sigma, num_steps, num_selected=1, num_epochs=1, epsilon_accuracy=-1.0)`
   - Adaptive upper/lower bounds for epsilon.
-- `gaussian_allocation_delta_range(epsilon, sigma, num_steps, num_selected=1, num_epochs=1, delta_accuracy=-1.0)`
-  - Adaptive upper/lower bounds for delta.
-- `gaussian_allocation_epsilon_extended(params, config, bound_type=BoundType.DOMINATES)`
+- `gaussian_allocation_epsilon_configurable(params, config, bound_type=BoundType.DOMINATES)`
   - Single epsilon query with explicit discretization/convolution config.
-- `gaussian_allocation_delta_extended(params, config, bound_type=BoundType.DOMINATES)`
+- `gaussian_allocation_delta_configurable(params, config, bound_type=BoundType.DOMINATES)`
   - Single delta query with explicit discretization/convolution config.
 - `gaussian_allocation_PLD(params, config, bound_type=BoundType.DOMINATES)`
   - Build a reusable `dp_accounting.PrivacyLossDistribution`.
@@ -68,7 +66,7 @@ PLD-based subsampling helpers:
 
 - `subsample_PLD(pld, sampling_probability)`
   - Applies subsampling amplification to a `dp_accounting` PLD.
-- `subsample_PMF(base_pld, sampling_prob, direction)`
+- `subsample_PLD_realization(base_pld, sampling_prob, direction)`
   - Lower-level helper for `PLDRealization` inputs (REMOVE/ADD direction).
 
 Subsampling helpers use DOMINATES semantics (upper-bound style).
@@ -81,5 +79,5 @@ pip install PLD_accounting
 
 ## Where To Start
 
-- Usage examples: [usage_example.py](usage_example.py)
+- End-to-end tutorial notebook: [PLD_accounting_tutorial.ipynb](PLD_accounting_tutorial.ipynb)
 - Implementation details: [IMPLEMENTATION_OVERVIEW.md](IMPLEMENTATION_OVERVIEW.md)

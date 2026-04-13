@@ -28,6 +28,8 @@ bash tests_extended/run_suites.sh medium
 bash tests_extended/run_suites.sh long
 ```
 
+These tiers are nested, and each one already begins by running the public/basic unit suite from `public/tests/unit/`. If you just ran one of the scripted tiers, rerunning root `pytest` is redundant unless you specifically want the public/basic suite output on its own.
+
 Or run explicit paths, for example:
 
 ```bash
@@ -36,10 +38,11 @@ pytest tests_extended/integration/test_pld_realizations.py -q
 
 ## Legacy implementation tests
 
-Tests for the frozen reference implementation under `legacy/PLD_accounting/` are in `legacy/tests/`. Use an explicit path and set `PYTHONPATH` so `PLD_accounting` resolves to `legacy/PLD_accounting` and (for a few integration tests) `utils` / `comparisons` resolve via `experiments`:
+Tests for the frozen reference implementation under `legacy/PLD_accounting/` are in `legacy/tests/`. Use an explicit path and set `PYTHONPATH` so `PLD_accounting` resolves to `legacy/PLD_accounting`, the in-tree `tests` package wins over any site-packages `tests`, and (for a few integration tests) `utils` / `comparisons` resolve via `experiments`:
 
 ```bash
-PYTHONPATH=legacy:experiments pytest legacy/tests -q
+PYTHONPATH=legacy/tests:legacy:experiments \
+  pytest legacy/tests -q --import-mode=importlib --confcutdir=legacy/tests
 ```
 
 Install runtime and test dependencies with `pip install -r experiments/requirements.txt` (not a separate `legacy/requirements.txt`).

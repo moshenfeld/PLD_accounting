@@ -1,27 +1,41 @@
-"""
-Gaussian-specific random-allocation accounting.
-"""
+"""Gaussian-specific random-allocation accounting."""
 
 from __future__ import annotations
 
 from functools import partial
 
 import numpy as np
+from numpy.typing import NDArray
 from scipy import stats
 
-from PLD_accounting.FFT_convolution import FFT_convolve, FFT_self_convolve
-from PLD_accounting.discrete_dist import GeometricDiscreteDist, LinearDiscreteDist
+from PLD_accounting.discrete_dist import DenseDiscreteDist, Domain
 from PLD_accounting.distribution_discretization import (
-    MIN_GRID_SIZE,
-    change_spacing_type,
+    discretize_continuous_dist,
     discretize_continuous_distribution,
-    discretize_continuous_to_pmf,
+    rediscritize_dist,
 )
-from PLD_accounting.distribution_utils import compute_bin_width
-from PLD_accounting.random_allocation_accounting import geometric_allocation_PMF_base_add, geometric_allocation_PMF_base_remove
-from PLD_accounting.types import AllocationSchemeConfig, BoundType, ConvolutionMethod, Direction, SpacingType
-from PLD_accounting.utils import combine_distributions, log_geometric_to_linear, negate_reverse_linear_distribution
-
+from PLD_accounting.distribution_utils import MIN_GRID_SIZE, compute_bin_width
+from PLD_accounting.FFT_convolution import FFT_convolve, FFT_self_convolve
+from PLD_accounting.random_allocation_accounting import (
+    geometric_allocation_PLD_base_add,
+    geometric_allocation_PLD_base_remove,
+)
+from PLD_accounting.types import (
+    AllocationSchemeConfig,
+    BoundType,
+    ConvolutionMethod,
+    Direction,
+    SpacingType,
+)
+from PLD_accounting.utils import (
+    combine_distributions,
+    log_geometric_to_linear,
+    negate_reverse_linear_distribution,
+)
+from PLD_accounting.validation import (
+    validate_bound_type,
+    validate_discretization_params,
+)
 
 _TAIL_EPS_FLOOR = float(np.finfo(float).eps * 1e-10)
 
@@ -31,7 +45,7 @@ _TAIL_EPS_FLOOR = float(np.finfo(float).eps * 1e-10)
 # =============================================================================
 
 
-def gaussian_allocation_PMF_core(
+def gaussian_allocation_PLD_core(
     *,
     num_steps: int,
     loss_discretization: float,
@@ -40,12 +54,23 @@ def gaussian_allocation_PMF_core(
     direction: Direction,
     sigma: float,
     config: AllocationSchemeConfig,
-) -> LinearDiscreteDist:
-    """
-    Route one Gaussian component through GEOM/FFT/BEST backend selection.
+) -> DenseDiscreteDist:
+    """Route one Gaussian component through GEOM/FFT/BEST backend selection.
 
     This is the Gaussian-side orchestrator used by the shared allocation core.
     """
+    # Input validation
+    if num_steps < 1:
+        raise ValueError(f"num_steps must be >= 1, got {num_steps}")
+    if sigma <= 0:
+        raise ValueError(f"sigma must be positive, got {sigma}")
+    validate_discretization_params(loss_discretization, tail_truncation)
+    validate_bound_type(bound_type)
+    if direction not in (Direction.ADD, Direction.REMOVE):
+        raise ValueError(f"Invalid direction: {direction}")
+    if not isinstance(config, AllocationSchemeConfig):
+        raise TypeError(f"config must be AllocationSchemeConfig, got {type(config)}")
+
     convolution_method = config.convolution_method
     if convolution_method == ConvolutionMethod.COMBINED:
         if direction == Direction.ADD:
@@ -121,13 +146,14 @@ def _gaussian_allocation_geom(
     direction: Direction,
     sigma: float,
     config: AllocationSchemeConfig,
-) -> LinearDiscreteDist:
-    """
-    GEOM path intentionally mirrors realization path after base creation:
-    both call geometric_allocation_PMF_base_* with identical wiring.
+) -> DenseDiscreteDist:
+    """GEOM path intentionally mirrors realization path after base creation.
+
+    Both call geometric_allocation_PLD_base_* with identical wiring.
+
     """
     if direction == Direction.ADD:
-        return geometric_allocation_PMF_base_add(
+        return geometric_allocation_PLD_base_add(
             base_distributions_creation=partial(
                 _gaussian_add_geom_loss_factor,
                 sigma=sigma,
@@ -139,7 +165,7 @@ def _gaussian_allocation_geom(
             bound_type=bound_type,
         )
     if direction == Direction.REMOVE:
-        return geometric_allocation_PMF_base_remove(
+        return geometric_allocation_PLD_base_remove(
             base_distributions_creation=partial(
                 _gaussian_remove_geom_loss_factors,
                 sigma=sigma,
@@ -160,10 +186,8 @@ def _gaussian_remove_geom_loss_factors(
     bound_type: BoundType,
     sigma: float,
     config: AllocationSchemeConfig,
-) -> tuple[LinearDiscreteDist, LinearDiscreteDist]:
-    """
-    Build REMOVE GEOM one-step loss factors as ``(base, dual_base)``.
-    """
+) -> tuple[DenseDiscreteDist, DenseDiscreteDist]:
+    """Build REMOVE GEOM one-step PLD factors as ``(base, dual_base)``."""
     sigma_inv = 1.0 / sigma
     factor_tail_truncation = tail_truncation / 2
     n_grid_geom = _geom_grid_size(
@@ -173,22 +197,22 @@ def _gaussian_remove_geom_loss_factors(
         config=config,
     )
 
-    lower_norm_mean = -sigma_inv**2 / 2
-    upper_norm_mean = sigma_inv**2 / 2
-    exp_L_QP_neg = stats.lognorm(s=sigma_inv, scale=np.exp(lower_norm_mean))
-    exp_L_PQ = stats.lognorm(s=sigma_inv, scale=np.exp(upper_norm_mean))
+    dual_norm_mean = -(sigma_inv**2) / 2
+    base_norm_mean = sigma_inv**2 / 2
+    exp_dual = stats.lognorm(s=sigma_inv, scale=np.exp(dual_norm_mean))
+    exp_base = stats.lognorm(s=sigma_inv, scale=np.exp(base_norm_mean))
 
-    lower_x_min = exp_L_QP_neg.ppf(factor_tail_truncation)
-    lower_x_max = exp_L_QP_neg.isf(factor_tail_truncation)
-    upper_x_min = exp_L_PQ.ppf(factor_tail_truncation)
-    upper_x_max = exp_L_PQ.isf(factor_tail_truncation)
-    log_span = max(np.log(lower_x_max / lower_x_min), np.log(upper_x_max / upper_x_min))
+    dual_x_min = exp_dual.ppf(factor_tail_truncation)
+    dual_x_max = exp_dual.isf(factor_tail_truncation)
+    base_x_min = exp_base.ppf(factor_tail_truncation)
+    base_x_max = exp_base.isf(factor_tail_truncation)
+    log_span = max(np.log(dual_x_max / dual_x_min), np.log(base_x_max / base_x_min))
     shared_log_step = log_span / (n_grid_geom - 1)
 
-    base_dist_lower = discretize_continuous_to_pmf(
-        dist=exp_L_QP_neg,
+    dual_factor_dist = discretize_continuous_dist(
+        dist=exp_dual,
         x_array=_build_shared_geometric_grid(
-            dist=exp_L_QP_neg,
+            dist=exp_dual,
             tail_truncation=factor_tail_truncation,
             log_step=shared_log_step,
         ),
@@ -196,12 +220,20 @@ def _gaussian_remove_geom_loss_factors(
         PMF_min_increment=factor_tail_truncation,
         spacing_type=SpacingType.GEOMETRIC,
     )
-    assert isinstance(base_dist_lower, GeometricDiscreteDist)
+    if not (
+        isinstance(dual_factor_dist, DenseDiscreteDist)
+        and dual_factor_dist.spacing_type == SpacingType.GEOMETRIC
+    ):
+        _st = getattr(dual_factor_dist, "spacing_type", "?")
+        raise TypeError(
+            "Expected DenseDiscreteDist with GEOMETRIC spacing, "
+            f"got {type(dual_factor_dist).__name__} with spacing {_st}"
+        )
 
-    base_dist_upper = discretize_continuous_to_pmf(
-        dist=exp_L_PQ,
+    base_factor_dist = discretize_continuous_dist(
+        dist=exp_base,
         x_array=_build_shared_geometric_grid(
-            dist=exp_L_PQ,
+            dist=exp_base,
             tail_truncation=factor_tail_truncation,
             log_step=shared_log_step,
         ),
@@ -209,12 +241,20 @@ def _gaussian_remove_geom_loss_factors(
         PMF_min_increment=factor_tail_truncation,
         spacing_type=SpacingType.GEOMETRIC,
     )
-    assert isinstance(base_dist_upper, GeometricDiscreteDist)
+    if not (
+        isinstance(base_factor_dist, DenseDiscreteDist)
+        and base_factor_dist.spacing_type == SpacingType.GEOMETRIC
+    ):
+        _st = getattr(base_factor_dist, "spacing_type", "?")
+        raise TypeError(
+            "Expected DenseDiscreteDist with GEOMETRIC spacing, "
+            f"got {type(base_factor_dist).__name__} with spacing {_st}"
+        )
 
-    lower_loss_factor = log_geometric_to_linear(base_dist_lower)
-    upper_loss_factor = log_geometric_to_linear(base_dist_upper)
-    # geometric_allocation_PMF_base_remove expects (base, dual_base).
-    return upper_loss_factor, lower_loss_factor
+    dual_loss_factor = log_geometric_to_linear(dual_factor_dist)
+    base_loss_factor = log_geometric_to_linear(base_factor_dist)
+    # geometric_allocation_PLD_base_remove expects (base, dual_base).
+    return base_loss_factor, dual_loss_factor
 
 
 def _gaussian_add_geom_loss_factor(
@@ -224,10 +264,8 @@ def _gaussian_add_geom_loss_factor(
     bound_type: BoundType,
     sigma: float,
     config: AllocationSchemeConfig,
-) -> LinearDiscreteDist:
-    """
-    Build ADD GEOM one-step linear loss factor.
-    """
+) -> DenseDiscreteDist:
+    """Build ADD GEOM one-step linear PLD factor."""
     sigma_inv = 1.0 / sigma
     n_grid_geom = _geom_grid_size(
         sigma_inv=sigma_inv,
@@ -238,14 +276,20 @@ def _gaussian_add_geom_loss_factor(
     exp_bound_type = _flip_bound_type(bound_type)
 
     base_dist = discretize_continuous_distribution(
-        dist=stats.lognorm(s=sigma_inv, scale=np.exp(-sigma_inv**2 / 2)),
+        dist=stats.lognorm(s=sigma_inv, scale=np.exp(-(sigma_inv**2) / 2)),
         tail_truncation=tail_truncation,
         bound_type=exp_bound_type,
         spacing_type=SpacingType.GEOMETRIC,
         n_grid=n_grid_geom,
         align_to_multiples=True,
     )
-    assert isinstance(base_dist, GeometricDiscreteDist)
+    if not (
+        isinstance(base_dist, DenseDiscreteDist) and base_dist.spacing_type == SpacingType.GEOMETRIC
+    ):
+        raise TypeError(
+            f"Expected DenseDiscreteDist with GEOMETRIC spacing, "
+            f"got {type(base_dist).__name__} with spacing {getattr(base_dist, 'spacing_type', '?')}"
+        )
     return log_geometric_to_linear(base_dist)
 
 
@@ -256,9 +300,7 @@ def _geom_grid_size(
     tail_probability: float,
     config: AllocationSchemeConfig,
 ) -> int:
-    """
-    Compute GEOM grid size from tail probability and log-loss span.
-    """
+    """Compute GEOM grid size from tail probability and log-loss span."""
     if tail_probability <= 0.0:
         grid_size = MIN_GRID_SIZE
     else:
@@ -278,16 +320,16 @@ def _build_shared_geometric_grid(
     dist: stats.rv_continuous,
     tail_truncation: float,
     log_step: float,
-) -> np.ndarray:
-    """
-    Build a geometric grid snapped to a shared log-space lattice.
-    """
+) -> NDArray[np.float64]:
+    """Build a geometric grid snapped to a shared log-space lattice."""
     x_min = dist.ppf(tail_truncation)
     x_max = dist.isf(tail_truncation)
     if not np.isfinite(x_min) or not np.isfinite(x_max):
         raise ValueError(f"Quantiles not finite: x_min={x_min}, x_max={x_max}")
     if x_min <= 0.0:
-        raise ValueError(f"Geometric spacing requires positive values, got x_min={x_min}, x_max={x_max}")
+        raise ValueError(
+            f"Geometric spacing requires positive values, got x_min={x_min}, x_max={x_max}"
+        )
     if x_max <= x_min:
         raise ValueError(f"x_max must be greater than x_min, got x_min={x_min}, x_max={x_max}")
 
@@ -317,10 +359,8 @@ def _gaussian_allocation_fft(
     direction: Direction,
     sigma: float,
     config: AllocationSchemeConfig,
-) -> LinearDiscreteDist:
-    """
-    Build one FFT-based Gaussian PMF component for REMOVE or ADD.
-    """
+) -> DenseDiscreteDist:
+    """Build one FFT-based Gaussian PMF component for REMOVE or ADD."""
     sigma_inv = 1.0 / sigma
     single_step_tail_truncation = max(float(tail_truncation / num_steps), _TAIL_EPS_FLOOR)
     single_step_n_grid = max(int(np.ceil(config.max_grid_FFT / num_steps)), MIN_GRID_SIZE)
@@ -359,20 +399,29 @@ def _gaussian_allocation_fft_add(
     sigma_inv: float,
     single_step_tail_truncation: float,
     single_step_n_grid: int,
-) -> LinearDiscreteDist:
-    """
-    Build ADD-direction FFT component and convert back to linear loss space.
-    """
+) -> DenseDiscreteDist:
+    """Build ADD-direction FFT component and convert back to linear loss space."""
     exp_bound_type = _flip_bound_type(bound_type)
     base_dist = discretize_continuous_distribution(
-        dist=stats.lognorm(s=sigma_inv, scale=np.exp(-sigma_inv**2 / 2 - np.log(num_steps))),
+        dist=stats.lognorm(s=sigma_inv, scale=np.exp(-(sigma_inv**2) / 2 - np.log(num_steps))),
         tail_truncation=single_step_tail_truncation,
         bound_type=exp_bound_type,
         spacing_type=SpacingType.LINEAR,
         n_grid=single_step_n_grid,
         align_to_multiples=False,
+        domain=Domain.POSITIVES,
     )
-    assert isinstance(base_dist, LinearDiscreteDist)
+    if not (
+        isinstance(base_dist, DenseDiscreteDist) and base_dist.spacing_type == SpacingType.LINEAR
+    ):
+        raise TypeError(
+            f"Expected DenseDiscreteDist with LINEAR spacing, "
+            f"got {type(base_dist).__name__} with spacing {getattr(base_dist, 'spacing_type', '?')}"
+        )
+    # Fold zero-atom into leftmost finite bin before FFT convolution.
+    base_dist.prob_arr[0] += base_dist.p_min
+    base_dist.p_min = 0
+
     conv_dist = FFT_self_convolve(
         dist=base_dist,
         T=num_steps,
@@ -380,14 +429,20 @@ def _gaussian_allocation_fft_add(
         bound_type=exp_bound_type,
         use_direct=True,
     )
-    exp_geom = change_spacing_type(
+    exp_geom = rediscritize_dist(
         dist=conv_dist,
         tail_truncation=0.0,
         loss_discretization=loss_discretization,
         spacing_type=SpacingType.GEOMETRIC,
         bound_type=exp_bound_type,
     )
-    assert isinstance(exp_geom, GeometricDiscreteDist)
+    if not (
+        isinstance(exp_geom, DenseDiscreteDist) and exp_geom.spacing_type == SpacingType.GEOMETRIC
+    ):
+        raise TypeError(
+            f"Expected DenseDiscreteDist with GEOMETRIC spacing, "
+            f"got {type(exp_geom).__name__} with spacing {getattr(exp_geom, 'spacing_type', '?')}"
+        )
     log_dist = log_geometric_to_linear(exp_geom)
     return negate_reverse_linear_distribution(log_dist)
 
@@ -401,84 +456,109 @@ def _gaussian_allocation_fft_remove(
     sigma_inv: float,
     single_step_tail_truncation: float,
     single_step_n_grid: int,
-) -> LinearDiscreteDist:
-    """
-    Build REMOVE-direction FFT component and convert back to linear loss space.
+) -> DenseDiscreteDist:
+    """Build REMOVE-direction FFT component and convert back to linear loss space.
+
+    Only BoundType.DOMINATES is supported.
     """
     if num_steps < 2:
         raise ValueError("REMOVE direction requires at least two steps per round")
+    if bound_type != BoundType.DOMINATES:
+        raise ValueError(f"FFT REMOVE route only supports BoundType.DOMINATES, got {bound_type}")
 
     factor_tail = single_step_tail_truncation / 2
     core_tail = tail_truncation / 2
-    lower_norm_mean = -sigma_inv**2 / 2 - np.log(num_steps)
-    upper_norm_mean = sigma_inv**2 / 2 - np.log(num_steps)
-    lower_shift = np.exp(lower_norm_mean + sigma_inv**2 / 2)
-    upper_shift = np.exp(upper_norm_mean + sigma_inv**2 / 2)
+    dual_norm_mean = -(sigma_inv**2) / 2 - np.log(num_steps)
+    base_norm_mean = sigma_inv**2 / 2 - np.log(num_steps)
+    dual_shift = np.exp(dual_norm_mean + sigma_inv**2 / 2)
+    base_shift = np.exp(base_norm_mean + sigma_inv**2 / 2)
 
-    base_dist_lower = discretize_continuous_distribution(
-        dist=stats.lognorm(s=sigma_inv, scale=np.exp(lower_norm_mean)),
+    dual_dist = discretize_continuous_distribution(
+        dist=stats.lognorm(s=sigma_inv, scale=np.exp(dual_norm_mean)),
         tail_truncation=factor_tail,
         bound_type=bound_type,
         spacing_type=SpacingType.LINEAR,
         n_grid=single_step_n_grid,
         align_to_multiples=False,
+        domain=Domain.POSITIVES,
     )
-    assert isinstance(base_dist_lower, LinearDiscreteDist)
-    base_dist_lower.x_min -= lower_shift
+    if not (
+        isinstance(dual_dist, DenseDiscreteDist) and dual_dist.spacing_type == SpacingType.LINEAR
+    ):
+        raise TypeError(
+            f"Expected DenseDiscreteDist with LINEAR spacing, "
+            f"got {type(dual_dist).__name__} with spacing {getattr(dual_dist, 'spacing_type', '?')}"
+        )
+    # Fold zero-atom into leftmost finite bin before FFT convolution.
+    dual_dist.prob_arr[0] += dual_dist.p_min
+    dual_dist.p_min = 0
 
-    conv_dist_lower = FFT_self_convolve(
-        dist=base_dist_lower,
+    dual_dist.x_min -= dual_shift
+
+    dual_convolved_dist = FFT_self_convolve(
+        dist=dual_dist,
         T=num_steps - 1,
         tail_truncation=core_tail,
         bound_type=bound_type,
         use_direct=True,
     )
 
-    exp_L_PQ = stats.lognorm(s=sigma_inv, scale=np.exp(upper_norm_mean))
-    upper_grid = _extend_upper_grid_for_fft_remove(
-        x_array=conv_dist_lower.x_array + upper_shift,
-        dist=exp_L_PQ,
+    exp_base = stats.lognorm(s=sigma_inv, scale=np.exp(base_norm_mean))
+    base_grid = _extend_base_grid_for_fft_remove(
+        x_array=dual_convolved_dist.x_array + base_shift,
+        dist=exp_base,
         factor_tail_truncation=factor_tail,
         tail_truncation=tail_truncation,
     )
-    base_dist_upper = discretize_continuous_to_pmf(
-        dist=exp_L_PQ,
-        x_array=upper_grid,
+    base_dist = discretize_continuous_dist(
+        dist=exp_base,
+        x_array=base_grid,
         bound_type=bound_type,
         PMF_min_increment=factor_tail,
         spacing_type=SpacingType.LINEAR,
+        domain=Domain.POSITIVES,
     )
-    assert isinstance(base_dist_upper, LinearDiscreteDist)
-    base_dist_upper.x_min -= upper_shift
+    if not (
+        isinstance(base_dist, DenseDiscreteDist) and base_dist.spacing_type == SpacingType.LINEAR
+    ):
+        raise TypeError(
+            f"Expected DenseDiscreteDist with LINEAR spacing, "
+            f"got {type(base_dist).__name__} with spacing {getattr(base_dist, 'spacing_type', '?')}"
+        )
+    base_dist.x_min -= base_shift
 
     conv_dist_raw = FFT_convolve(
-        dist_1=conv_dist_lower,
-        dist_2=base_dist_upper,
+        dist_1=dual_convolved_dist,
+        dist_2=base_dist,
         tail_truncation=core_tail,
         bound_type=bound_type,
     )
-    conv_dist_raw.x_min += (num_steps - 1) * lower_shift + upper_shift
-    exp_geom = change_spacing_type(
+    conv_dist_raw.x_min += (num_steps - 1) * dual_shift + base_shift
+    exp_geom = rediscritize_dist(
         dist=conv_dist_raw,
         tail_truncation=0.0,
         loss_discretization=loss_discretization,
         spacing_type=SpacingType.GEOMETRIC,
         bound_type=bound_type,
     )
-    assert isinstance(exp_geom, GeometricDiscreteDist)
+    if not (
+        isinstance(exp_geom, DenseDiscreteDist) and exp_geom.spacing_type == SpacingType.GEOMETRIC
+    ):
+        raise TypeError(
+            f"Expected DenseDiscreteDist with GEOMETRIC spacing, "
+            f"got {type(exp_geom).__name__} with spacing {getattr(exp_geom, 'spacing_type', '?')}"
+        )
     return log_geometric_to_linear(exp_geom)
 
 
-def _extend_upper_grid_for_fft_remove(
+def _extend_base_grid_for_fft_remove(
     *,
     x_array: np.ndarray,
-    dist,
+    dist: stats.rv_continuous,
     factor_tail_truncation: float,
     tail_truncation: float,
-) -> np.ndarray:
-    """
-    Extend REMOVE upper-factor linear grid when right-tail support is truncated.
-    """
+) -> NDArray[np.float64]:
+    """Extend REMOVE base-factor linear grid when right-tail support is truncated."""
     if x_array.size <= 1:
         return x_array
 
@@ -502,33 +582,37 @@ def _extend_upper_grid_for_fft_remove(
 
 def _combine_best_of_two(
     *,
-    fft_dist: LinearDiscreteDist,
-    geom_dist: LinearDiscreteDist,
+    fft_dist: DenseDiscreteDist,
+    geom_dist: DenseDiscreteDist,
     tail_truncation: float,
     loss_discretization: float,
     bound_type: BoundType,
-) -> LinearDiscreteDist:
-    """
-    Combine FFT and GEOM candidates and regrid to linear output spacing.
-    """
+) -> DenseDiscreteDist:
+    """Combine FFT and GEOM candidates and regrid to linear output spacing."""
     combined_dist = combine_distributions(
         dist_1=fft_dist,
         dist_2=geom_dist,
         bound_type=bound_type,
     )
-    combined_linear = change_spacing_type(
+    combined_linear = rediscritize_dist(
         dist=combined_dist,
         tail_truncation=tail_truncation,
         loss_discretization=loss_discretization,
         spacing_type=SpacingType.LINEAR,
         bound_type=bound_type,
     )
-    assert isinstance(combined_linear, LinearDiscreteDist)
+    if not (
+        isinstance(combined_linear, DenseDiscreteDist)
+        and combined_linear.spacing_type == SpacingType.LINEAR
+    ):
+        _st = getattr(combined_linear, "spacing_type", "?")
+        raise TypeError(
+            "Expected DenseDiscreteDist with LINEAR spacing, "
+            f"got {type(combined_linear).__name__} with spacing {_st}"
+        )
     return combined_linear
 
 
 def _flip_bound_type(bound_type: BoundType) -> BoundType:
-    """
-    Swap DOMINATES <-> IS_DOMINATED for exp-space transforms.
-    """
+    """Swap DOMINATES <-> IS_DOMINATED for exp-space transforms."""
     return BoundType.IS_DOMINATED if bound_type == BoundType.DOMINATES else BoundType.DOMINATES

@@ -20,6 +20,12 @@ class TestTolerances:
     All values are tuned for maximum accuracy with large grids and minimal truncation.
     """
 
+    def __repr__(self) -> str:
+        return "TestTolerances"
+
+    def __str__(self) -> str:
+        return "TestTolerances"
+
     # ========================================================================
     # MASS CONSERVATION (Probability sums to 1.0)
     # ========================================================================
@@ -88,3 +94,26 @@ class TestTolerances:
 
     DISCRETIZATION = 1e-4
     """Fine discretization."""
+
+    # ========================================================================
+    # GRID / SPACING (aligned with PLD_accounting.distribution_utils; defined here
+    # so tests do not import spacing tolerances from production code.)
+    # ========================================================================
+
+    SPACING_ATOL = 1e-12
+    SPACING_RTOL = 1e-6
+
+    # ========================================================================
+    # TIGHT ARRAY & COUPLED-DISTRIBUTION CHECKS
+    # ========================================================================
+
+    ARRAY_RTOL_ULTRA = 1e-12
+    PMF_COUPLED_RTOL = 1e-3
+    PMF_COUPLED_ATOL = 5e-4
+    INF_MASS_RTOL = 1e-9
+    STOCHASTIC_DOM_SLACK = 1e-6
+    NEG_INF_STRICT_LT = 1e-6
+    PMF_NONNEGATIVE_SLACK = 1e-15
+    TAIL_LINEAR_RELATION_ATOL = 1e-24
+    GRID_EXACT_RTOL = 0.0
+    GRID_EXACT_ATOL = 0.0

@@ -1,13 +1,11 @@
-"""
-Pytest configuration and fixtures for the basic (unit) test suite.
-"""
+"""Pytest configuration and fixtures for the basic (unit) test suite."""
+
 import os
 from pathlib import Path
 
 import numpy as np
 import pytest
-
-from PLD_accounting.discrete_dist import GeneralDiscreteDist
+from PLD_accounting.discrete_dist import SparseDiscreteDist
 from PLD_accounting.types import AllocationSchemeConfig, PrivacyParams
 
 # Numba expects a writable cache directory in some environments.
@@ -29,7 +27,7 @@ def simple_uniform_dist():
     """Fixture providing simple uniform distribution for testing."""
     x = np.array([1.0, 2.0, 3.0, 4.0])
     pmf = np.array([0.25, 0.25, 0.25, 0.25], dtype=np.float64)
-    return GeneralDiscreteDist(x_array=x, PMF_array=pmf)
+    return SparseDiscreteDist(x_array=x, prob_arr=pmf)
 
 
 @pytest.fixture
