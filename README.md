@@ -60,6 +60,19 @@ Common notes:
 - `BoundType.IS_DOMINATED` gives a lower (optimistic) bound.
 - Builders do not accept `BoundType.BOTH`; build two PLDs if both bounds are needed.
 
+### Mechanism PLD Helpers
+
+Factory helpers for building `PLDRealization` inputs from specific mechanisms:
+
+- `gaussian_distribution(scale, value_discretization, tail_truncation, bound_type=BoundType.DOMINATES)`
+  - Discretizes the Gaussian mechanism PLD (L2 sensitivity 1) onto a linear grid.
+  - Returns a `PLDRealization` for `DOMINATES` and a `DenseDiscreteDist` for `IS_DOMINATED`.
+- `laplace_distribution(scale, value_discretization, tail_truncation, bound_type=BoundType.DOMINATES)`
+  - Discretizes the Laplace mechanism PLD (L1 sensitivity 1) onto a linear grid.
+  - Same return semantics as `gaussian_distribution`.
+
+For both, `scale` is the noise standard deviation (Gaussian) or Laplace scale parameter. Pass the result directly as `remove_realization` and `add_realization` to the general allocation APIs.
+
 ### Subsampling APIs
 
 PLD-based subsampling helpers:

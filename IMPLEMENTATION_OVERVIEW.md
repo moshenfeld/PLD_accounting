@@ -122,6 +122,8 @@ discretization before shared composition finalization.
 | `PLD_accounting/random_allocation_gaussian.py` | Gaussian-specific factor construction and convolution method selection. |
 | `PLD_accounting/random_allocation_realization.py` | Realization-specific factor construction from `PLDRealization` inputs. |
 | `PLD_accounting/adaptive_random_allocation.py` | Adaptive upper/lower range refinement for epsilon/delta queries. |
+| `PLD_accounting/mechanisms.py` | Mechanism PLD factory helpers (`gaussian_distribution`, `laplace_distribution`). |
+| `PLD_accounting/validation.py` | Centralized input validation (`validate_privacy_params`, `validate_allocation_params`, etc.). |
 | `PLD_accounting/discrete_dist.py` | Distribution classes (`DenseDiscreteDist`, `SparseDiscreteDist`, `PLDRealization`, `Domain`). |
 | `PLD_accounting/distribution_discretization.py` | Continuous-to-discrete conversion and spacing changes (linear/geometric). |
 | `PLD_accounting/FFT_convolution.py` | FFT-based convolution and self-convolution on linear grids. |
@@ -133,7 +135,7 @@ discretization before shared composition finalization.
 
 ## Public API Surface
 
-Defined in `PLD_accounting/random_allocation_api.py`:
+Random allocation (defined in `PLD_accounting/random_allocation_api.py`):
 
 - Gaussian path:
   - `gaussian_allocation_PLD(...)`
@@ -144,6 +146,20 @@ Defined in `PLD_accounting/random_allocation_api.py`:
   - `general_allocation_PLD(...)`
   - `general_allocation_epsilon(...)`
   - `general_allocation_delta(...)`
+
+Mechanism PLD helpers (defined in `PLD_accounting/mechanisms.py`):
+
+- `gaussian_distribution(scale, value_discretization, tail_truncation, bound_type)`
+- `laplace_distribution(scale, value_discretization, tail_truncation, bound_type)`
+
+Subsampling (defined in `PLD_accounting/subsample_PLD.py`):
+
+- `subsample_PLD(pld, sampling_probability)`
+- `subsample_PLD_realization(base_pld, sampling_prob, direction)`
+
+Distribution type (defined in `PLD_accounting/discrete_dist.py`):
+
+- `PLDRealization` — linear-grid privacy-loss distribution used as input to realization APIs.
 
 Notes:
 
