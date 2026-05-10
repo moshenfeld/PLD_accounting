@@ -27,12 +27,12 @@ from typing import Any
 import numpy as np
 from numpy.typing import NDArray
 from scipy import stats
+from scipy.stats._distn_infrastructure import rv_frozen
 
 from PLD_accounting.discrete_dist import DenseDiscreteDist, PLDRealization
 from PLD_accounting.distribution_discretization import (
     discretize_continuous_distribution,
 )
-from PLD_accounting.distribution_utils import MIN_GRID_SIZE
 from PLD_accounting.types import (
     DEFAULT_LOSS_DISCRETIZATION,
     DEFAULT_TAIL_TRUNCATION,
@@ -138,7 +138,7 @@ class LaplacePLD(stats.rv_continuous):
         probs = np.array([0.5 * np.exp(-lam), 0.5])
         return points, probs
 
-    def _pdf(self, x: NDArray[np.floating[Any]], *args: Any) -> NDArray[np.float64]:
+    def _pdf(self, x: Any, *args: Any) -> Any:
         del args
         x_arr = np.asarray(x)
         lam = self.lam
@@ -147,7 +147,7 @@ class LaplacePLD(stats.rv_continuous):
         out[mask] = 0.25 * np.exp((x_arr[mask] - lam) / 2.0)
         return out
 
-    def _cdf(self, x: NDArray[np.floating[Any]], *args: Any) -> NDArray[np.float64]:
+    def _cdf(self, x: Any, *args: Any) -> Any:
         del args
         x_arr = np.asarray(x)
         lam = self.lam
@@ -157,7 +157,7 @@ class LaplacePLD(stats.rv_continuous):
         out[x_arr >= lam] = 1.0
         return out
 
-    def _ppf(self, q: NDArray[np.floating[Any]], *args: Any) -> NDArray[np.float64]:
+    def _ppf(self, q: Any, *args: Any) -> Any:
         del args
         q_arr = np.asarray(q)
         lam = self.lam
@@ -171,7 +171,8 @@ class LaplacePLD(stats.rv_continuous):
         out[right] = lam
         return out
 
-    def _rvs(self, size: Any = None, random_state: Any = None) -> Any:
+    def _rvs(self, *args: Any, size: Any = None, random_state: Any = None) -> Any:
+        del args  # shape parameters for frozen distributions; Laplace PLD has none
         if random_state is None:
             raise ValueError("random_state is required for LaplacePLD._rvs")
         u = random_state.uniform(size=size)
@@ -187,7 +188,7 @@ class LaplacePLD(stats.rv_continuous):
 
 def _continuous_mechanism_distribution(
     *,
-    dist: stats.rv_continuous,
+    dist: stats.rv_continuous | rv_frozen[Any, Any],
     value_discretization: float,
     tail_truncation: float,
     bound_type: BoundType,
@@ -196,15 +197,12 @@ def _continuous_mechanism_distribution(
 
     Wraps in `PLDRealization` only when ``bound_type`` is ``DOMINATES``.
     """
-    x_min = float(dist.ppf(tail_truncation))
-    x_max = float(dist.isf(tail_truncation))
-    n_grid = max(int(np.ceil((x_max - x_min) / value_discretization)) + 1, MIN_GRID_SIZE)
     linear_dist = discretize_continuous_distribution(
         dist=dist,
         tail_truncation=tail_truncation,
         bound_type=bound_type,
         spacing_type=SpacingType.LINEAR,
-        n_grid=n_grid,
+        step=value_discretization,
         align_to_multiples=True,
     )
     if not (

@@ -12,7 +12,7 @@ from PLD_accounting.discrete_dist import (
     PLDRealization,
     SparseDiscreteDist,
 )
-from PLD_accounting.distribution_discretization import rediscritize_dist
+from PLD_accounting.distribution_discretization import rediscretize_dist
 from PLD_accounting.distribution_utils import MAX_SAFE_EXP_ARG, exp_moment_terms
 from PLD_accounting.dp_accounting_support import (
     dp_accounting_pmf_to_pld_realization,
@@ -38,6 +38,7 @@ def _make_realization() -> PLDRealization:
 
 
 def test_dp_accounting_roundtrip_preserves_mass_and_grid_shape():
+    """Dp accounting roundtrip preserves mass and grid shape."""
     original = _make_realization()
     pmf = linear_dist_to_dp_accounting_pmf(dist=original, pessimistic_estimate=True)
     restored = dp_accounting_pmf_to_pld_realization(pmf)
@@ -153,14 +154,14 @@ def test_realization_remove_base_distributions_handles_is_dominated_coarsening()
         bound_type=BoundType.IS_DOMINATED,
     )
     exact_neg_dual = negate_reverse_linear_distribution(calc_pld_dual(remove_realization))
-    expected_base = rediscritize_dist(
+    expected_base = rediscretize_dist(
         dist=remove_realization,
         tail_truncation=tail_truncation,
         loss_discretization=loss_discretization,
         spacing_type=SpacingType.LINEAR,
         bound_type=BoundType.IS_DOMINATED,
     )
-    expected_neg_dual = rediscritize_dist(
+    expected_neg_dual = rediscretize_dist(
         dist=exact_neg_dual,
         tail_truncation=tail_truncation,
         loss_discretization=loss_discretization,
@@ -233,7 +234,7 @@ def test_realization_remove_base_distributions_is_dominated_clamps_when_refining
     # Effective discretization is clamped to realization.step, not the finer target.
     effective_disc = max(remove_realization.step, loss_discretization)
     exact_neg_dual = negate_reverse_linear_distribution(calc_pld_dual(remove_realization))
-    expected_base = rediscritize_dist(
+    expected_base = rediscretize_dist(
         dist=DenseDiscreteDist(
             x_min=remove_realization.x_min,
             step=remove_realization.step,
@@ -246,7 +247,7 @@ def test_realization_remove_base_distributions_is_dominated_clamps_when_refining
         spacing_type=SpacingType.LINEAR,
         bound_type=BoundType.IS_DOMINATED,
     )
-    expected_neg_dual = rediscritize_dist(
+    expected_neg_dual = rediscretize_dist(
         dist=exact_neg_dual,
         tail_truncation=tail_truncation,
         loss_discretization=effective_disc,
@@ -324,6 +325,7 @@ class TestRealizationAdapter:
         assert np.isclose(realization.p_max, restored.p_max)
 
     def test_linear_dist_to_dp_accounting_rejects_non_linear_dist(self):
+        """Linear dist to dp accounting rejects non linear dist."""
         dist = SparseDiscreteDist(
             x_array=np.array([0.0, 0.5]),
             prob_arr=np.array([0.5, 0.5]),

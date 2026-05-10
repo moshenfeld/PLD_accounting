@@ -1,6 +1,6 @@
 # PLD_accounting
 
-`PLD_accounting` is a Python package for tight differential privacy accounting of random allocation and subsampling using Privacy Loss Distributions (PLDs) as described in: [Efficient privacy loss accounting for subsampling and random allocation](https://arxiv.org/pdf/2602.17284)
+``PLD_accounting`` is a Python package for tight differential privacy accounting for random allocation and subsampling using Privacy Loss Distributions (PLDs) as described in: [Efficient privacy loss accounting for subsampling and random allocation](https://arxiv.org/pdf/2602.17284)
 
 ## Purpose
 
@@ -42,12 +42,12 @@ Gaussian path (most common):
   - Single epsilon query with explicit discretization/convolution config.
 - `gaussian_allocation_delta_configurable(params, config, bound_type=BoundType.DOMINATES)`
   - Single delta query with explicit discretization/convolution config.
-- `gaussian_allocation_PLD(params, config, bound_type=BoundType.DOMINATES)`
+- `gaussian_allocation_pld(params, config, bound_type=BoundType.DOMINATES)`
   - Build a reusable `dp_accounting.PrivacyLossDistribution`.
 
 Realization path (advanced):
 
-- `general_allocation_PLD(num_steps, num_selected, num_epochs, remove_realization, add_realization, config, bound_type=BoundType.DOMINATES)`
+- `general_allocation_pld(num_steps, num_selected, num_epochs, remove_realization, add_realization, config, bound_type=BoundType.DOMINATES)`
   - Build PLD from explicit `PLDRealization` inputs.
 - `general_allocation_epsilon(delta, num_steps, num_selected, num_epochs, remove_realization, add_realization, config, bound_type=BoundType.DOMINATES)`
   - Epsilon query from explicit realizations.
@@ -77,9 +77,9 @@ For both, `scale` is the noise standard deviation (Gaussian) or Laplace scale pa
 
 PLD-based subsampling helpers:
 
-- `subsample_PLD(pld, sampling_probability)`
+- `subsample_pld(pld, sampling_probability)`
   - Applies subsampling amplification to a `dp_accounting` PLD.
-- `subsample_PLD_realization(base_pld, sampling_prob, direction)`
+- `subsample_pld_realization(base_pld, sampling_prob, direction)`
   - Lower-level helper for `PLDRealization` inputs (REMOVE/ADD direction).
 
 Subsampling helpers use DOMINATES semantics (upper-bound style).
@@ -87,7 +87,7 @@ Subsampling helpers use DOMINATES semantics (upper-bound style).
 ## Install
 
 ```bash
-pip install PLD_accounting
+pip install PLD_accounting  # distribution name; then: import PLD_accounting
 ```
 
 ## Where To Start

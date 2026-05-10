@@ -5,16 +5,16 @@ from __future__ import annotations
 from typing import Any
 
 import numpy as np
-import pytest
 import PLD_accounting.random_allocation_accounting as random_allocation_accounting_module
 import PLD_accounting.random_allocation_api as random_allocation_api_module
+import pytest
 from PLD_accounting.discrete_dist import DenseDiscreteDist, PLDRealization
 from PLD_accounting.random_allocation_accounting import (
-    _allocation_directional_PLD_core as allocation_directional_PLD_core,
+    _allocation_directional_pld_core as allocation_directional_pld_core,
 )
 from PLD_accounting.random_allocation_api import (
-    gaussian_allocation_PLD,
-    general_allocation_PLD,
+    gaussian_allocation_pld,
+    general_allocation_pld,
 )
 from PLD_accounting.types import (
     AllocationSchemeConfig,
@@ -44,10 +44,12 @@ def _stub_linear_dist() -> DenseDiscreteDist:
 
 
 class TestGeneralAllocationWiring:
+    """Tests that general (geometric-base) allocation delegates to shared helpers."""
 
     def test_general_allocation_uses_shared_allocation_full_pld(
         self, monkeypatch: pytest.MonkeyPatch
     ):
+        """General allocation uses shared allocation full pld."""
         captured: dict[str, Any] = {}
         sentinel_pld = object()
 
@@ -77,13 +79,13 @@ class TestGeneralAllocationWiring:
             return sentinel_pld
 
         monkeypatch.setattr(
-            random_allocation_api_module, "allocation_full_PLD", fake_allocation_full_pld
+            random_allocation_api_module, "allocation_full_pld", fake_allocation_full_pld
         )
 
         config = AllocationSchemeConfig(convolution_method=ConvolutionMethod.GEOM)
         remove_realization = _simple_realization()
         add_realization = _simple_realization()
-        result = general_allocation_PLD(
+        result = general_allocation_pld(
             num_steps=23,
             num_selected=5,
             num_epochs=4,
@@ -106,9 +108,9 @@ class TestGeneralAllocationWiring:
         assert callable(remove_builder)
         assert callable(add_builder)
         assert (
-            remove_builder.func is random_allocation_api_module.geometric_allocation_PLD_base_remove
+            remove_builder.func is random_allocation_api_module.geometric_allocation_pld_base_remove
         )
-        assert add_builder.func is random_allocation_api_module.geometric_allocation_PLD_base_add
+        assert add_builder.func is random_allocation_api_module.geometric_allocation_pld_base_add
         remove_base_creation = remove_builder.keywords["base_distributions_creation"]
         add_base_creation = add_builder.keywords["base_distributions_creation"]
         assert (
@@ -122,8 +124,9 @@ class TestGeneralAllocationWiring:
         assert add_base_creation.keywords == {"realization": add_realization}
 
     def test_general_allocation_rejects_num_steps_less_than_num_selected(self):
+        """General allocation rejects num steps less than num selected."""
         with pytest.raises(ValueError, match="num_selected .* cannot exceed num_steps"):
-            general_allocation_PLD(
+            general_allocation_pld(
                 num_steps=3,
                 num_selected=4,
                 num_epochs=1,
@@ -134,10 +137,12 @@ class TestGeneralAllocationWiring:
 
 
 class TestGaussianAllocationWiring:
+    """Tests that Gaussian allocation composes base PLD builders consistently."""
 
     def test_gaussian_allocation_uses_shared_allocation_full_pld(
         self, monkeypatch: pytest.MonkeyPatch
     ):
+        """Gaussian allocation uses shared allocation full pld."""
         captured: dict[str, Any] = {}
         sentinel_pld = object()
 
@@ -167,7 +172,7 @@ class TestGaussianAllocationWiring:
             return sentinel_pld
 
         monkeypatch.setattr(
-            random_allocation_api_module, "allocation_full_PLD", fake_allocation_full_pld
+            random_allocation_api_module, "allocation_full_pld", fake_allocation_full_pld
         )
 
         config = AllocationSchemeConfig(convolution_method=ConvolutionMethod.BEST_OF_TWO)
@@ -177,7 +182,7 @@ class TestGaussianAllocationWiring:
             num_selected=4,
             num_epochs=3,
         )
-        result = gaussian_allocation_PLD(
+        result = gaussian_allocation_pld(
             params=params,
             config=config,
             bound_type=BoundType.DOMINATES,
@@ -195,8 +200,8 @@ class TestGaussianAllocationWiring:
         add_builder = captured["compute_base_pld_add"]
         assert callable(remove_builder)
         assert callable(add_builder)
-        assert remove_builder.func is random_allocation_api_module.gaussian_allocation_PLD_core
-        assert add_builder.func is random_allocation_api_module.gaussian_allocation_PLD_core
+        assert remove_builder.func is random_allocation_api_module.gaussian_allocation_pld_core
+        assert add_builder.func is random_allocation_api_module.gaussian_allocation_pld_core
         assert remove_builder.keywords == {
             "direction": Direction.REMOVE,
             "sigma": params.sigma,
@@ -210,11 +215,13 @@ class TestGaussianAllocationWiring:
 
 
 class TestAllocationFinalization:
+    """Tests re-gridding and composition behavior inside directional allocation."""
 
-    def test_allocation_directional_pld_core_regrids_before_and_after_compose(
+    def test_allocation_directional_pld_core_truncates_without_regridding(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ):
+        """Allocation directional pld core keeps the base step through composition."""
         captured: dict[str, float] = {}
 
         def fake_fft_self_convolve(
@@ -244,7 +251,7 @@ class TestAllocationFinalization:
 
         monkeypatch.setattr(
             random_allocation_accounting_module,
-            "FFT_self_convolve",
+            "fft_self_convolve",
             fake_fft_self_convolve,
         )
 
@@ -253,7 +260,7 @@ class TestAllocationFinalization:
             tail_truncation=1e-8,
             convolution_method=ConvolutionMethod.FFT,
         )
-        result = allocation_directional_PLD_core(
+        result = allocation_directional_pld_core(
             num_steps=7,
             num_epochs=5,
             compute_base_pld=fake_compute_base_pld,
@@ -262,25 +269,32 @@ class TestAllocationFinalization:
             bound_type=BoundType.DOMINATES,
         )
 
-        output_loss_discretization = config.loss_discretization / 3
-        expected_core_loss = output_loss_discretization / np.sqrt(5)
+        expected_core_loss = config.loss_discretization / (2 * 5)
+        expected_step = _stub_linear_dist().step
 
         assert captured["num_steps"] == 7.0
         assert captured["num_epochs"] == 5.0
         assert np.isclose(
-            captured["base_gap_at_compose"],
+            captured["core_loss_discretization"],
             expected_core_loss,
             atol=TOL.SPACING_ATOL,
         )
-        assert np.isclose(result.step, output_loss_discretization, atol=TOL.SPACING_ATOL)
+        assert np.isclose(
+            captured["base_gap_at_compose"],
+            expected_step,
+            atol=TOL.SPACING_ATOL,
+        )
+        assert np.isclose(result.step, expected_step, atol=TOL.SPACING_ATOL)
 
 
 class TestGaussianAllocationRuntimeRegressions:
+    """Regression tests for end-to-end Gaussian PLD construction."""
 
     def test_geom_is_dominated_path_handles_tiny_nonpositive_exp_tail(self):
         # The FFT REMOVE route only supports BoundType.DOMINATES; IS_DOMINATED
         # uses the GEOM route. This regression guards against the case where
         # IS_DOMINATED produces a non-finite or non-positive epsilon.
+        """Geom is dominated path handles tiny nonpositive exp tail."""
         params = PrivacyParams(
             sigma=2.0,
             num_steps=5,
@@ -294,7 +308,7 @@ class TestGaussianAllocationRuntimeRegressions:
             convolution_method=ConvolutionMethod.GEOM,
         )
 
-        pld = gaussian_allocation_PLD(
+        pld = gaussian_allocation_pld(
             params=params,
             config=config,
             bound_type=BoundType.IS_DOMINATED,
@@ -306,11 +320,13 @@ class TestGaussianAllocationRuntimeRegressions:
 
 
 class TestGeometricBaseTailScaling:
+    """Tests how tail truncation is threaded into geometric base construction."""
 
     def test_remove_base_factor_tail_scales_with_num_steps(
         self,
         monkeypatch: pytest.MonkeyPatch,
     ):
+        """Remove base factor tail scales with num steps."""
         captured_tails: list[float] = []
         sentinel = object()
 
@@ -342,7 +358,7 @@ class TestGeometricBaseTailScaling:
         )
 
         for num_steps in (5, 10):
-            random_allocation_accounting_module.geometric_allocation_PLD_base_remove(
+            random_allocation_accounting_module.geometric_allocation_pld_base_remove(
                 base_distributions_creation=fake_base_distributions_creation,
                 num_steps=num_steps,
                 loss_discretization=0.1,
@@ -359,6 +375,7 @@ class TestGeometricBaseTailScaling:
         self,
         monkeypatch: pytest.MonkeyPatch,
     ):
+        """Add base factor tail scales with num steps."""
         captured_tails: list[float] = []
         sentinel = object()
 
@@ -392,7 +409,7 @@ class TestGeometricBaseTailScaling:
         )
 
         for num_steps in (5, 10):
-            random_allocation_accounting_module.geometric_allocation_PLD_base_add(
+            random_allocation_accounting_module.geometric_allocation_pld_base_add(
                 base_distributions_creation=fake_base_distributions_creation,
                 num_steps=num_steps,
                 loss_discretization=0.1,

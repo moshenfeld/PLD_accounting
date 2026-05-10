@@ -1,5 +1,7 @@
 """Utility functions for distribution operations and numerical stability."""
 
+from __future__ import annotations
+
 import math
 from typing import Any, Callable
 
@@ -60,18 +62,18 @@ def convolve_boundary_masses(
 
 def self_convolve_boundary_masses(
     dist: DiscreteDistBase,
-    T: int,
+    num_convolutions: int,
 ) -> tuple[float, float]:
-    """Compute boundary masses for T-fold self-convolution."""
+    """Compute boundary masses after ``num_convolutions`` self-convolutions."""
     # p_max: absorbing in both domains
-    p_max = float(np.clip(-np.expm1(T * np.log1p(-dist.p_max)), 0.0, 1.0))
+    p_max = float(np.clip(-np.expm1(num_convolutions * np.log1p(-dist.p_max)), 0.0, 1.0))
 
     if dist.domain == Domain.POSITIVES:
-        # 0 is neutral: Z=0 only when ALL T copies are 0
-        p_min = dist.p_min**T
+        # 0 is neutral: Z=0 only when all num_convolutions factors are 0
+        p_min = dist.p_min**num_convolutions
     else:
         # −∞ is absorbing: Z=−∞ when any copy is −∞
-        p_min = float(np.clip(-np.expm1(T * np.log1p(-dist.p_min)), 0.0, 1.0))
+        p_min = float(np.clip(-np.expm1(num_convolutions * np.log1p(-dist.p_min)), 0.0, 1.0))
 
     return p_min, p_max
 
@@ -149,8 +151,8 @@ def combine_distributions(
         )
 
     x_array = dist_1_aligned.x_array
-    ccdf_1 = _CCDF_from_PMF(dist_1_aligned)
-    ccdf_2 = _CCDF_from_PMF(dist_2_aligned)
+    ccdf_1 = _ccdf_from_pmf(dist_1_aligned)
+    ccdf_2 = _ccdf_from_pmf(dist_2_aligned)
     combined_ccdf = ccdf_op(ccdf_1, ccdf_2)
     prob_arr = combined_ccdf[:-2] - combined_ccdf[1:-1]
 
@@ -315,7 +317,7 @@ def _expand_to_grid(
     )
 
 
-def _CCDF_from_PMF(dist: DiscreteDistBase) -> NDArray[np.float64]:
+def _ccdf_from_pmf(dist: DiscreteDistBase) -> NDArray[np.float64]:
     """Convert distribution PMF to padded complementary CDF.
 
     Returns CCDF over [−∞/0, l_0, l_1, ..., +∞]:

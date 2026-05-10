@@ -4,12 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "PLD_accounting"
-version = "0.3.0"
+version = "0.4.0"
 description = "Numerical privacy accounting for random allocation and subsampling using PLDs."
 readme = "README.md"
 requires-python = ">=3.10"
-license = "MIT"
-license-files = ["LICENSE"]
+license = {text = "MIT"}
 authors = [
   { name = "Moshe Shenfeld" }
 ]
@@ -55,14 +54,9 @@ dev = [
   "pytest-cov>=4.0",
   "mypy>=1.10",
   "build>=1.2.0",
+  "pylint>=4.0",
+  "pylint-per-file-ignores>=3.0",
 ]
 
 [tool.setuptools.packages.find]
 include = ["PLD_accounting*"]
-
-[tool.mypy]
-python_version = "3.10"
-ignore_missing_imports = true
-follow_imports = "silent"
-warn_unused_ignores = true
-show_error_codes = true

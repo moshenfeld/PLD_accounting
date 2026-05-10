@@ -1,5 +1,7 @@
 """Subsampling utilities for privacy loss distributions."""
 
+from __future__ import annotations
+
 import math
 
 import numpy as np
@@ -13,7 +15,7 @@ from PLD_accounting.discrete_dist import (
 )
 from PLD_accounting.distribution_discretization import (
     discretize_aligned_range,
-    rediscritize_prob,
+    rediscretize_prob,
 )
 from PLD_accounting.distribution_utils import (
     compute_bin_width,
@@ -32,7 +34,7 @@ from PLD_accounting.utils import calc_pld_dual, negate_reverse_linear_distributi
 # =============================================================================
 
 
-def subsample_PLD(
+def subsample_pld(
     pld: PrivacyLossDistribution,
     sampling_probability: float,
 ) -> PrivacyLossDistribution:
@@ -54,7 +56,7 @@ def subsample_PLD(
 
     # Convert REMOVE direction
     remove_dist = dp_accounting_pmf_to_pld_realization(pld._pmf_remove)
-    subsampled_remove = subsample_PLD_realization(
+    subsampled_remove = subsample_pld_realization(
         base_pld=remove_dist,
         sampling_prob=sampling_probability,
         direction=Direction.REMOVE,
@@ -69,7 +71,7 @@ def subsample_PLD(
         return PrivacyLossDistribution(pmf_remove=subsampled_remove_pmf)
 
     add_dist = dp_accounting_pmf_to_pld_realization(pld._pmf_add)
-    subsampled_add = subsample_PLD_realization(
+    subsampled_add = subsample_pld_realization(
         base_pld=add_dist,
         sampling_prob=sampling_probability,
         direction=Direction.ADD,
@@ -82,7 +84,7 @@ def subsample_PLD(
     return PrivacyLossDistribution(pmf_remove=subsampled_remove_pmf, pmf_add=subsampled_add_pmf)
 
 
-def subsample_PLD_realization(
+def subsample_pld_realization(
     base_pld: PLDRealization,
     sampling_prob: float,
     direction: Direction,
@@ -103,10 +105,8 @@ def subsample_PLD_realization(
         Supports only the DOMINATES bound type.
 
     """
-    if direction not in (Direction.REMOVE, Direction.ADD):
-        raise ValueError("Direction BOTH is invalid for subsampling")
     if not isinstance(base_pld, PLDRealization):
-        raise TypeError(f"subsample_PLD_realization requires PLDRealization, got {type(base_pld)}")
+        raise TypeError(f"subsample_pld_realization requires PLDRealization, got {type(base_pld)}")
     if sampling_prob <= 0 or sampling_prob > 1:
         raise ValueError("sampling_prob must be in (0, 1]")
     if sampling_prob == 1.0:
@@ -134,14 +134,14 @@ def subsample_PLD_realization(
             target_x_array=target_x_array,
         )
         return PLDRealization.from_linear_dist(out)
-    elif direction == Direction.ADD:
+    if direction == Direction.ADD:
         out = _subsample_dist(
             base_pld=base_pld,
             sampling_prob=sampling_prob,
             direction=direction,
         )
         return PLDRealization.from_linear_dist(out)
-    raise RuntimeError("unreachable direction branch")
+    raise ValueError("Direction BOTH is invalid for subsampling")
 
 
 # =============================================================================
@@ -347,7 +347,7 @@ def _subsample_dist(
 
     # Pseudocode PMF transfer on transformed support, implemented as
     # domination-preserving re-discretization onto a shared linear grid.
-    prob_out = rediscritize_prob(
+    prob_out = rediscretize_prob(
         x_array=transformed_x_array,
         prob_arr=base_pld.prob_arr,
         x_array_out=target_x_array,

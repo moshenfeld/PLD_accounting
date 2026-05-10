@@ -11,11 +11,11 @@ from PLD_accounting.adaptive_random_allocation import (
 )
 from PLD_accounting.discrete_dist import PLDRealization
 from PLD_accounting.random_allocation_accounting import (
-    allocation_full_PLD,
-    geometric_allocation_PLD_base_add,
-    geometric_allocation_PLD_base_remove,
+    allocation_full_pld,
+    geometric_allocation_pld_base_add,
+    geometric_allocation_pld_base_remove,
 )
-from PLD_accounting.random_allocation_gaussian import gaussian_allocation_PLD_core
+from PLD_accounting.random_allocation_gaussian import gaussian_allocation_pld_core
 from PLD_accounting.random_allocation_realization import (
     realization_add_base_distribution,
     realization_remove_base_distributions,
@@ -29,6 +29,7 @@ from PLD_accounting.types import (
 )
 from PLD_accounting.validation import (
     validate_allocation_params,
+    validate_allocation_scheme_config,
     validate_bound_type,
     validate_delta,
     validate_epsilon,
@@ -75,7 +76,7 @@ def gaussian_allocation_epsilon_range(
     result = optimize_allocation_epsilon_range(
         params=params,
         target_accuracy=epsilon_accuracy,
-        pld_builder=gaussian_allocation_PLD,
+        pld_builder=gaussian_allocation_pld,
     )
     return result.upper_bound, result.lower_bound
 
@@ -98,9 +99,10 @@ def gaussian_allocation_epsilon_configurable(
     """
     # Input validation
     validate_privacy_params(params, require_delta=True)
+    validate_allocation_scheme_config(config)
     validate_bound_type(bound_type)
 
-    full_pld = gaussian_allocation_PLD(
+    full_pld = gaussian_allocation_pld(
         params=params,
         config=config,
         bound_type=bound_type,
@@ -126,9 +128,10 @@ def gaussian_allocation_delta_configurable(
     """
     # Input validation
     validate_privacy_params(params, require_epsilon=True)
+    validate_allocation_scheme_config(config)
     validate_bound_type(bound_type)
 
-    full_pld = gaussian_allocation_PLD(
+    full_pld = gaussian_allocation_pld(
         params=params,
         config=config,
         bound_type=bound_type,
@@ -136,7 +139,7 @@ def gaussian_allocation_delta_configurable(
     return float(full_pld.get_delta_for_epsilon(params.epsilon))
 
 
-def gaussian_allocation_PLD(
+def gaussian_allocation_pld(
     params: PrivacyParams,
     config: AllocationSchemeConfig,
     bound_type: BoundType = BoundType.DOMINATES,
@@ -155,21 +158,22 @@ def gaussian_allocation_PLD(
     """
     # Input validation
     validate_privacy_params(params)
+    validate_allocation_scheme_config(config)
     validate_bound_type(bound_type)
 
     compute_base_pld_remove = partial(
-        gaussian_allocation_PLD_core,
+        gaussian_allocation_pld_core,
         direction=Direction.REMOVE,
         sigma=params.sigma,
         config=config,
     )
     compute_base_pld_add = partial(
-        gaussian_allocation_PLD_core,
+        gaussian_allocation_pld_core,
         direction=Direction.ADD,
         sigma=params.sigma,
         config=config,
     )
-    return allocation_full_PLD(
+    return allocation_full_pld(
         compute_base_pld_remove=compute_base_pld_remove,
         compute_base_pld_add=compute_base_pld_add,
         num_steps=params.num_steps,
@@ -224,9 +228,10 @@ def general_allocation_epsilon(
         )
     if not isinstance(add_realization, PLDRealization):
         raise TypeError(f"add_realization must be PLDRealization, got {type(add_realization)}")
+    validate_allocation_scheme_config(config)
     validate_bound_type(bound_type)
 
-    pld = general_allocation_PLD(
+    pld = general_allocation_pld(
         num_steps=num_steps,
         num_selected=num_selected,
         num_epochs=num_epochs,
@@ -276,9 +281,10 @@ def general_allocation_delta(
         )
     if not isinstance(add_realization, PLDRealization):
         raise TypeError(f"add_realization must be PLDRealization, got {type(add_realization)}")
+    validate_allocation_scheme_config(config)
     validate_bound_type(bound_type)
 
-    pld = general_allocation_PLD(
+    pld = general_allocation_pld(
         num_steps=num_steps,
         num_selected=num_selected,
         num_epochs=num_epochs,
@@ -290,7 +296,7 @@ def general_allocation_delta(
     return float(pld.get_delta_for_epsilon(epsilon))
 
 
-def general_allocation_PLD(
+def general_allocation_pld(
     num_steps: int,
     num_selected: int,
     num_epochs: int,
@@ -325,6 +331,7 @@ def general_allocation_PLD(
         )
     if not isinstance(add_realization, PLDRealization):
         raise TypeError(f"add_realization must be PLDRealization, got {type(add_realization)}")
+    validate_allocation_scheme_config(config)
     validate_bound_type(bound_type)
     # Validate that geometric convolution is used for realization path
     if config.convolution_method != ConvolutionMethod.GEOM:
@@ -335,20 +342,20 @@ def general_allocation_PLD(
         )
 
     compute_base_pld_remove = partial(
-        geometric_allocation_PLD_base_remove,
+        geometric_allocation_pld_base_remove,
         base_distributions_creation=partial(
             realization_remove_base_distributions,
             realization=remove_realization,
         ),
     )
     compute_base_pld_add = partial(
-        geometric_allocation_PLD_base_add,
+        geometric_allocation_pld_base_add,
         base_distributions_creation=partial(
             realization_add_base_distribution,
             realization=add_realization,
         ),
     )
-    return allocation_full_PLD(
+    return allocation_full_pld(
         compute_base_pld_remove=compute_base_pld_remove,
         compute_base_pld_add=compute_base_pld_add,
         num_steps=num_steps,

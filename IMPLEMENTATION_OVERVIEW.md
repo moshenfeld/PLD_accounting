@@ -19,7 +19,7 @@ API parameter mapping:
 - `num_epochs = number of epochs`
 
 In code, this decomposition is implemented in
-`allocation_directional_PLD()` in `PLD_accounting/random_allocation_accounting.py`:
+`allocation_directional_pld()` in `PLD_accounting/random_allocation_accounting.py`:
 
 - Floor component:
   - `floor_steps = floor(num_steps / num_selected)`
@@ -32,7 +32,7 @@ In code, this decomposition is implemented in
 Both Gaussian and realization paths use the same floor/ceil decomposition and
 compose both components when needed.
 
-Input validation in `allocation_directional_PLD()`:
+Input validation in `allocation_directional_pld()`:
 
 - `num_steps`, `num_selected`, and `num_epochs` must be at least `1`.
 - `num_steps` must be at least `num_selected` to ensure at least one
@@ -74,24 +74,23 @@ Boundary semantics depend on `Domain`:
 ## Parameter Budget Conventions
 
 Shared composition budgets are derived inside
-`_allocation_directional_PLD_core()` in `PLD_accounting/random_allocation_accounting.py`.
+`_allocation_directional_pld_core()` in `PLD_accounting/random_allocation_accounting.py`.
 
 - `output_tail_truncation = component_tail_truncation / 3`
 - `base_tail_truncation = output_tail_truncation / (2 * component_num_epochs)`
 - `output_loss_discretization = config.loss_discretization / 3`
-- `base_loss_discretization = output_loss_discretization / sqrt(component_num_epochs)`
+- `base_loss_discretization = output_loss_discretization / component_num_epochs`
 
 Interpretation used in code:
 
-- `allocation_directional_PLD()` keeps the full top-level tail budget when only one
+- `allocation_directional_pld()` keeps the full top-level tail budget when only one
   component is present (divisible case), and splits evenly only when both
   floor and ceil components are present.
 - `/3` is used in each component core because truncation is handled across
   multiple stages (base creation, composition, output alignment).
 - `1 / (2 * num_epochs)` is used for base tail truncation in each component.
-- `1 / sqrt(num_epochs)` is used for core loss discretization because
-  discretization error scales approximately like the square root of the number
-  of compositions.
+- `1 / num_epochs` is used for core loss discretization so the post-compose
+  discretization target is preserved under linear-in-epochs error growth.
 
 Gaussian FFT path needs additional one-step parameters for discretizing analytic
 continuous factors. These are derived in
@@ -105,7 +104,7 @@ continuous factors. These are derived in
   ADD uses no extra split.
 
 Gaussian GEOM path now mirrors realization wiring after factor creation:
-- both routes call shared `geometric_allocation_PLD_base_add/remove(...)`;
+- both routes call shared `geometric_allocation_pld_base_add/remove(...)`;
 - only the base distribution creation differs (analytic Gaussian vs explicit realization).
 
 Realization path uses the same depth factor for component-level loss
@@ -131,19 +130,19 @@ discretization before shared composition finalization.
 | `PLD_accounting/utils.py` | PLD transforms (`exp`, `log`, dual, negate-reverse, composition helpers). |
 | `PLD_accounting/distribution_utils.py` | Numerical utilities (mass conservation, spacing checks, stable comparisons). |
 | `PLD_accounting/dp_accounting_support.py` | Conversion between internal probability representations and `dp_accounting` PMF/PLD types. |
-| `PLD_accounting/subsample_PLD.py` | PLD-level subsampling amplification helpers (DOMINATES-only path). |
+| `PLD_accounting/subsample_pld.py` | PLD-level subsampling amplification helpers (DOMINATES-only path). |
 
 ## Public API Surface
 
 Random allocation (defined in `PLD_accounting/random_allocation_api.py`):
 
 - Gaussian path:
-  - `gaussian_allocation_PLD(...)`
+  - `gaussian_allocation_pld(...)`
   - `gaussian_allocation_epsilon_configurable(...)`
   - `gaussian_allocation_delta_configurable(...)`
   - `gaussian_allocation_epsilon_range(...)`
 - Realization path:
-  - `general_allocation_PLD(...)`
+  - `general_allocation_pld(...)`
   - `general_allocation_epsilon(...)`
   - `general_allocation_delta(...)`
 
@@ -152,10 +151,10 @@ Mechanism PLD helpers (defined in `PLD_accounting/mechanisms.py`):
 - `gaussian_distribution(scale, value_discretization, tail_truncation, bound_type)`
 - `laplace_distribution(scale, value_discretization, tail_truncation, bound_type)`
 
-Subsampling (defined in `PLD_accounting/subsample_PLD.py`):
+Subsampling (defined in `PLD_accounting/subsample_pld.py`):
 
-- `subsample_PLD(pld, sampling_probability)`
-- `subsample_PLD_realization(base_pld, sampling_prob, direction)`
+- `subsample_pld(pld, sampling_probability)`
+- `subsample_pld_realization(base_pld, sampling_prob, direction)`
 
 Distribution type (defined in `PLD_accounting/discrete_dist.py`):
 
@@ -174,22 +173,22 @@ This is the shared composition core used by both Gaussian and realization accoun
 
 Key functions:
 
-- `allocation_full_PLD(...)`:
+- `allocation_full_pld(...)`:
   Shared top-level orchestrator used by both API paths. Calls
-  `allocation_directional_PLD(...)` for REMOVE and ADD, then combines with
-  `_compose_full_PLD(...)`.
-- `_allocation_directional_PLD_core(...)`:
+  `allocation_directional_pld(...)` for REMOVE and ADD, then combines with
+  `_compose_full_pld(...)`.
+- `_allocation_directional_pld_core(...)`:
   Calls a base-PLD callback, regrids to core resolution, composes across
   epochs, then regrids to output discretization.
-- `geometric_allocation_PLD_base_remove(...)`:
+- `geometric_allocation_pld_base_remove(...)`:
   Shared exp-space geometric composer for REMOVE. Accepts a callback that
   builds lower/upper loss factors.
-- `geometric_allocation_PLD_base_add(...)`:
+- `geometric_allocation_pld_base_add(...)`:
   Shared exp-space geometric composer for ADD. Accepts a callback that builds
   the add loss factor.
-- `allocation_directional_PLD(...)`:
+- `allocation_directional_pld(...)`:
   Applies adaptive step decomposition and composes floor/ceil components.
-- `_compose_full_PLD(...)`:
+- `_compose_full_pld(...)`:
   Converts internal directional PLDs into a `dp_accounting` PLD object.
 
 ### `random_allocation_realization.py`
@@ -210,8 +209,8 @@ Gaussian-specific path that constructs factors analytically, then reuses shared 
 
 Key functions:
 
-- `gaussian_allocation_PLD_core(...)`: selects FFT/GEOM/BEST computation and
-  returns the base directional PLD used by `_allocation_directional_PLD_core(...)`:
+- `gaussian_allocation_pld_core(...)`: selects FFT/GEOM/BEST computation and
+  returns the base directional PLD used by `_allocation_directional_pld_core(...)`:
   - FFT callback uses `_gaussian_allocation_fft(...)` with compact ADD/REMOVE internals.
   - GEOM callback uses shared add/remove geometric cores with Gaussian factor
     builders, matching realization route structure.
@@ -237,10 +236,10 @@ The module tracks best upper/lower bounds across iterations and returns `Adaptiv
 
 ## Subsampling Integration
 
-`PLD_accounting/subsample_PLD.py` provides:
+`PLD_accounting/subsample_pld.py` provides:
 
-- `subsample_PLD(pld, sampling_probability)`
-- `subsample_PLD_realization(base_pld, sampling_prob, direction)`
+- `subsample_pld(pld, sampling_probability)`
+- `subsample_pld_realization(base_pld, sampling_prob, direction)`
 
 This module implements PLD-based subsampling amplification (Appendix C mapping) and uses DOMINATES semantics.
 
@@ -259,7 +258,7 @@ Across the codebase:
 ## Practical Extension Points
 
 - New mechanisms can be added by producing valid `PLDRealization` inputs and
-  using `general_allocation_PLD(...)`.
+  using `general_allocation_pld(...)`.
 - Gaussian method tuning is controlled by `AllocationSchemeConfig` and
   `ConvolutionMethod`.
 - Additional accounting workflows can compose returned `dp_accounting` PLDs directly.

@@ -3,18 +3,20 @@
 import numpy as np
 import pytest
 from PLD_accounting.discrete_dist import DenseDiscreteDist, PLDRealization
-from PLD_accounting.FFT_convolution import FFT_convolve
+from PLD_accounting.fft_convolution import fft_convolve
 from PLD_accounting.mechanisms import gaussian_distribution, laplace_distribution
 from PLD_accounting.types import DEFAULT_TAIL_TRUNCATION, BoundType, SpacingType
 from PLD_accounting.utils import binary_self_convolve
 
 
 def test_gaussian_distribution_dominates_returns_pld_realization():
+    """Gaussian distribution dominates returns pld realization."""
     d = gaussian_distribution(1.0, tail_truncation=DEFAULT_TAIL_TRUNCATION)
     assert isinstance(d, PLDRealization)
 
 
 def test_gaussian_distribution_is_dominated_returns_linear_only():
+    """Gaussian distribution is dominated returns linear only."""
     d = gaussian_distribution(
         1.0,
         tail_truncation=DEFAULT_TAIL_TRUNCATION,
@@ -25,11 +27,13 @@ def test_gaussian_distribution_is_dominated_returns_linear_only():
 
 
 def test_laplace_distribution_dominates_returns_pld_realization():
+    """Laplace distribution dominates returns pld realization."""
     d = laplace_distribution(1.0, tail_truncation=DEFAULT_TAIL_TRUNCATION)
     assert isinstance(d, PLDRealization)
 
 
 def test_laplace_distribution_is_dominated_returns_linear_only():
+    """Laplace distribution is dominated returns linear only."""
     d = laplace_distribution(
         1.0,
         tail_truncation=DEFAULT_TAIL_TRUNCATION,
@@ -58,7 +62,10 @@ def test_laplace_distribution_self_convolve_t100():
     binary squarings the finite mass fell below the truncation budget and raised
     ValueError inside truncate_edges.
     """
-    tail_truncation = 1e-8
+    # Use a looser truncation budget for the 100-step composition to avoid
+    # re-triggering the truncation error; the initial distribution uses the
+    # default (tight) budget.
+    convolve_tail_truncation = 1e-8
     d = laplace_distribution(
         scale=0.7071,
         value_discretization=0.01,
@@ -69,9 +76,9 @@ def test_laplace_distribution_self_convolve_t100():
     composed = binary_self_convolve(
         dist=d,
         T=100,
-        tail_truncation=tail_truncation,
+        tail_truncation=convolve_tail_truncation,
         bound_type=BoundType.IS_DOMINATED,
-        convolve=FFT_convolve,
+        convolve=fft_convolve,
     )
     total = float(np.sum(composed.prob_arr)) + composed.p_min + composed.p_max
     assert abs(total - 1.0) < 1e-4

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from PLD_accounting.discrete_dist import DenseDiscreteDist, PLDRealization
-from PLD_accounting.distribution_discretization import rediscritize_dist
+from PLD_accounting.distribution_discretization import rediscretize_dist
 from PLD_accounting.types import BoundType, SpacingType
 from PLD_accounting.utils import calc_pld_dual, negate_reverse_linear_distribution
 
@@ -34,7 +34,7 @@ def realization_remove_base_distributions(
     if bound_type == BoundType.DOMINATES:
         # Avoid inflating the grid when the target is finer than the original one.
         effective_disc = max(realization.step, loss_discretization)
-        coarsened_base = rediscritize_dist(
+        coarsened_base = rediscretize_dist(
             dist=realization,
             tail_truncation=tail_truncation,
             loss_discretization=effective_disc,
@@ -68,7 +68,7 @@ def realization_remove_base_distributions(
         p_min=realization.p_min,
         p_max=realization.p_max,
     )
-    lower_base_dist = rediscritize_dist(
+    lower_base_dist = rediscretize_dist(
         dist=lower_realization_input,
         tail_truncation=tail_truncation,
         loss_discretization=effective_disc,
@@ -84,7 +84,7 @@ def realization_remove_base_distributions(
             "Expected DenseDiscreteDist with LINEAR spacing, "
             f"got {type(lower_base_dist).__name__} with spacing {_st}"
         )
-    neg_dual_dist = rediscritize_dist(
+    neg_dual_dist = rediscretize_dist(
         dist=neg_dual_linear,
         tail_truncation=tail_truncation,
         loss_discretization=effective_disc,
@@ -124,26 +124,21 @@ def realization_add_base_distribution(
         One ADD loss factor aligned to the requested linear grid.
 
     """
-    exp_bound_type = (
-        BoundType.IS_DOMINATED if bound_type == BoundType.DOMINATES else BoundType.DOMINATES
-    )
-    neg_realization = negate_reverse_linear_distribution(realization)
     # Avoid inflating the grid when the target is finer than the original one.
-    effective_disc = max(neg_realization.step, loss_discretization)
-    neg_coarsened = rediscritize_dist(
-        dist=neg_realization,
+    effective_disc = max(realization.step, loss_discretization)
+    coarsened = rediscretize_dist(
+        dist=realization,
         tail_truncation=tail_truncation,
         loss_discretization=effective_disc,
         spacing_type=SpacingType.LINEAR,
-        bound_type=exp_bound_type,
+        bound_type=bound_type,
     )
     if not (
-        isinstance(neg_coarsened, DenseDiscreteDist)
-        and neg_coarsened.spacing_type == SpacingType.LINEAR
+        isinstance(coarsened, DenseDiscreteDist) and coarsened.spacing_type == SpacingType.LINEAR
     ):
-        _st = getattr(neg_coarsened, "spacing_type", "?")
+        _st = getattr(coarsened, "spacing_type", "?")
         raise TypeError(
             "Expected DenseDiscreteDist with LINEAR spacing, "
-            f"got {type(neg_coarsened).__name__} with spacing {_st}"
+            f"got {type(coarsened).__name__} with spacing {_st}"
         )
-    return neg_coarsened
+    return coarsened

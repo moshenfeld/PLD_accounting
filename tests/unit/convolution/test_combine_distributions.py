@@ -5,7 +5,10 @@ import math
 import numpy as np
 from PLD_accounting.discrete_dist import SparseDiscreteDist
 from PLD_accounting.types import BoundType
-from PLD_accounting.utils import _align_distributions_to_union_grid, combine_distributions
+from PLD_accounting.utils import (
+    _align_distributions_to_union_grid,
+    combine_distributions,
+)
 
 from tests.test_tolerances import TestTolerances as TOL
 
@@ -20,6 +23,7 @@ def _make_dist(x_values, probs, p_max=0.0, p_min=0.0):
 
 
 def test_combine_distributions_aligns_grids_dominate():
+    """Combine distributions aligns grids dominate."""
     dist_1 = _make_dist([0.0, 1.0], [0.4, 0.5], p_max=0.1)
     dist_2 = _make_dist([0.5, 1.5], [0.3, 0.6], p_max=0.1)
 
@@ -32,6 +36,7 @@ def test_combine_distributions_aligns_grids_dominate():
 
 
 def test_align_distributions_to_union_grid_preserves_mass():
+    """Align distributions to union grid preserves mass."""
     dist_1 = _make_dist([0.0, 2.0], [0.2, 0.7], p_max=0.1)
     dist_2 = _make_dist([1.0, 3.0], [0.3, 0.6], p_max=0.1)
 
@@ -48,6 +53,7 @@ def test_align_distributions_to_union_grid_preserves_mass():
 
 
 def test_combine_distributions_aligns_grids_is_dominated():
+    """Combine distributions aligns grids is dominated."""
     dist_1 = _make_dist([0.0, 1.0], [0.4, 0.5], p_min=0.1)
     dist_2 = _make_dist([0.5, 1.5], [0.3, 0.6], p_min=0.1)
 

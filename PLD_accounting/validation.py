@@ -9,7 +9,7 @@ from __future__ import annotations
 import numpy as np
 from numpy.typing import NDArray
 
-from PLD_accounting.types import BoundType, PrivacyParams
+from PLD_accounting.types import AllocationSchemeConfig, BoundType, PrivacyParams
 
 # =============================================================================
 # Discrete PMF validation
@@ -161,10 +161,9 @@ def validate_bound_type(bound_type: BoundType) -> None:
 
     Args:
         bound_type: The bound type to validate.
-        allow_both: If False, raise an error if bound_type is BoundType.BOTH.
 
     Raises:
-        ValueError: If bound_type is invalid or BoundType.BOTH when not allowed.
+        ValueError: If bound_type is not DOMINATES or IS_DOMINATED.
 
     """
     if bound_type not in (BoundType.DOMINATES, BoundType.IS_DOMINATED):
@@ -194,6 +193,29 @@ def validate_discretization_params(
         raise ValueError(f"loss_discretization must be positive, got {loss_discretization}")
     if tail_truncation <= 0:
         raise ValueError(f"tail_truncation must be positive, got {tail_truncation}")
+
+
+def validate_allocation_scheme_config(config: AllocationSchemeConfig) -> None:
+    """Validate AllocationSchemeConfig fields.
+
+    Args:
+        config: Configuration to validate.
+
+    Raises:
+        TypeError: If config is not an AllocationSchemeConfig instance.
+        ValueError: If any field value is out of range.
+
+    """
+    if not isinstance(config, AllocationSchemeConfig):
+        raise TypeError(f"config must be AllocationSchemeConfig, got {type(config)}")
+    validate_discretization_params(config.loss_discretization, config.tail_truncation)
+    if config.max_grid_fft <= 0:
+        raise ValueError(f"max_grid_fft must be positive, got {config.max_grid_fft}")
+    if config.max_grid_mult != -1 and config.max_grid_mult <= 0:
+        raise ValueError(
+            f"max_grid_mult must be -1 (no limit) or a positive integer, "
+            f"got {config.max_grid_mult}"
+        )
 
 
 def validate_optional_discretization_params(

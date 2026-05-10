@@ -8,8 +8,6 @@ import math
 
 import numpy as np
 import pytest
-from scipy import stats
-
 from PLD_accounting.discrete_dist import DenseDiscreteDist, Domain, SparseDiscreteDist
 from PLD_accounting.distribution_discretization import (
     discretize_continuous_distribution,
@@ -18,7 +16,7 @@ from PLD_accounting.distribution_utils import compute_bin_width
 from PLD_accounting.geometric_convolution import (
     geometric_convolve,
 )
-from PLD_accounting.subsample_PLD import (
+from PLD_accounting.subsample_pld import (
     _calc_subsampled_grid,
     _mix_distributions,
     _stable_subsampling_transformation,
@@ -26,8 +24,20 @@ from PLD_accounting.subsample_PLD import (
     _subsample_dist_mix,
 )
 from PLD_accounting.types import BoundType, Direction, SpacingType
+from scipy import stats
 
 from tests.test_tolerances import TestTolerances as TOL
+
+
+def _linear_step_for_tail_truncation(
+    dist: stats.rv_continuous,
+    tail_truncation: float,
+    n_grid: int,
+) -> float:
+    """Match legacy ``n_grid``-only grids: uniform step over the tail quantile span."""
+    x_min = float(dist.ppf(tail_truncation))
+    x_max = float(dist.isf(tail_truncation))
+    return (x_max - x_min) / (n_grid - 1)
 
 
 class TestDominationSemantics:
@@ -38,7 +48,7 @@ class TestDominationSemantics:
         dist = stats.norm(loc=0.0, scale=1.0)
         result = discretize_continuous_distribution(
             dist=dist,
-            n_grid=100,
+            step=_linear_step_for_tail_truncation(dist, 0.01, 100),
             align_to_multiples=True,
             tail_truncation=0.01,
             bound_type=BoundType.DOMINATES,
@@ -52,7 +62,7 @@ class TestDominationSemantics:
         dist = stats.norm(loc=0.0, scale=1.0)
         result = discretize_continuous_distribution(
             dist=dist,
-            n_grid=100,
+            step=_linear_step_for_tail_truncation(dist, 0.01, 100),
             align_to_multiples=True,
             tail_truncation=0.01,
             bound_type=BoundType.IS_DOMINATED,
@@ -66,7 +76,7 @@ class TestDominationSemantics:
         dist = stats.norm(loc=0.0, scale=1.0)
         result = discretize_continuous_distribution(
             dist=dist,
-            n_grid=100,
+            step=_linear_step_for_tail_truncation(dist, 0.01, 100),
             align_to_multiples=True,
             tail_truncation=0.01,
             bound_type=BoundType.DOMINATES,
@@ -83,7 +93,7 @@ class TestDominationSemantics:
         dist = stats.norm(loc=0.0, scale=1.0)
         result = discretize_continuous_distribution(
             dist=dist,
-            n_grid=100,
+            step=_linear_step_for_tail_truncation(dist, 0.01, 100),
             align_to_multiples=True,
             tail_truncation=0.01,
             bound_type=BoundType.IS_DOMINATED,
@@ -104,7 +114,7 @@ class TestStochasticDominance:
 
         upper = discretize_continuous_distribution(
             dist=dist,
-            n_grid=200,
+            step=_linear_step_for_tail_truncation(dist, 0.001, 200),
             align_to_multiples=True,
             tail_truncation=0.001,
             bound_type=BoundType.DOMINATES,
@@ -113,7 +123,7 @@ class TestStochasticDominance:
 
         lower = discretize_continuous_distribution(
             dist=dist,
-            n_grid=200,
+            step=_linear_step_for_tail_truncation(dist, 0.001, 200),
             align_to_multiples=True,
             tail_truncation=0.001,
             bound_type=BoundType.IS_DOMINATED,
@@ -121,13 +131,14 @@ class TestStochasticDominance:
         )
 
         # Compute expectations (over finite grid only)
-        E_upper = math.fsum(float(x) * float(p) for x, p in zip(upper.x_array, upper.prob_arr))
-        E_lower = math.fsum(float(x) * float(p) for x, p in zip(lower.x_array, lower.prob_arr))
+        mean_upper = math.fsum(float(x) * float(p) for x, p in zip(upper.x_array, upper.prob_arr))
+        mean_lower = math.fsum(float(x) * float(p) for x, p in zip(lower.x_array, lower.prob_arr))
 
         # Upper bound should have higher or equal expectation
-        assert (
-            E_upper >= E_lower - TOL.STOCHASTIC_DOM_SLACK
-        ), f"Expected value ordering violated: E_upper={E_upper} < E_lower={E_lower}"
+        assert mean_upper >= mean_lower - TOL.STOCHASTIC_DOM_SLACK, (
+            "Expected value ordering violated: "
+            f"mean_upper={mean_upper} < mean_lower={mean_lower}"
+        )
 
     def test_variance_ordering_reasonable(self):
         """Test that variance relationship is reasonable."""
@@ -135,7 +146,7 @@ class TestStochasticDominance:
 
         upper = discretize_continuous_distribution(
             dist=dist,
-            n_grid=200,
+            step=_linear_step_for_tail_truncation(dist, 0.001, 200),
             align_to_multiples=True,
             tail_truncation=0.001,
             bound_type=BoundType.DOMINATES,
@@ -144,7 +155,7 @@ class TestStochasticDominance:
 
         lower = discretize_continuous_distribution(
             dist=dist,
-            n_grid=200,
+            step=_linear_step_for_tail_truncation(dist, 0.001, 200),
             align_to_multiples=True,
             tail_truncation=0.001,
             bound_type=BoundType.IS_DOMINATED,
@@ -152,19 +163,19 @@ class TestStochasticDominance:
         )
 
         # Compute variances
-        E_upper = math.fsum(float(x) * float(p) for x, p in zip(upper.x_array, upper.prob_arr))
-        E_lower = math.fsum(float(x) * float(p) for x, p in zip(lower.x_array, lower.prob_arr))
+        mean_upper = math.fsum(float(x) * float(p) for x, p in zip(upper.x_array, upper.prob_arr))
+        mean_lower = math.fsum(float(x) * float(p) for x, p in zip(lower.x_array, lower.prob_arr))
 
-        Var_upper = math.fsum(
-            float((x - E_upper) ** 2) * float(p) for x, p in zip(upper.x_array, upper.prob_arr)
+        var_upper = math.fsum(
+            float((x - mean_upper) ** 2) * float(p) for x, p in zip(upper.x_array, upper.prob_arr)
         )
-        Var_lower = math.fsum(
-            float((x - E_lower) ** 2) * float(p) for x, p in zip(lower.x_array, lower.prob_arr)
+        var_lower = math.fsum(
+            float((x - mean_lower) ** 2) * float(p) for x, p in zip(lower.x_array, lower.prob_arr)
         )
 
         # Both should be reasonable (close to true variance = 1)
-        assert 0.5 < Var_upper < 2.0
-        assert 0.5 < Var_lower < 2.0
+        assert 0.5 < var_upper < 2.0
+        assert 0.5 < var_lower < 2.0
 
 
 class TestDominationUnderConvolution:
@@ -265,7 +276,7 @@ class TestExponentialDistribution:
         dist = stats.expon(scale=1.0)
         result = discretize_continuous_distribution(
             dist=dist,
-            n_grid=100,
+            step=_linear_step_for_tail_truncation(dist, 0.01, 100),
             align_to_multiples=True,
             tail_truncation=0.01,
             bound_type=BoundType.DOMINATES,
@@ -280,7 +291,7 @@ class TestExponentialDistribution:
         dist = stats.expon(scale=1.0)
         result = discretize_continuous_distribution(
             dist=dist,
-            n_grid=100,
+            step=_linear_step_for_tail_truncation(dist, 0.05, 100),
             align_to_multiples=True,
             tail_truncation=0.05,
             bound_type=BoundType.IS_DOMINATED,
@@ -305,6 +316,8 @@ def _build_test_dist(x_array, pmf_array, *, p_min=0.0, p_max=0.0) -> SparseDiscr
 
 
 class TestSubsampleDistMix:
+    """``_subsample_dist_mix`` should match explicit sequential subsample + mix semantics."""
+
     _BASE_X = np.linspace(-3.0, 1.0, 6)
     _BASE_PMF = np.array([0.1, 0.15, 0.2, 0.25, 0.15, 0.15], dtype=np.float64)
     _REF_X = np.linspace(-2.5, 2.0, 6)
@@ -324,6 +337,7 @@ class TestSubsampleDistMix:
         ],
     )
     def test_matches_sequential_discretization(self, base_inf, ref_inf):
+        """Mixed subsampled PLD must equal subsampling each factor then mixing with weight ``q``."""
         sampling_prob = 0.37
         direction = Direction.REMOVE
         base_dist = _build_test_dist(self._BASE_X, self._BASE_PMF, **base_inf)
@@ -370,6 +384,7 @@ class TestSubsampleDistMix:
         assert np.isclose(result.p_max, coupled.p_max, rtol=TOL.INF_MASS_RTOL)
 
     def test_grid_covers_transformed_range(self):
+        """The coupled lattice must span the transformed finite endpoints and subsampling caps."""
         sampling_prob = 0.4
         direction = Direction.REMOVE
         base_dist = _build_test_dist(self._BASE_X, self._BASE_PMF, p_min=0.0, p_max=0.02)
@@ -407,6 +422,7 @@ class TestSubsampleDistMix:
         assert result.x_array[-1] >= expected_upper - TOL.SPACING_ATOL
 
     def test_uses_provided_grid(self):
+        """With ``target_x_array`` set, the mixture must use that lattice exactly."""
         sampling_prob = 0.25
         direction = Direction.REMOVE
         base_dist = _build_test_dist(self._BASE_X, self._BASE_PMF, p_min=0.0, p_max=0.0)
@@ -427,9 +443,10 @@ class TestSubsampleDistMix:
             target_x_array=target_grid,
         )
 
+        # Same lattice can differ by a few ULP when materialized on different paths.
         np.testing.assert_allclose(
             result.x_array,
             target_grid,
-            rtol=TOL.GRID_EXACT_RTOL,
-            atol=TOL.GRID_EXACT_ATOL,
+            rtol=0.0,
+            atol=1e-12,
         )

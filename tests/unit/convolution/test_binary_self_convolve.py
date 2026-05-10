@@ -5,7 +5,7 @@ import math
 import numpy as np
 import pytest
 from PLD_accounting.discrete_dist import DenseDiscreteDist, Domain
-from PLD_accounting.FFT_convolution import FFT_convolve, FFT_self_convolve
+from PLD_accounting.fft_convolution import fft_convolve, fft_self_convolve
 from PLD_accounting.geometric_convolution import geometric_convolve
 from PLD_accounting.types import BoundType, SpacingType
 from PLD_accounting.utils import binary_self_convolve
@@ -31,6 +31,7 @@ def _geometric_dist(n: int = 6) -> DenseDiscreteDist:
 
 
 def test_binary_self_convolve_rejects_invalid_t():
+    """Binary self convolve rejects invalid t."""
     dist = _linear_dist()
     with pytest.raises(ValueError, match="T must be >= 1"):
         binary_self_convolve(
@@ -38,25 +39,27 @@ def test_binary_self_convolve_rejects_invalid_t():
             T=0,
             tail_truncation=0.0,
             bound_type=BoundType.DOMINATES,
-            convolve=FFT_convolve,
+            convolve=fft_convolve,
         )
 
 
 def test_binary_self_convolve_t1_identity():
+    """Binary self convolve t1 identity."""
     dist = _linear_dist()
     result = binary_self_convolve(
-        dist=dist, T=1, tail_truncation=0.0, bound_type=BoundType.DOMINATES, convolve=FFT_convolve
+        dist=dist, T=1, tail_truncation=0.0, bound_type=BoundType.DOMINATES, convolve=fft_convolve
     )
     assert np.allclose(result.x_array, dist.x_array)
     assert np.allclose(result.prob_arr, dist.prob_arr)
 
 
 def test_binary_self_convolve_matches_direct_fft_t2():
+    """Binary self convolve matches direct fft t2."""
     dist = _linear_dist()
     result = binary_self_convolve(
-        dist=dist, T=2, tail_truncation=0.0, bound_type=BoundType.DOMINATES, convolve=FFT_convolve
+        dist=dist, T=2, tail_truncation=0.0, bound_type=BoundType.DOMINATES, convolve=fft_convolve
     )
-    direct = FFT_convolve(
+    direct = fft_convolve(
         dist_1=dist, dist_2=dist, tail_truncation=0.0, bound_type=BoundType.DOMINATES
     )
     assert np.allclose(result.x_array, direct.x_array)
@@ -64,6 +67,7 @@ def test_binary_self_convolve_matches_direct_fft_t2():
 
 
 def test_binary_self_convolve_matches_repeated_geometric():
+    """Binary self convolve matches repeated geometric."""
     dist = _geometric_dist()
     result = binary_self_convolve(
         dist=dist,
@@ -83,9 +87,10 @@ def test_binary_self_convolve_matches_repeated_geometric():
 
 
 def test_binary_self_convolve_preserves_mass_fft():
+    """Binary self convolve preserves mass fft."""
     dist = _linear_dist()
     result = binary_self_convolve(
-        dist=dist, T=5, tail_truncation=0.0, bound_type=BoundType.DOMINATES, convolve=FFT_convolve
+        dist=dist, T=5, tail_truncation=0.0, bound_type=BoundType.DOMINATES, convolve=fft_convolve
     )
     total = math.fsum([*map(float, result.prob_arr), result.p_min, result.p_max])
     assert np.isclose(total, 1.0, atol=TOL.MASS_CONSERVATION)
@@ -100,10 +105,10 @@ def test_fft_self_convolve_direct_vs_binary():
     with conserved mass.
     """
     dist = _linear_dist(n=9)
-    direct = FFT_self_convolve(
+    direct = fft_self_convolve(
         dist=dist, T=7, tail_truncation=0.0, bound_type=BoundType.DOMINATES, use_direct=True
     )
-    binary = FFT_self_convolve(
+    binary = fft_self_convolve(
         dist=dist, T=7, tail_truncation=0.0, bound_type=BoundType.DOMINATES, use_direct=False
     )
 

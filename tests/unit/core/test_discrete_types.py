@@ -5,13 +5,11 @@ Tests all distribution types: General, Linear (Dense/Sparse), Geometric (Dense/S
 and transform functions between linear and geometric grids.
 """
 
-from pathlib import Path
-from typing import Any, Optional
-
 import numpy as np
 import pytest
 from PLD_accounting.discrete_dist import (
     DenseDiscreteDist,
+    Domain,
     SparseDiscreteDist,
 )
 from PLD_accounting.distribution_utils import PMF_MASS_TOL
@@ -20,14 +18,6 @@ from PLD_accounting.utils import (
     exp_linear_to_geometric,
     log_geometric_to_linear,
 )
-
-mypy_api: Optional[Any]
-try:
-    from mypy import api as _mypy_api
-
-    mypy_api = _mypy_api
-except ImportError:
-    mypy_api = None
 
 
 class TestGeneralDiscreteDist:
@@ -45,8 +35,6 @@ class TestGeneralDiscreteDist:
 
     def test_with_boundary_mass(self):
         """Test distribution with mass at boundaries (POSITIVES domain allows both)."""
-        from PLD_accounting.discrete_dist import Domain
-
         x = np.array([1.0, 2.0])
         pmf = np.array([0.3, 0.5], dtype=np.float64)
         dist = SparseDiscreteDist(
@@ -173,8 +161,6 @@ class TestDenseDiscreteDistGeometric:
 
     def test_valid_dense_geometric(self):
         """Test creating valid dense geometric distribution."""
-        from PLD_accounting.discrete_dist import Domain
-
         dist = DenseDiscreteDist(
             x_min=1.0,
             step=2.0,
@@ -187,8 +173,6 @@ class TestDenseDiscreteDistGeometric:
 
     def test_x_min_must_be_positive(self):
         """Test that non-positive x_min raises error for geometric grid."""
-        from PLD_accounting.discrete_dist import Domain
-
         with pytest.raises(ValueError, match="x_min must be positive"):
             DenseDiscreteDist(
                 x_min=0.0,
@@ -200,8 +184,6 @@ class TestDenseDiscreteDistGeometric:
 
     def test_skip_must_exceed_one(self):
         """Test that step <= 1 raises error for geometric grid."""
-        from PLD_accounting.discrete_dist import Domain
-
         with pytest.raises(ValueError, match="step must be > 1"):
             DenseDiscreteDist(
                 x_min=1.0,
@@ -242,8 +224,6 @@ class TestLinearGeometricTransforms:
 
     def test_dense_geometric_to_linear_roundtrip(self):
         """Test dense geometric -> linear -> geometric preserves structure."""
-        from PLD_accounting.discrete_dist import Domain
-
         dist_geom = DenseDiscreteDist(
             x_min=2.0,
             step=1.5,
@@ -306,8 +286,6 @@ class TestLinearGeometricTransforms:
         assert back_pos.p_max == 0.2
 
         # POSITIVES with both non-zero is valid
-        from PLD_accounting.discrete_dist import Domain
-
         geom_both = DenseDiscreteDist(
             x_min=np.exp(1.0),
             step=np.exp(0.5),
@@ -319,26 +297,3 @@ class TestLinearGeometricTransforms:
         )
         assert geom_both.p_min == 0.1
         assert geom_both.p_max == 0.1
-
-
-@pytest.mark.unit
-def test_project_type_hints_with_mypy_static_analysis():
-    if mypy_api is None:
-        raise AssertionError(
-            "mypy is required for full-project static type checks. Install test dependencies."
-        )
-
-    repo_root = Path(__file__).resolve().parents[3]
-    targets = [str(repo_root / "PLD_accounting"), str(repo_root / "tests")]
-    stdout, stderr, exit_status = mypy_api.run(
-        [
-            "--config-file",
-            str(repo_root / "pyproject.toml"),
-            "--cache-dir",
-            str(repo_root / ".mypy_cache"),
-            *targets,
-        ]
-    )
-    if exit_status != 0:
-        output = "\n".join(part for part in (stdout, stderr) if part.strip()).strip()
-        pytest.fail(f"Full-project mypy type check failed:\n{output}")

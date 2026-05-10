@@ -31,7 +31,7 @@ class ConvolutionMethod(Enum):
     GEOM = "geometric"
     FFT = "fft"
     COMBINED = "combined"
-    BEST_OF_TWO = "best of two"
+    BEST_OF_TWO = "best_of_two"
 
 
 class Direction(Enum):
@@ -66,6 +66,9 @@ class AllocationSchemeConfig:
 
     loss_discretization: float = DEFAULT_LOSS_DISCRETIZATION
     tail_truncation: float = DEFAULT_TAIL_TRUNCATION
-    max_grid_FFT: int = 1_000_000
-    max_grid_mult: int = -1
+    max_grid_fft: int = 1_000_000
+    max_grid_mult: int = -1  # -1 means no upper limit on grid size
     convolution_method: ConvolutionMethod = ConvolutionMethod.GEOM
+    # CF (characteristic-function) allocation path; currently experimental.
+    cf_max_grid: int = 50_000_000
+    cf_refine_factor: int = 10

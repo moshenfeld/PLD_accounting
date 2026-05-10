@@ -106,15 +106,15 @@ class DiscreteDistBase(ABC):
 
     def truncate_edges(self, tail_truncation: float, bound_type: BoundType) -> Self:
         """Truncate distribution edges. Computation lives in distribution_utils."""
-        new_PMF, new_p_min, new_p_max, min_ind, max_ind = compute_truncation(
+        new_prob_arr, new_p_min, new_p_max, min_ind, max_ind = compute_truncation(
             self.prob_arr, self.p_min, self.p_max, tail_truncation, bound_type
         )
-        return self._create_truncated(new_PMF, new_p_min, new_p_max, min_ind, max_ind)
+        return self._create_truncated(new_prob_arr, new_p_min, new_p_max, min_ind, max_ind)
 
     @abstractmethod
     def _create_truncated(
         self,
-        new_PMF: NDArray[np.float64],
+        new_prob_arr: NDArray[np.float64],
         new_p_min: float,
         new_p_max: float,
         min_ind: int,
@@ -160,15 +160,15 @@ class SparseDiscreteDist(DiscreteDistBase):
 
     def _create_truncated(
         self,
-        new_PMF: NDArray[np.float64],
+        new_prob_arr: NDArray[np.float64],
         new_p_min: float,
         new_p_max: float,
         min_ind: int,
         max_ind: int,
     ) -> SparseDiscreteDist:
         return SparseDiscreteDist(
-            x_array=self._x_array[slice(min_ind, max_ind + 1)],
-            prob_arr=new_PMF,
+            x_array=self._x_array[slice(min_ind, max_ind + 1)].copy(),
+            prob_arr=new_prob_arr,
             p_min=new_p_min,
             p_max=new_p_max,
             domain=self.domain,
@@ -260,12 +260,11 @@ class DenseDiscreteDist(DiscreteDistBase):
         n = self.prob_arr.size
         if self.spacing_type == SpacingType.LINEAR:
             return self.x_min + np.arange(n, dtype=np.float64) * self.step
-        else:
-            return self.x_min * np.power(self.step, np.arange(n, dtype=np.float64))
+        return self.x_min * np.power(self.step, np.arange(n, dtype=np.float64))
 
     def _create_truncated(
         self,
-        new_PMF: NDArray[np.float64],
+        new_prob_arr: NDArray[np.float64],
         new_p_min: float,
         new_p_max: float,
         min_ind: int,
@@ -278,7 +277,7 @@ class DenseDiscreteDist(DiscreteDistBase):
         return self.__class__(
             x_min=new_x_min,
             step=self.step,
-            prob_arr=new_PMF,
+            prob_arr=new_prob_arr,
             p_min=new_p_min,
             p_max=new_p_max,
             spacing_type=self.spacing_type,
@@ -341,7 +340,7 @@ class PLDRealization(DenseDiscreteDist):
             p_min=dist.p_min,
         )
 
-    def _validate_pld_realization(self) -> "PLDRealization":
+    def _validate_pld_realization(self) -> None:
         """Validate the properties of PLD-realization.
 
         1. p(-inf) = 0 (p_min = 0).
@@ -362,7 +361,6 @@ class PLDRealization(DenseDiscreteDist):
                 f"Exponential moment E[exp(-L)] = {exp_moment_total:.15f} > 1.0, "
                 "not a valid PLD realization"
             )
-        return self
 
     def copy(self) -> "PLDRealization":
         """Create a deep copy of this PLD realization."""
@@ -374,9 +372,30 @@ class PLDRealization(DenseDiscreteDist):
             p_min=self.p_min,
         )
 
+    def truncate_edges(  # type: ignore[override]
+        self, tail_truncation: float, bound_type: BoundType
+    ) -> DenseDiscreteDist:
+        """Trim edge mass, returning a plain dense distribution when needed.
+
+        ``IS_DOMINATED`` truncation can move mass into ``p_min``, which violates
+        the PLD-realization invariant ``p_min == 0``. In that case the result is
+        intentionally downgraded to ``DenseDiscreteDist``.
+        """
+        if bound_type == BoundType.IS_DOMINATED:
+            # IS_DOMINATED can set p_min > 0, violating PLDRealization.p_min = 0.
+            # Delegate through a plain DenseDiscreteDist so the result is not a PLDRealization.
+            return DenseDiscreteDist(
+                x_min=self.x_min,
+                step=self.step,
+                prob_arr=self.prob_arr.copy(),
+                p_min=self.p_min,
+                p_max=self.p_max,
+            ).truncate_edges(tail_truncation, bound_type)
+        return super().truncate_edges(tail_truncation, bound_type)
+
     def _create_truncated(
         self,
-        new_PMF: NDArray[np.float64],
+        new_prob_arr: NDArray[np.float64],
         new_p_min: float,
         new_p_max: float,
         min_ind: int,
@@ -387,7 +406,7 @@ class PLDRealization(DenseDiscreteDist):
         return PLDRealization(
             x_min=self.x_min + min_ind * self.step,
             step=self.step,
-            prob_arr=new_PMF,
+            prob_arr=new_prob_arr,
             p_min=new_p_min,
             p_max=new_p_max,
         )

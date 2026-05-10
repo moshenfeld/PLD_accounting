@@ -38,10 +38,10 @@ pytest tests_extended/integration/test_pld_realizations.py -q
 
 ## Legacy implementation tests
 
-Tests for the frozen reference implementation under `legacy/PLD_accounting/` are in `legacy/tests/`. Use an explicit path and set `PYTHONPATH` so `PLD_accounting` resolves to `legacy/PLD_accounting`, the in-tree `tests` package wins over any site-packages `tests`, and (for a few integration tests) `utils` / `comparisons` resolve via `experiments`:
+Tests for the frozen reference implementation under `legacy/PLD_accounting/` are in `legacy/tests/`. Use an explicit path and set `PYTHONPATH` so `PLD_accounting` resolves to `legacy/PLD_accounting` and the in-tree `tests` package wins over any site-packages `tests`:
 
 ```bash
-PYTHONPATH=legacy/tests:legacy:experiments \
+PYTHONPATH=legacy/tests:legacy \
   pytest legacy/tests -q --import-mode=importlib --confcutdir=legacy/tests
 ```
 

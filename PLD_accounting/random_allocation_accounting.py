@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import math
+import warnings
 from typing import Callable
 
 import numpy as np
 from dp_accounting.pld import privacy_loss_distribution
 
 from PLD_accounting.discrete_dist import DenseDiscreteDist
-from PLD_accounting.distribution_discretization import rediscritize_dist
+from PLD_accounting.distribution_discretization import rediscretize_dist
 from PLD_accounting.dp_accounting_support import linear_dist_to_dp_accounting_pmf
-from PLD_accounting.FFT_convolution import FFT_convolve, FFT_self_convolve
+from PLD_accounting.fft_convolution import (
+    MAX_FFT_BYTES,
+    fft_convolve,
+    fft_self_convolve,
+)
 from PLD_accounting.geometric_convolution import (
     geometric_convolve,
     geometric_self_convolve,
@@ -27,12 +33,17 @@ from PLD_accounting.validation import (
     validate_discretization_params,
 )
 
+# Minimum number of bins to keep after per-epoch base PMF size capping.
+_MIN_BASE_PMF_BINS = 4
+# Estimated bytes consumed per input PMF bin in the direct epoch-compose cap.
+_DIRECT_COMPOSE_BYTES_PER_BASE_BIN = 16
+
 # =============================================================================
 # Public API
 # =============================================================================
 
 
-def allocation_full_PLD(
+def allocation_full_pld(
     *,
     compute_base_pld_remove: Callable[..., DenseDiscreteDist],
     compute_base_pld_add: Callable[..., DenseDiscreteDist],
@@ -46,7 +57,7 @@ def allocation_full_PLD(
     """Orchestrate full allocation PLD construction for both directions.
 
     This function builds REMOVE and ADD directional PLDs via
-    ``allocation_directional_PLD(...)`` and then converts them to the final
+    ``allocation_directional_pld(...)`` and then converts them to the final
     ``dp_accounting`` PLD object.
     """
     # Input validation
@@ -54,7 +65,7 @@ def allocation_full_PLD(
     validate_discretization_params(loss_discretization, tail_truncation)
     validate_bound_type(bound_type)
 
-    remove_dist = allocation_directional_PLD(
+    remove_dist = allocation_directional_pld(
         compute_base_pld=compute_base_pld_remove,
         num_steps=num_steps,
         num_selected=num_selected,
@@ -63,7 +74,7 @@ def allocation_full_PLD(
         tail_truncation=tail_truncation,
         bound_type=bound_type,
     )
-    add_dist = allocation_directional_PLD(
+    add_dist = allocation_directional_pld(
         compute_base_pld=compute_base_pld_add,
         num_steps=num_steps,
         num_selected=num_selected,
@@ -72,14 +83,14 @@ def allocation_full_PLD(
         tail_truncation=tail_truncation,
         bound_type=bound_type,
     )
-    return _compose_full_PLD(
+    return _compose_full_pld(
         remove_dist=remove_dist,
         add_dist=add_dist,
         bound_type=bound_type,
     )
 
 
-def allocation_directional_PLD(
+def allocation_directional_pld(
     *,
     compute_base_pld: Callable[..., DenseDiscreteDist],
     num_steps: int,
@@ -93,8 +104,8 @@ def allocation_directional_PLD(
 
     For divisible ``num_steps / num_selected``, this builds one component. For
     non-divisible cases, it builds floor and ceil components via
-    ``_allocation_directional_PLD_core(...)`` and combines them with one final
-    ``FFT_convolve(...)``.
+    ``_allocation_directional_pld_core(...)`` and combines them with one final
+    ``fft_convolve(...)``.
     """
     # Input validation
     validate_allocation_params(num_steps, num_selected, num_epochs)
@@ -107,26 +118,47 @@ def allocation_directional_PLD(
     new_num_steps_ceil = new_num_steps_floor + 1
     new_num_epochs_floor = (num_selected - num_epochs_remainder) * num_epochs
     new_num_epochs_ceil = num_epochs_remainder * num_epochs
-    # Tail budget is applied twice (floor and ceil distributions).
-    tail_truncation /= 2
+    # Loss: fft_convolve preserves the grid step, so only the component builds add
+    # rounding error.  Each component receives loss_discretization / component_count,
+    # and all components together account for the full budget:
+    #   component_count * (loss_discretization / component_count) = loss_discretization.
+    # Tail: active tail-consuming ops = one _allocation_directional_pld_core per component
+    # plus one fft_convolve when both components are active, giving 2*component_count - 1
+    # ops total (1 for component_count=1, 3 for component_count=2).  After
+    # tail_truncation /= (2*component_count - 1), each op consumes at most the rescaled
+    # budget, and all ops together sum to <= (2*component_count - 1) * rescaled = tail_truncation.
+    component_count = int(new_num_epochs_floor > 0) + int(new_num_epochs_ceil > 0)
+    tail_truncation /= 2 * component_count - 1
+    loss_discretization_component = loss_discretization / component_count
+    # _allocation_directional_pld_core produces
+    # output discretization = loss_discretization / (2*num_epochs).
+    # When both floor and ceil are active their num_epochs differ, so scale each component's
+    # loss budget proportionally so both land on the same output step (required for fft_convolve).
+    if new_num_epochs_floor > 0 and new_num_epochs_ceil > 0:
+        _max_epochs = max(new_num_epochs_floor, new_num_epochs_ceil)
+        loss_disc_floor = loss_discretization_component * new_num_epochs_floor / _max_epochs
+        loss_disc_ceil = loss_discretization_component * new_num_epochs_ceil / _max_epochs
+    else:
+        loss_disc_floor = loss_discretization_component
+        loss_disc_ceil = loss_discretization_component
 
     dist_floor = None
     dist_ceil = None
     if new_num_epochs_floor > 0:
-        dist_floor = _allocation_directional_PLD_core(
+        dist_floor = _allocation_directional_pld_core(
             compute_base_pld=compute_base_pld,
             num_steps=new_num_steps_floor,
             num_epochs=new_num_epochs_floor,
-            loss_discretization=loss_discretization,
+            loss_discretization=loss_disc_floor,
             tail_truncation=tail_truncation,
             bound_type=bound_type,
         )
     if new_num_epochs_ceil > 0:
-        dist_ceil = _allocation_directional_PLD_core(
+        dist_ceil = _allocation_directional_pld_core(
             compute_base_pld=compute_base_pld,
             num_steps=new_num_steps_ceil,
             num_epochs=new_num_epochs_ceil,
-            loss_discretization=loss_discretization,
+            loss_discretization=loss_disc_ceil,
             tail_truncation=tail_truncation,
             bound_type=bound_type,
         )
@@ -134,12 +166,44 @@ def allocation_directional_PLD(
     if dist_floor is None:
         if dist_ceil is None:
             raise RuntimeError(
-                "allocation_directional_PLD failed to build either floor or ceil component"
+                "allocation_directional_pld failed to build either floor or ceil component"
             )
         return dist_ceil
     if dist_ceil is None:
         return dist_floor
-    return FFT_convolve(
+    # Fallback: max_grid coarsening inside compute_base_pld can still produce
+    # unequal steps even after pre-scaling.  Align to the coarser of the two.
+    if dist_floor.step != dist_ceil.step:
+        floor_step_before = dist_floor.step
+        ceil_step_before = dist_ceil.step
+        floor_size_before = dist_floor.prob_arr.size
+        ceil_size_before = dist_ceil.prob_arr.size
+        target_step = max(dist_floor.step, dist_ceil.step)
+        if dist_floor.step < target_step:
+            dist_floor = rediscretize_dist(
+                dist=dist_floor,
+                tail_truncation=tail_truncation,
+                loss_discretization=target_step,
+                spacing_type=SpacingType.LINEAR,
+                bound_type=bound_type,
+            )
+        else:
+            dist_ceil = rediscretize_dist(
+                dist=dist_ceil,
+                tail_truncation=tail_truncation,
+                loss_discretization=target_step,
+                spacing_type=SpacingType.LINEAR,
+                bound_type=bound_type,
+            )
+        warnings.warn(
+            "allocation_directional_pld: aligning mismatched floor/ceil grids. "
+            f"floor size {floor_size_before}->{dist_floor.prob_arr.size}, "
+            f"step {floor_step_before:.6e}->{dist_floor.step:.6e}; "
+            f"ceil size {ceil_size_before}->{dist_ceil.prob_arr.size}, "
+            f"step {ceil_step_before:.6e}->{dist_ceil.step:.6e}; "
+            f"target_step={target_step:.6e}"
+        )
+    return fft_convolve(
         dist_1=dist_floor,
         dist_2=dist_ceil,
         tail_truncation=tail_truncation,
@@ -147,7 +211,7 @@ def allocation_directional_PLD(
     )
 
 
-def geometric_allocation_PLD_base_remove(
+def geometric_allocation_pld_base_remove(
     *,
     base_distributions_creation: Callable[..., tuple[DenseDiscreteDist, DenseDiscreteDist]],
     num_steps: int,
@@ -165,11 +229,30 @@ def geometric_allocation_PLD_base_remove(
         raise ValueError(f"num_steps must be >= 1, got {num_steps}")
     validate_discretization_params(loss_discretization, tail_truncation)
     validate_bound_type(bound_type)
-    # Loss grid is refined across ~2*ceil(log2(num_steps)) geometric-convolution stages;
-    # split discretization across them and the initial discretization.
-    loss_discretization /= int(2 * np.ceil(np.log2(num_steps)) + 1)
-    # Tail mass is charged at base construction, self-convolution, and the final geometric convolve.
-    tail_truncation /= 3
+    # For num_steps > 1 there are active convolution stages beyond base construction.
+    # For num_steps == 1 neither convolution stages nor Phases 2/3 execute, so no
+    # division is needed for either budget.
+    if num_steps > 1:
+        # Loss: divide by the total stage count so each stage contributes at most
+        # loss_discretization / num_stages rounding error, and all stages together sum to:
+        #   remove_loss_stages * (loss_discretization / remove_loss_stages) = loss_discretization.
+        # Stages: 2 for base + neg-dual factor creation
+        #         + _binary_self_convolution_call_count(num_steps - 1) for geometric_self_convolve
+        #         + 1 for the final geometric_convolve(neg_dual_convolved, base).
+        remove_loss_stages = 3 + _binary_self_convolution_call_count(num_steps - 1)
+        loss_discretization /= remove_loss_stages
+        # Tail: three phases each receive tail_truncation / 3 after division.  Contributions
+        # to output p_max (letting T = num_steps, budget/3 = rescaled per-phase share):
+        #   Phase 1 (base_distributions_creation): base_factor_tail_truncation = budget/(3T).
+        #            neg_dual is self-convolved T-1 times, base convolved once; total amplified
+        #            contribution = ((T-1) + 1) * budget/(3T) = budget/3.
+        #   Phase 2 (geometric_self_convolve, T-1): called with budget/3 -> <= budget/3.
+        #   Phase 3 (geometric_convolve): called with budget/3 -> <= budget/3.
+        # Sum <= budget/3 + budget/3 + budget/3 = budget
+        tail_truncation /= 3
+    # Each base factor is one of num_steps terms in the final product; its individual
+    # tail error is amplified by num_steps through self-convolution, so scale its budget
+    # down by num_steps so the amplified contribution stays within the phase budget.
     base_factor_tail_truncation = tail_truncation / num_steps
 
     base, neg_dual_base = base_distributions_creation(
@@ -177,6 +260,11 @@ def geometric_allocation_PLD_base_remove(
         tail_truncation=base_factor_tail_truncation,
         bound_type=bound_type,
     )
+
+    # For num_steps == 1 the centering shift is log(1) = 0 and the exp/log round-trip
+    # is an identity, so base is already the final result.
+    if num_steps == 1:
+        return base
 
     # Subtract the average loss
     log_num_steps = float(np.log(num_steps))
@@ -199,28 +287,25 @@ def geometric_allocation_PLD_base_remove(
     exp_neg_dual = exp_linear_to_geometric(centered_neg_dual)
     exp_base = exp_linear_to_geometric(centered_base)
 
-    if num_steps == 1:
-        exp_convolved = exp_base
-    else:
-        # V_{t-1} <- self-conv(V1, t-1, ...).
-        exp_convolved_dual = geometric_self_convolve(
-            dist=exp_neg_dual,
-            T=num_steps - 1,
-            tail_truncation=tail_truncation,
-            bound_type=bound_type,
-        )
-        # U_t <- conv(V_{t-1}, U1, ...).
-        exp_convolved = geometric_convolve(
-            dist_1=exp_convolved_dual,
-            dist_2=exp_base,
-            tail_truncation=tail_truncation,
-            bound_type=bound_type,
-        )
+    # V_{t-1} <- self-conv(V1, t-1, ...).
+    exp_convolved_dual = geometric_self_convolve(
+        dist=exp_neg_dual,
+        T=num_steps - 1,
+        tail_truncation=tail_truncation,
+        bound_type=bound_type,
+    )
+    # U_t <- conv(V_{t-1}, U1, ...).
+    exp_convolved = geometric_convolve(
+        dist_1=exp_convolved_dual,
+        dist_2=exp_base,
+        tail_truncation=tail_truncation,
+        bound_type=bound_type,
+    )
     # L_t <- log(U_t).
     return log_geometric_to_linear(exp_convolved)
 
 
-def geometric_allocation_PLD_base_add(
+def geometric_allocation_pld_base_add(
     *,
     base_distributions_creation: Callable[..., DenseDiscreteDist],
     num_steps: int,
@@ -239,11 +324,26 @@ def geometric_allocation_PLD_base_add(
     if num_steps < 1:
         raise ValueError(f"num_steps must be >= 1, got {num_steps}")
 
-    # Loss grid is refined across ~2*ceil(log2(num_steps)) geometric-convolution stages;
-    # split discretization across them and the initial discretization.
-    loss_discretization /= int(2 * np.ceil(np.log2(num_steps)) + 1)
-    # Tail mass is charged at base construction and self-convolution.
-    tail_truncation /= 2
+    # For num_steps > 1 there are active convolution stages beyond base construction.
+    # For num_steps == 1 neither convolution stages nor Phase 2 execute, so no
+    # division is needed for either budget.
+    if num_steps > 1:
+        # Loss: divide by the total stage count so each stage contributes at most
+        # loss_discretization / num_stages rounding error, and all stages together sum to:
+        #   add_loss_stages * (loss_discretization / add_loss_stages) = loss_discretization.
+        # Stages: 1 for base-factor creation + _binary_self_convolution_call_count(num_steps)
+        #         squarings/multiplies in the self-convolution.
+        add_loss_stages = 1 + _binary_self_convolution_call_count(num_steps)
+        loss_discretization /= add_loss_stages
+        # Tail: after dividing by 2, each of the two phases receives tail_truncation:
+        #   Phase 1 (base creation): tail_truncation / num_steps per call; num_steps-fold
+        #            self-convolution amplifies the contribution back to tail_truncation.
+        #   Phase 2 (geometric_self_convolve, num_steps): tail_truncation directly.
+        # Sum: tail_truncation + tail_truncation = 2 * tail_truncation = original ✓
+        tail_truncation /= 2
+    # Each base factor's tail error is amplified by num_steps through self-convolution,
+    # so scale its budget down by num_steps so the amplified contribution stays within the
+    # phase budget.
     base_factor_tail_truncation = tail_truncation / num_steps
 
     base = base_distributions_creation(
@@ -252,33 +352,34 @@ def geometric_allocation_PLD_base_add(
         bound_type=bound_type,
     )
 
+    # For num_steps == 1 the centering shift is log(1) = 0 and the exp/log round-trip
+    # is an identity, so base is already the final result.
+    if num_steps == 1:
+        return base
+
     log_num_steps = float(np.log(num_steps))
 
-    centered_base = DenseDiscreteDist(
-        x_min=base.x_min - log_num_steps,
-        step=base.step,
-        prob_arr=base.prob_arr.copy(),
-        p_min=base.p_min,
-        p_max=base.p_max,
+    neg_base = negate_reverse_linear_distribution(base)
+    centered_neg_base = DenseDiscreteDist(
+        x_min=neg_base.x_min - log_num_steps,
+        step=neg_base.step,
+        prob_arr=neg_base.prob_arr.copy(),
+        p_min=neg_base.p_min,
+        p_max=neg_base.p_max,
     )
 
     # Factor preparation in exp-space.
-    exp_base = exp_linear_to_geometric(centered_base)
+    exp_base = exp_linear_to_geometric(centered_neg_base)
     exp_bound_type = (
         BoundType.IS_DOMINATED if bound_type == BoundType.DOMINATES else BoundType.DOMINATES
     )
-    if num_steps == 1:
-        exp_convolved = exp_base
-    else:
-        # U_t <- self-conv(U, t, lower).
-        # Self-convolution applies tail along a binary tree; halve again for the inner
-        # combine vs outer structure.
-        exp_convolved = geometric_self_convolve(
-            dist=exp_base,
-            T=num_steps,
-            tail_truncation=tail_truncation / 2,
-            bound_type=exp_bound_type,
-        )
+    # U_t <- self-conv(U, t, lower).
+    exp_convolved = geometric_self_convolve(
+        dist=exp_base,
+        T=num_steps,
+        tail_truncation=tail_truncation,
+        bound_type=exp_bound_type,
+    )
     # L_t <- -log(U_t).
     log_dist = log_geometric_to_linear(exp_convolved)
     return negate_reverse_linear_distribution(log_dist)
@@ -289,7 +390,14 @@ def geometric_allocation_PLD_base_add(
 # =============================================================================
 
 
-def _allocation_directional_PLD_core(
+def _binary_self_convolution_call_count(num_convolutions: int) -> int:
+    """Return exact pairwise-convolution calls used by binary self-compose."""
+    if num_convolutions <= 1:
+        return 0
+    return int(np.floor(np.log2(num_convolutions)) + int(num_convolutions).bit_count() - 1)
+
+
+def _allocation_directional_pld_core(
     *,
     compute_base_pld: Callable[..., DenseDiscreteDist],
     num_steps: int,
@@ -301,18 +409,24 @@ def _allocation_directional_PLD_core(
     """Build and finalize one floor/ceil decomposition component.
 
     This function derives component-level budgets, calls
-    ``compute_base_pld(...)``, regrids to linear spacing, composes across
-    epochs, and aligns to output discretization.
+    ``compute_base_pld(...)``, trims tails before and after epoch
+    composition, and returns the resulting linear distribution.
     """
-    # Incoming tail and loss budgets are each split across three phases: base PLD,
-    # optional epoch self-conv, final regrid.
-    output_tail_truncation = tail_truncation / 3
-    # Base tail is split across the base computation and potential rediscretization,
-    # and divided by the number of compositions.
-    base_tail_truncation = output_tail_truncation / (2 * num_epochs)
-    output_loss_discretization = loss_discretization / 3
-    # Per-epoch loss grid tightens like 1/sqrt(epochs) when composing IID epoch blocks.
-    base_loss_discretization = output_loss_discretization / np.sqrt(num_epochs)
+    # Tail: divide by 3; each of the three phases receives tail_truncation (the divided value):
+    #   Phase 1 (base creation, amplified by num_epochs): up to 3 sub-ops per epoch
+    #            (compute_base_pld, truncate_edges, optional rediscretize_dist), each with
+    #            base_tail_truncation = tail_truncation / (3 * num_epochs).  Amplified total:
+    #            num_epochs * 3 * tail_truncation / (3 * num_epochs) = tail_truncation.
+    #   Phase 2 (fft_self_convolve, T=num_epochs): tail_truncation directly
+    #            (skipped if num_epochs=1).
+    #   Phase 3 (final truncate_edges): tail_truncation directly.
+    # Sum: tail_truncation + tail_truncation + tail_truncation = 3 * tail_truncation = original ✓
+    tail_truncation /= 3
+    base_tail_truncation = tail_truncation / (3 * num_epochs)
+    # Loss: FFT self-convolution preserves the grid step, so the output step equals the base
+    # step.  Dividing by num_epochs ensures the output step <= loss_discretization; the extra
+    # factor of 2 absorbs Chernoff window boundary rounding in the fft_self_convolve direct path.
+    base_loss_discretization = loss_discretization / (2 * num_epochs)
 
     base_dist = compute_base_pld(
         num_steps=num_steps,
@@ -320,40 +434,51 @@ def _allocation_directional_PLD_core(
         tail_truncation=base_tail_truncation,
         bound_type=bound_type,
     )
-    rediscritized_dist = rediscritize_dist(
-        dist=base_dist,
+    prepared_base_dist = base_dist.truncate_edges(
         tail_truncation=base_tail_truncation,
-        loss_discretization=base_loss_discretization,
-        spacing_type=SpacingType.LINEAR,
         bound_type=bound_type,
     )
     if not (
-        isinstance(rediscritized_dist, DenseDiscreteDist)
-        and rediscritized_dist.spacing_type == SpacingType.LINEAR
+        isinstance(prepared_base_dist, DenseDiscreteDist)
+        and prepared_base_dist.spacing_type == SpacingType.LINEAR
     ):
-        _st = getattr(rediscritized_dist, "spacing_type", "?")
+        _st = getattr(prepared_base_dist, "spacing_type", "?")
         raise TypeError(
             "Expected DenseDiscreteDist with LINEAR spacing, "
-            f"got {type(rediscritized_dist).__name__} with spacing {_st}"
+            f"got {type(prepared_base_dist).__name__} with spacing {_st}"
         )
 
     if num_epochs == 1:
-        composed_dist = rediscritized_dist
+        composed_dist = prepared_base_dist
     else:
-        composed_dist = FFT_self_convolve(
-            dist=rediscritized_dist,
+        # Cap base distribution so fft_self_convolve(T=num_epochs) stays within
+        # MAX_FFT_BYTES.  For the direct method the FFT size is T * pmf_size;
+        # for the binary method the worst-case FFT size is also T * pmf_size
+        # (before truncation shrinks intermediate steps).
+        max_base_pmf = max(
+            _MIN_BASE_PMF_BINS,
+            MAX_FFT_BYTES // (num_epochs * _DIRECT_COMPOSE_BYTES_PER_BASE_BIN),
+        )
+        if prepared_base_dist.prob_arr.size > max_base_pmf:
+            capped_step = prepared_base_dist.step * math.ceil(
+                prepared_base_dist.prob_arr.size / max_base_pmf
+            )
+            prepared_base_dist = rediscretize_dist(
+                dist=prepared_base_dist,
+                tail_truncation=base_tail_truncation,
+                loss_discretization=capped_step,
+                spacing_type=SpacingType.LINEAR,
+                bound_type=bound_type,
+            )
+        composed_dist = fft_self_convolve(
+            dist=prepared_base_dist,
             T=num_epochs,
-            tail_truncation=output_tail_truncation,
+            tail_truncation=tail_truncation,
             bound_type=bound_type,
             use_direct=True,
         )
-    # Avoid inflating the grid when the target is finer than the original one.
-    effective_disc = max(composed_dist.step, output_loss_discretization)
-    final_dist = rediscritize_dist(
-        dist=composed_dist,
-        tail_truncation=output_tail_truncation,
-        loss_discretization=effective_disc,
-        spacing_type=SpacingType.LINEAR,
+    final_dist = composed_dist.truncate_edges(
+        tail_truncation=tail_truncation,
         bound_type=bound_type,
     )
     if not (
@@ -367,7 +492,7 @@ def _allocation_directional_PLD_core(
     return final_dist
 
 
-def _compose_full_PLD(
+def _compose_full_pld(
     *,
     remove_dist: DenseDiscreteDist | None,
     add_dist: DenseDiscreteDist | None,

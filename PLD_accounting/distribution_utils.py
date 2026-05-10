@@ -11,6 +11,7 @@ from PLD_accounting.types import BoundType
 from PLD_accounting.validation import validate_discrete_pmf_and_boundaries
 
 PMF_MASS_TOL = 10 * np.finfo(float).eps  # total-mass tolerance (10× machine epsilon)
+RENORMALIZATION_THRESHOLD = 10 * np.finfo(float).eps
 SPACING_ATOL = 1e-12
 SPACING_RTOL = 1e-6
 MIN_GRID_SIZE = 100  # Minimum number of points in a  discretization grid.
@@ -58,7 +59,12 @@ def enforce_mass_conservation(
         target_mass = 1.0 - expected_p_max
         current_mass = math.fsum(map(float, extended))
         excess = current_mass - target_mass
-        extended = _zero_mass(values=extended, mass=excess, from_left=True, exact=True)
+        if excess > 0:
+            if excess < RENORMALIZATION_THRESHOLD:
+                # Tiny excess (numerical noise): renormalize instead of trimming bins
+                extended = extended * (target_mass / current_mass)
+            else:
+                extended = _zero_mass(values=extended, mass=excess, from_left=True, exact=True)
         current_mass = math.fsum(map(float, extended))
         return (
             extended[1:].copy(),
@@ -73,7 +79,12 @@ def enforce_mass_conservation(
         target_mass = 1.0 - expected_p_min
         current_mass = math.fsum(map(float, extended))
         excess = current_mass - target_mass
-        extended = _zero_mass(values=extended, mass=excess, from_left=False, exact=True)
+        if excess > 0:
+            if excess < RENORMALIZATION_THRESHOLD:
+                # Tiny excess (numerical noise): renormalize instead of trimming bins
+                extended = extended * (target_mass / current_mass)
+            else:
+                extended = _zero_mass(values=extended, mass=excess, from_left=False, exact=True)
         current_mass = math.fsum(map(float, extended))
         return (
             extended[:-1].copy(),
@@ -216,7 +227,7 @@ def compute_truncation(
       C. Apply step A again to remove any newly created leading/trailing zeros.
 
     Returns:
-        (new_PMF, new_p_min, new_p_max, min_ind, max_ind) where min_ind and
+        (new_prob_arr, new_p_min, new_p_max, min_ind, max_ind) where min_ind and
         max_ind are indices into the original prob_arr.
     """
     # Remove zero probability tails to reduce unnecessary computations
@@ -309,7 +320,7 @@ def _zero_mass(
             f"got mass={mass:.12g}, total={total_mass:.12g}"
         )
 
-    # When removing from the right, we just flip the array before and after the caculation
+    # When removing from the right, we just flip the array before and after the calculation
     if not from_left:
         values = values[::-1]
 
