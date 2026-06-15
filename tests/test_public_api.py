@@ -10,6 +10,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 from dp_accounting.pld import privacy_loss_distribution
+
 from PLD_accounting import (
     AllocationSchemeConfig,
     BoundType,
@@ -130,14 +131,14 @@ class TestPLDRealizationType:
     def test_construction_with_valid_data(self):
         """Accept valid grids on non-negative losses with ``E[exp(-L)] < 1``."""
         prob_arr = np.array([0.3, 0.5, 0.2])
-        r = PLDRealization(x_min=0.1, step=0.1, prob_arr=prob_arr)
+        r = PLDRealization(x_0=0.1, step=0.1, prob_arr=prob_arr)
         assert r.step == 0.1
         np.testing.assert_array_equal(r.prob_arr, prob_arr)
 
     def test_rejects_nonzero_p_min(self):
         """Reject mass at negative infinity while claiming a PLD realization."""
         with pytest.raises(ValueError):
-            PLDRealization(x_min=0.1, step=0.1, prob_arr=np.array([0.5]), p_min=0.5)
+            PLDRealization(x_0=0.1, step=0.1, prob_arr=np.array([0.5]), p_min=0.5)
 
     def test_copy_is_independent(self):
         """``copy()`` must detach the probability array so callers cannot mutate the original."""

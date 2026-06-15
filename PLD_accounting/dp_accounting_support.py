@@ -78,11 +78,11 @@ def linear_dist_to_dp_accounting_pmf(
     # geometric-grid minimums, which land off the linear step grid by up to
     # ~0.5 * step.  Round to the nearest integer index; raise only if the
     # offset exceeds half a step, which would indicate a real bug upstream.
-    base_index = int(np.rint(dist.x_min / dist.step))
-    offset = abs(base_index * dist.step - dist.x_min)
+    base_index = int(np.rint(dist.x_0 / dist.step))
+    offset = abs(base_index * dist.step - dist.x_0)
     if offset > 0.5 * dist.step + SPACING_ATOL:
         raise ValueError(
-            f"x_min={dist.x_min!r} is more than 0.5 steps from the nearest grid point "
+            f"x_0={dist.x_0!r} is more than 0.5 steps from the nearest grid point "
             f"(step={dist.step!r}, offset={offset:.3e})"
         )
     return DensePLDPmf(
@@ -112,7 +112,7 @@ def dp_accounting_pmf_to_pld_realization(pmf: PLDPmf) -> PLDRealization:
         inf_mass=inf_mass,
     )
     return PLDRealization(
-        x_min=x_min,
+        x_0=x_min,
         step=discretization,
         prob_arr=probs_dense,
         p_max=inf_mass,
@@ -389,7 +389,7 @@ def _compose_pmf_binary(
 
     if bt == BoundType.DOMINATES:
         dist = DenseDiscreteDist(
-            x_min=x_min,
+            x_0=x_min,
             step=disc,
             prob_arr=probs,
             p_min=0.0,
@@ -398,7 +398,7 @@ def _compose_pmf_binary(
         )
     else:
         dist = DenseDiscreteDist(
-            x_min=x_min,
+            x_0=x_min,
             step=disc,
             prob_arr=probs,
             p_min=inf_mass,
@@ -478,7 +478,7 @@ def _compose_pmf_binary(
     total = float(np.sum(composed.prob_arr)) + composed.p_min + composed.p_max
     if total > 0 and abs(total - 1.0) > PMF_MASS_TOL:
         composed = DenseDiscreteDist(
-            x_min=composed.x_min,
+            x_0=composed.x_0,
             step=composed.step,
             prob_arr=composed.prob_arr / total,
             p_min=composed.p_min / total,
@@ -487,7 +487,7 @@ def _compose_pmf_binary(
         )
 
     final_step = composed.step
-    lower_loss = int(np.round(composed.x_min / final_step))
+    lower_loss = int(np.round(composed.x_0 / final_step))
     inf_mass_out = composed.p_max if pessimistic else composed.p_min
     return DensePLDPmf(
         discretization=final_step,
@@ -535,7 +535,7 @@ def _coarsen_dist_by_factor(dist: DenseDiscreteDist, factor: int) -> DenseDiscre
     padded_pmf[:n] = dist.prob_arr
     new_prob_arr = padded_pmf.reshape(new_n, factor).sum(axis=1)
     return DenseDiscreteDist(
-        x_min=dist.x_min,
+        x_0=dist.x_0,
         step=dist.step * factor,
         prob_arr=new_prob_arr,
         p_min=dist.p_min,

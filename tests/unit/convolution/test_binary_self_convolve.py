@@ -4,12 +4,12 @@ import math
 
 import numpy as np
 import pytest
+
 from PLD_accounting.discrete_dist import DenseDiscreteDist, Domain
 from PLD_accounting.fft_convolution import fft_convolve, fft_self_convolve
 from PLD_accounting.geometric_convolution import geometric_convolve
 from PLD_accounting.types import BoundType, SpacingType
 from PLD_accounting.utils import binary_self_convolve
-
 from tests.test_tolerances import TestTolerances as TOL
 
 

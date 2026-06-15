@@ -17,7 +17,7 @@ def realization_remove_base_distributions(
 ) -> tuple[DenseDiscreteDist, DenseDiscreteDist]:
     """Prepare remove-direction factors from a loss-space realization.
 
-    Algorithm 1 (`rand-alloc-rem`) in Appendix C.
+    Algorithm 1 (`rand-alloc-rem`).
 
     Args:
         realization: REMOVE-direction realization in linear loss space.
@@ -62,7 +62,7 @@ def realization_remove_base_distributions(
     # Avoid inflating the grid when the target is finer than the original one.
     effective_disc = max(realization.step, loss_discretization)
     lower_realization_input = DenseDiscreteDist(
-        x_min=realization.x_min,
+        x_0=realization.x_0,
         step=realization.step,
         prob_arr=realization.prob_arr.copy(),
         p_min=realization.p_min,
@@ -112,7 +112,7 @@ def realization_add_base_distribution(
 ) -> DenseDiscreteDist:
     """Prepare add-direction factors from a loss-space realization.
 
-    Algorithm 2 (`rand-alloc-add`) in Appendix C.
+    Algorithm 2 (`rand-alloc-add`).
 
     Args:
         realization: ADD-direction realization in linear loss space.

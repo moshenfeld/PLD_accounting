@@ -8,6 +8,8 @@ import math
 
 import numpy as np
 import pytest
+from scipy import stats
+
 from PLD_accounting.discrete_dist import DenseDiscreteDist, Domain, SparseDiscreteDist
 from PLD_accounting.distribution_discretization import (
     _compute_discrete_prob as compute_discrete_PMF,
@@ -29,8 +31,6 @@ from PLD_accounting.distribution_utils import (
 )
 from PLD_accounting.types import BoundType, SpacingType
 from PLD_accounting.utils import _ccdf_from_pmf
-from scipy import stats
-
 from tests.test_tolerances import TestTolerances as TOL
 
 
@@ -313,17 +313,14 @@ class TestPMFRemapToGrid:
         assert np.isclose(total_in, total_out, atol=TOL.MASS_CONSERVATION)
 
 
-class TestCCDFComputation:
-    """Test CCDF computation from SparseDiscreteDist."""
-
-    def test_ccdf_from_pmf_padded(self):
-        """Ccdf from pmf padded."""
-        dist = SparseDiscreteDist(
-            x_array=np.array([0.0, 1.0]), prob_arr=np.array([0.25, 0.5]), p_min=0.0, p_max=0.25
-        )
-        ccdf = _ccdf_from_pmf(dist)
-        assert ccdf.shape == (4,)
-        assert np.allclose(ccdf, np.array([1.0, 0.75, 0.25, 0.0]))
+def test_ccdf_from_pmf_padded():
+    """Ccdf from pmf padded."""
+    dist = SparseDiscreteDist(
+        x_array=np.array([0.0, 1.0]), prob_arr=np.array([0.25, 0.5]), p_min=0.0, p_max=0.25
+    )
+    ccdf = _ccdf_from_pmf(dist)
+    assert ccdf.shape == (4,)
+    assert np.allclose(ccdf, np.array([1.0, 0.75, 0.25, 0.0]))
 
 
 class TestEnforceMassConservation:
@@ -426,7 +423,7 @@ class TestComputeTruncation:
     def test_dense_truncate_edges_updates_x_min_after_zero_edge_removal(self):
         """Dense truncate edges updates x min after zero edge removal."""
         dist = DenseDiscreteDist(
-            x_min=0.0,
+            x_0=0.0,
             step=1.0,
             prob_arr=np.array([0.0, 0.8], dtype=np.float64),
             p_max=0.2,
@@ -454,18 +451,15 @@ class TestComputeTruncation:
         assert np.isclose(result.p_max, 0.1)
 
 
-class TestZeroMass:
-    """Test directional zero-mass helper edge cases."""
-
-    def test_raises_when_mass_is_at_least_total(self):
-        """Raises when mass is at least total."""
-        with pytest.raises(ValueError, match="mass must be smaller than total array mass"):
-            _zero_mass(
-                values=np.array([0.2, 0.8], dtype=np.float64),
-                mass=1.0,
-                from_left=True,
-                exact=True,
-            )
+def test_raises_when_mass_is_at_least_total():
+    """Raises when mass is at least total."""
+    with pytest.raises(ValueError, match="mass must be smaller than total array mass"):
+        _zero_mass(
+            values=np.array([0.2, 0.8], dtype=np.float64),
+            mass=1.0,
+            from_left=True,
+            exact=True,
+        )
 
 
 class TestRediscretizeBoundaryFolding:
@@ -476,7 +470,7 @@ class TestRediscretizeBoundaryFolding:
         # Both bins have mass >> tail_truncation so neither is consumed.
         """Rediscretize near point mass distribution."""
         dist = DenseDiscreteDist(
-            x_min=0.5,
+            x_0=0.5,
             step=0.5,
             prob_arr=np.array([1.0 - 1e-6, 1e-6], dtype=np.float64),
         )

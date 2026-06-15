@@ -10,7 +10,7 @@ from numpy.typing import NDArray
 from scipy import stats
 from scipy.stats._distn_infrastructure import rv_frozen
 
-from PLD_accounting.discrete_dist import DenseDiscreteDist, DiscreteDistBase, Domain
+from PLD_accounting.discrete_dist import DenseDiscreteDist, DiscreteDistBase, Domain, GridSpec
 from PLD_accounting.distribution_utils import enforce_mass_conservation
 from PLD_accounting.types import BoundType, SpacingType
 
@@ -44,26 +44,25 @@ def discretize_continuous_distribution(
         Discretized distribution on a structured dense grid.
     """
 
-    x_array = _discretize_continuous_to_grid(
+    grid = _discretize_continuous_to_grid(
         dist=dist,
         tail_truncation=tail_truncation,
         spacing_type=spacing_type,
         step=step,
         align_to_multiples=align_to_multiples,
     )
-    if x_array[0] <= 0 and domain == Domain.POSITIVES:
+    if grid.x_0 <= 0 and domain == Domain.POSITIVES:
         dist_name = getattr(dist, "name", type(dist).__name__)
         raise ValueError(
-            f"Cannot discretize {dist_name} to a positive range, got x_min={x_array[0]}"
+            f"Cannot discretize {dist_name} to a positive range, got x_0={grid.x_0}"
         )
 
     # 2. Map density to PMF with semantics.
     return discretize_continuous_dist(
         dist=dist,
-        x_array=x_array,
+        grid=grid,
         bound_type=bound_type,
         PMF_min_increment=tail_truncation,
-        spacing_type=spacing_type,
         domain=domain,
     )
 
@@ -71,20 +70,25 @@ def discretize_continuous_distribution(
 def discretize_continuous_dist(
     *,
     dist: stats.rv_continuous | rv_frozen[Any, Any],
-    x_array: NDArray[np.float64],
+    grid: GridSpec,
     bound_type: BoundType,
     PMF_min_increment: float,
-    spacing_type: SpacingType,
     domain: Domain = Domain.REALS,
 ) -> DenseDiscreteDist:
-    """Convert continuous distribution to discrete PMF with bounding semantics."""
+    """Convert continuous distribution to discrete PMF with bounding semantics.
+
+    The grid is described by an exact :class:`GridSpec` rather than a materialized
+    ``x_array``; its ``step`` is carried straight through to the result, so the
+    output spacing is exactly the requested one -- no round-trip through
+    ``compute_bin_width``.
+    """
+    x_array = grid.materialize()
     # Compute raw probabilities for intervals [x_i, x_{i+1}) using PMF_min_increment.
     bin_probs, p_left, p_right = _compute_discrete_prob(
         dist=dist, x_array=x_array, bound_type=bound_type, PMF_min_increment=PMF_min_increment
     )
 
-    n = x_array.size
-    prob_arr = np.zeros(n)
+    prob_arr = np.zeros(grid.n)
 
     if bound_type == BoundType.DOMINATES:
         # Shift mass right: left tail (-inf, x0) -> x0,
@@ -104,18 +108,20 @@ def discretize_continuous_dist(
     else:
         raise ValueError(f"Unknown BoundType: {bound_type}")
 
-    if spacing_type == SpacingType.LINEAR:
-        return DenseDiscreteDist.from_x_array(
-            x_array=x_array,
+    if grid.spacing_type == SpacingType.LINEAR:
+        return DenseDiscreteDist(
+            x_0=grid.x_0,
+            step=grid.step,
             prob_arr=prob_arr,
             p_min=p_min,
             p_max=p_max,
             domain=domain,
         )
 
-    if spacing_type == SpacingType.GEOMETRIC:
-        return DenseDiscreteDist.from_x_array(
-            x_array=x_array,
+    if grid.spacing_type == SpacingType.GEOMETRIC:
+        return DenseDiscreteDist(
+            x_0=grid.x_0,
+            step=grid.step,
             prob_arr=prob_arr,
             p_min=p_min,
             p_max=p_max,
@@ -123,7 +129,7 @@ def discretize_continuous_dist(
             domain=Domain.POSITIVES,
         )
 
-    raise ValueError(f"Invalid spacing_type: {spacing_type}")
+    raise ValueError(f"Invalid spacing_type: {grid.spacing_type}")
 
 
 def rediscretize_dist(
@@ -140,10 +146,52 @@ def rediscretize_dist(
     Implementation trims zero/tail regions, computes new grid size, then remaps
     using domination-aware rounding (e.g., linear grids for dp_accounting output).
 
-    Algorithm 6 (`disc-dist`) in Appendix C.
+    Algorithm 6 (`disc-dist`).
     """
 
-    # Support for rediscritizing a dominating distribution into a dominated one and vice versa
+    working_dist = fold_absorbable_boundary_atom(
+        dist=dist,
+        spacing_type=spacing_type,
+        bound_type=bound_type,
+    )
+
+    # Quantile-truncation
+    trunc_dist = working_dist.truncate_edges(
+        tail_truncation=tail_truncation / 2, bound_type=bound_type
+    )
+
+    x_array = trunc_dist.x_array
+    grid_out = aligned_grid_params(
+        x_min=x_array[0],
+        x_max=x_array[-1],
+        spacing_type=spacing_type,
+        align_to_multiples=True,
+        discretization=loss_discretization,
+    )
+
+    return project_dist_onto_grid(
+        dist=trunc_dist,
+        grid=grid_out,
+        expected_p_min=working_dist.p_min,
+        expected_p_max=working_dist.p_max,
+        bound_type=bound_type,
+    )
+
+
+def fold_absorbable_boundary_atom(
+    *,
+    dist: DiscreteDistBase,
+    spacing_type: SpacingType,
+    bound_type: BoundType,
+) -> DiscreteDistBase:
+    """Fold the boundary atom that domination-aware rounding can absorb.
+
+    Supports rediscretizing a dominating distribution into a dominated one and
+    vice versa: IS_DOMINATED rounds mass down, so the ``+inf`` atom folds into
+    the top bin; DOMINATES rounds mass up, so the ``-inf`` atom folds into the
+    bottom bin (linear output only -- geometric output keeps ``p_min`` as the
+    mass at 0).  Returns a copy; the input is unchanged.
+    """
     working_dist = dist.copy()
     if bound_type == BoundType.IS_DOMINATED and working_dist.p_max > 0.0:
         working_dist.prob_arr[-1] += working_dist.p_max
@@ -155,49 +203,52 @@ def rediscretize_dist(
     ):
         working_dist.prob_arr[0] += working_dist.p_min
         working_dist.p_min = 0.0
+    return working_dist
 
-    # Quantile-truncation
-    trunc_dist = working_dist.truncate_edges(
-        tail_truncation=tail_truncation / 2, bound_type=bound_type
-    )
 
-    x_array = trunc_dist.x_array
-    x_min = x_array[0]
-    x_max = x_array[-1]
+def project_dist_onto_grid(
+    *,
+    dist: DiscreteDistBase,
+    grid: GridSpec,
+    expected_p_min: float,
+    expected_p_max: float,
+    bound_type: BoundType,
+) -> DenseDiscreteDist:
+    """Project a distribution onto ``grid`` with domination-aware rounding.
 
-    x_array_out = discretize_aligned_range(
-        x_min=x_min,
-        x_max=x_max,
-        spacing_type=spacing_type,
-        align_to_multiples=True,
-        discretization=loss_discretization,
-    )
-
+    Remaps the PMF onto the target grid (DOMINATES rounds up, IS_DOMINATED rounds
+    down) and re-enforces mass conservation against the expected boundary atoms.
+    ``grid.step`` is carried through to the result unchanged, so the output spacing
+    is exactly the requested one.
+    """
+    x_array_out = grid.materialize()
     prob_arr_out = rediscretize_prob(
-        x_array=x_array,
-        prob_arr=trunc_dist.prob_arr,
+        x_array=dist.x_array,
+        prob_arr=dist.prob_arr,
         x_array_out=x_array_out,
         dominates=(bound_type == BoundType.DOMINATES),
     )
 
     prob_arr_out, p_min, p_max = enforce_mass_conservation(
         prob_arr=prob_arr_out,
-        expected_p_min=working_dist.p_min,
-        expected_p_max=working_dist.p_max,
+        expected_p_min=expected_p_min,
+        expected_p_max=expected_p_max,
         bound_type=bound_type,
     )
 
-    if spacing_type == SpacingType.LINEAR:
-        return DenseDiscreteDist.from_x_array(
-            x_array=x_array_out,
+    if grid.spacing_type == SpacingType.LINEAR:
+        return DenseDiscreteDist(
+            x_0=grid.x_0,
+            step=grid.step,
             prob_arr=prob_arr_out,
             p_min=p_min,
             p_max=p_max,
         )
 
-    if spacing_type == SpacingType.GEOMETRIC:
-        return DenseDiscreteDist.from_x_array(
-            x_array=x_array_out,
+    if grid.spacing_type == SpacingType.GEOMETRIC:
+        return DenseDiscreteDist(
+            x_0=grid.x_0,
+            step=grid.step,
             prob_arr=prob_arr_out,
             p_min=p_min,
             p_max=p_max,
@@ -205,7 +256,51 @@ def rediscretize_dist(
             domain=Domain.POSITIVES,
         )
 
-    raise ValueError(f"Invalid spacing_type: {spacing_type}")
+    raise ValueError(f"Invalid spacing_type: {grid.spacing_type}")
+
+
+def aligned_grid_params(
+    *,
+    x_min: float,
+    x_max: float,
+    spacing_type: SpacingType,
+    align_to_multiples: bool,
+    discretization: float,
+) -> GridSpec:
+    """Return a :class:`GridSpec` covering [x_min, x_max].
+
+    The returned spec is the single source of truth for a uniform grid and is
+    meant to be passed straight to grid consumers (e.g. ``discretize_continuous_dist``,
+    ``project_dist_onto_grid``), avoiding any re-derivation of the spacing from a
+    materialized array.
+
+    Args:
+        x_min: Minimum value of the range.
+        x_max: Maximum value of the range.
+        spacing_type: Type of spacing (LINEAR or GEOMETRIC).
+        align_to_multiples: If True, align range to whole multiples of discretization.
+                           If False, use x_min and x_max directly without alignment.
+        discretization: Grid spacing parameter (step size for LINEAR, log ratio for GEOMETRIC).
+
+    Returns:
+        A ``GridSpec`` whose ``step`` is the additive bin width (LINEAR) or
+        multiplicative ratio (GEOMETRIC).
+    """
+    if spacing_type not in (SpacingType.GEOMETRIC, SpacingType.LINEAR):
+        raise ValueError(f"Unsupported spacing_type: {spacing_type}")
+    if x_max <= x_min:
+        raise ValueError(f"x_max must be greater than x_min, got x_min={x_min}, x_max={x_max}")
+    if spacing_type == SpacingType.GEOMETRIC and x_min <= 0:
+        raise ValueError(
+            f"Geometric spacing requires positive values, got x_min={x_min}, x_max={x_max}"
+        )
+    if discretization <= 0:
+        raise ValueError("discretization must be positive")
+
+    d = float(discretization)
+    if spacing_type == SpacingType.LINEAR:
+        return _linear_grid_params(x_min, x_max, d, align_to_multiples)
+    return _geometric_grid_params(x_min, x_max, d, align_to_multiples)
 
 
 def discretize_aligned_range(
@@ -216,66 +311,20 @@ def discretize_aligned_range(
     align_to_multiples: bool,
     discretization: float,
 ) -> NDArray[np.float64]:
-    """Return a grid covering [x_min, x_max].
+    """Return a materialized grid covering [x_min, x_max].
 
-    Args:
-        x_min: Minimum value of the range.
-        x_max: Maximum value of the range.
-        spacing_type: Type of spacing (LINEAR or GEOMETRIC).
-        align_to_multiples: If True, align range to whole multiples of discretization.
-                           If False, use x_min and x_max directly without alignment.
-        discretization: Grid spacing parameter (step size for LINEAR, log ratio for GEOMETRIC).
-
+    Thin wrapper over :func:`aligned_grid_params` that materializes the grid into
+    an array, for callers that genuinely need the points. Callers that build a
+    discrete distribution should prefer ``aligned_grid_params`` and thread the
+    ``GridSpec`` through unchanged.
     """
-    # Validate inputs
-    if spacing_type not in (SpacingType.GEOMETRIC, SpacingType.LINEAR):
-        raise ValueError(f"Unsupported spacing_type: {spacing_type}")
-    if x_max <= x_min:
-        raise ValueError(f"x_max must be greater than x_min, got x_min={x_min}, x_max={x_max}")
-    if spacing_type == SpacingType.GEOMETRIC and x_min <= 0:
-        raise ValueError(
-            f"Geometric spacing requires positive values, got x_min={x_min}, x_max={x_max}"
-        )
-
-    if discretization <= 0:
-        raise ValueError("discretization must be positive")
-
-    d = float(discretization)
-
-    if spacing_type == SpacingType.LINEAR:
-        if align_to_multiples:
-            k_lo = int(np.floor(x_min / d))
-            k_hi = int(np.ceil(x_max / d))
-            # It is possible that `ceil(x/d)*d < x` in float64 due to floating numerics
-            if d * k_lo > x_min:
-                k_lo -= 1
-            if d * k_hi < x_max:
-                k_hi += 1
-            return d * np.arange(k_lo, k_hi + 1, dtype=np.float64)
-        span = x_max - x_min
-        n = int(np.ceil(span / d)) + 1
-        x = x_min + d * np.arange(n, dtype=np.float64)
-        if x[-1] < x_max:
-            n += 1
-            x = x_min + d * np.arange(n, dtype=np.float64)
-        return x
-
-    # GEOMETRIC: discretization is log-ratio per step; grid x = exp(d * k).
-    if align_to_multiples:
-        k_lo = int(np.floor(np.log(x_min) / d))
-        k_hi = int(np.ceil(np.log(x_max) / d))
-        # It is possible that `ceil(x/d)*d < x` in float64 due to floating numerics
-        if np.exp(d * k_lo) > x_min:
-            k_lo -= 1
-        if np.exp(d * k_hi) < x_max:
-            k_hi += 1
-        return np.exp(d * np.arange(k_lo, k_hi + 1, dtype=np.float64))
-    n = int(np.ceil(np.log(x_max / x_min) / d)) + 1
-    x = x_min * np.exp(d * np.arange(n, dtype=np.float64))
-    if x[-1] < x_max:
-        n += 1
-        x = x_min * np.exp(d * np.arange(n, dtype=np.float64))
-    return x
+    return aligned_grid_params(
+        x_min=x_min,
+        x_max=x_max,
+        spacing_type=spacing_type,
+        align_to_multiples=align_to_multiples,
+        discretization=discretization,
+    ).materialize()
 
 
 @njit(cache=True)
@@ -351,6 +400,52 @@ def rediscretize_prob(
 # =============================================================================
 # Helper Functions
 # =============================================================================
+
+
+def _cover_x_max(grid: GridSpec, x_max: float) -> GridSpec:
+    """Grow ``n`` until the materialized endpoint covers ``x_max`` after float rounding."""
+    while grid.last_point() < x_max:
+        grid.n += 1
+    return grid
+
+
+def _linear_grid_params(x_min: float, x_max: float, d: float, align_to_multiples: bool) -> GridSpec:
+    """Return a ``GridSpec`` for a uniformly-spaced linear grid covering [x_min, x_max]."""
+    if align_to_multiples:
+        k_lo = int(np.floor(x_min / d))
+        k_hi = int(np.ceil(x_max / d))
+        # It is possible that `ceil(x/d)*d < x` in float64 due to floating numerics
+        if d * k_lo > x_min:
+            k_lo -= 1
+        if d * k_hi < x_max:
+            k_hi += 1
+        x0 = d * k_lo
+        n = k_hi - k_lo + 1
+    else:
+        x0 = x_min
+        n = int(np.ceil((x_max - x_min) / d)) + 1
+    return _cover_x_max(GridSpec(x_0=x0, step=d, n=n, spacing_type=SpacingType.LINEAR), x_max)
+
+
+def _geometric_grid_params(
+    x_min: float, x_max: float, d: float, align_to_multiples: bool
+) -> GridSpec:
+    """Return a ``GridSpec`` for a geometric grid covering [x_min, x_max]; d is the log-ratio per step."""
+    step = float(np.exp(d))
+    if align_to_multiples:
+        k_lo = int(np.floor(np.log(x_min) / d))
+        k_hi = int(np.ceil(np.log(x_max) / d))
+        # It is possible that `ceil(x/d)*d < x` in float64 due to floating numerics
+        if np.exp(d * k_lo) > x_min:
+            k_lo -= 1
+        if np.exp(d * k_hi) < x_max:
+            k_hi += 1
+        x0 = float(np.exp(d * k_lo))
+        n = k_hi - k_lo + 1
+    else:
+        x0 = x_min
+        n = int(np.ceil(np.log(x_max / x_min) / d)) + 1
+    return _cover_x_max(GridSpec(x_0=x0, step=step, n=n, spacing_type=SpacingType.GEOMETRIC), x_max)
 
 
 @njit(cache=True)
@@ -489,8 +584,8 @@ def _discretize_continuous_to_grid(
     spacing_type: SpacingType,
     step: float,
     align_to_multiples: bool,
-) -> NDArray[np.float64]:
-    """Generate grid covering the quantile range defined by tail_truncation."""
+) -> GridSpec:
+    """Return a ``GridSpec`` covering the quantile range defined by tail_truncation."""
     # Determine support bounds via quantiles
     x_min = float(dist.ppf(tail_truncation))
     x_max = float(dist.isf(tail_truncation))
@@ -506,11 +601,10 @@ def _discretize_continuous_to_grid(
             raise ValueError(f"Linear step must be positive, got {step}")
         discretization = float(step)
 
-    x_array = discretize_aligned_range(
+    return aligned_grid_params(
         x_min=x_min,
         x_max=x_max,
         spacing_type=spacing_type,
         align_to_multiples=align_to_multiples,
         discretization=discretization,
     )
-    return x_array

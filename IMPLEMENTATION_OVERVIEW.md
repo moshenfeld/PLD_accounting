@@ -73,24 +73,31 @@ Boundary semantics depend on `Domain`:
 
 ## Parameter Budget Conventions
 
-Shared composition budgets are derived inside
-`_allocation_directional_pld_core()` in `PLD_accounting/random_allocation_accounting.py`.
+Shared composition budgets are derived inline in `allocation_directional_pld()`
+and `_allocation_directional_pld_core()` in
+`PLD_accounting/random_allocation_accounting.py`.
 
-- `output_tail_truncation = component_tail_truncation / 3`
-- `base_tail_truncation = output_tail_truncation / (2 * component_num_epochs)`
-- `output_loss_discretization = config.loss_discretization / 3`
-- `base_loss_discretization = output_loss_discretization / component_num_epochs`
-
-Interpretation used in code:
-
-- `allocation_directional_pld()` keeps the full top-level tail budget when only one
-  component is present (divisible case), and splits evenly only when both
-  floor and ceil components are present.
-- `/3` is used in each component core because truncation is handled across
-  multiple stages (base creation, composition, output alignment).
-- `1 / (2 * num_epochs)` is used for base tail truncation in each component.
-- `1 / num_epochs` is used for core loss discretization so the post-compose
-  discretization target is preserved under linear-in-epochs error growth.
+- `allocation_directional_pld()` divides the tail budget by the number of active
+  tail-consuming ops, `2 * component_count - 1`: one component core call per
+  floor/ceil component plus the final `fft_convolve` when both are active.
+  When both components are active, the loss budget is split between them
+  proportional to each component's effective discretization count
+  (`num_epochs * base_loss_discretization_count(num_steps)`), so both components
+  land on exactly the same output step while their budgets still sum to
+  `loss_discretization`.
+- `_allocation_directional_pld_core()` divides the component tail budget by 3
+  (base creation, epoch composition, final truncation) when `num_epochs > 1`,
+  or by 2 when the FFT phase is skipped (`num_epochs == 1`).
+  `base_tail_truncation = tail_truncation / (3 * num_epochs)` covers up to 3
+  tail-consuming sub-ops per epoch; `base_loss_discretization =
+  loss_discretization / num_epochs` absorbs linear-in-epochs quantization
+  growth (no division when `num_epochs == 1`).
+- GEOM base builds (`geometric_allocation_pld_base_add/remove()`) divide their
+  loss budget by the exact discretizing stage count
+  (`add/remove_geometric_loss_discretization_count(num_steps)`) and their tail
+  budget by the phase count (2 for ADD, 3 for REMOVE), with each one-step
+  factor receiving a further `1 / num_steps` to absorb self-convolution
+  amplification.
 
 Gaussian FFT path needs additional one-step parameters for discretizing analytic
 continuous factors. These are derived in
@@ -173,10 +180,6 @@ This is the shared composition core used by both Gaussian and realization accoun
 
 Key functions:
 
-- `allocation_full_pld(...)`:
-  Shared top-level orchestrator used by both API paths. Calls
-  `allocation_directional_pld(...)` for REMOVE and ADD, then combines with
-  `_compose_full_pld(...)`.
 - `_allocation_directional_pld_core(...)`:
   Calls a base-PLD callback, regrids to core resolution, composes across
   epochs, then regrids to output discretization.
@@ -188,7 +191,7 @@ Key functions:
   the add loss factor.
 - `allocation_directional_pld(...)`:
   Applies adaptive step decomposition and composes floor/ceil components.
-- `_compose_full_pld(...)`:
+- `compose_full_pld(...)`:
   Converts internal directional PLDs into a `dp_accounting` PLD object.
 
 ### `random_allocation_realization.py`
@@ -209,12 +212,17 @@ Gaussian-specific path that constructs factors analytically, then reuses shared 
 
 Key functions:
 
-- `gaussian_allocation_pld_core(...)`: selects FFT/GEOM/BEST computation and
-  returns the base directional PLD used by `_allocation_directional_pld_core(...)`:
-  - FFT callback uses `_gaussian_allocation_fft(...)` with compact ADD/REMOVE internals.
-  - GEOM callback uses shared add/remove geometric cores with Gaussian factor
-    builders, matching realization route structure.
-  - BEST callback combines FFT and GEOM PMFs.
+- `gaussian_allocation_directional_pld(...)`: resolves the convolution route
+  once for one direction and runs the full directional pipeline via
+  `allocation_directional_pld(...)`:
+  - FFT route uses `_gaussian_allocation_fft(...)` with compact ADD/REMOVE
+    internals, paired with the constant loss-discretization count 1.
+  - GEOM route uses shared add/remove geometric cores with Gaussian factor
+    builders (matching realization route structure), paired with the
+    geometric discretization counts.
+  - BEST_OF_TWO recursively runs the directional pipeline once per pure route
+    and combines same-direction results at the very end via
+    `combine_best_of_two_plds(...)` (in `utils.py`).
 - Internal builders:
   - `_gaussian_allocation_fft_remove(...)`
   - `_gaussian_remove_geom_loss_factors(...)`
@@ -241,7 +249,7 @@ The module tracks best upper/lower bounds across iterations and returns `Adaptiv
 - `subsample_pld(pld, sampling_probability)`
 - `subsample_pld_realization(base_pld, sampling_prob, direction)`
 
-This module implements PLD-based subsampling amplification (Appendix C mapping) and uses DOMINATES semantics.
+This module implements PLD-based subsampling amplification (the paper's "Full Implementation Details" appendix, Algorithms 8-10 mapping) and uses DOMINATES semantics.
 
 ## Numerical Invariants
 

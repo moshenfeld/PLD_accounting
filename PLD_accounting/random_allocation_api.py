@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from functools import partial
 
 from dp_accounting.pld import privacy_loss_distribution
@@ -9,13 +10,18 @@ from dp_accounting.pld import privacy_loss_distribution
 from PLD_accounting.adaptive_random_allocation import (
     optimize_allocation_epsilon_range,
 )
-from PLD_accounting.discrete_dist import PLDRealization
+from PLD_accounting.discrete_dist import DenseDiscreteDist, PLDRealization
 from PLD_accounting.random_allocation_accounting import (
-    allocation_full_pld,
+    add_geometric_loss_discretization_count,
+    allocation_directional_pld,
+    compose_full_pld,
     geometric_allocation_pld_base_add,
     geometric_allocation_pld_base_remove,
+    remove_geometric_loss_discretization_count,
 )
-from PLD_accounting.random_allocation_gaussian import gaussian_allocation_pld_core
+from PLD_accounting.random_allocation_gaussian import (
+    gaussian_allocation_pld_core_and_count,
+)
 from PLD_accounting.random_allocation_realization import (
     realization_add_base_distribution,
     realization_remove_base_distributions,
@@ -27,6 +33,7 @@ from PLD_accounting.types import (
     Direction,
     PrivacyParams,
 )
+from PLD_accounting.utils import combine_best_of_two_plds
 from PLD_accounting.validation import (
     validate_allocation_params,
     validate_allocation_scheme_config,
@@ -139,6 +146,55 @@ def gaussian_allocation_delta_configurable(
     return float(full_pld.get_delta_for_epsilon(params.epsilon))
 
 
+def gaussian_allocation_directional_pld(
+    params: PrivacyParams,
+    config: AllocationSchemeConfig,
+    direction: Direction,
+    bound_type: BoundType = BoundType.DOMINATES,
+) -> DenseDiscreteDist:
+    """Compute one directional PLD for Gaussian random-allocation."""
+    validate_privacy_params(params)
+    validate_allocation_scheme_config(config)
+    validate_bound_type(bound_type)
+    if direction not in (Direction.ADD, Direction.REMOVE):
+        raise ValueError(f"Invalid direction: {direction}")
+
+    if config.convolution_method == ConvolutionMethod.BEST_OF_TWO:
+        geom_dist = gaussian_allocation_directional_pld(
+            params=params,
+            config=replace(config, convolution_method=ConvolutionMethod.GEOM),
+            direction=direction,
+            bound_type=bound_type,
+        )
+        fft_dist = gaussian_allocation_directional_pld(
+            params=params,
+            config=replace(config, convolution_method=ConvolutionMethod.FFT),
+            direction=direction,
+            bound_type=bound_type,
+        )
+        return combine_best_of_two_plds(
+            dist_1=geom_dist,
+            dist_2=fft_dist,
+            bound_type=bound_type,
+        )
+
+    compute_base_pld, loss_discretization_count = gaussian_allocation_pld_core_and_count(
+        direction=direction,
+        sigma=params.sigma,
+        config=config,
+    )
+    return allocation_directional_pld(
+        compute_base_pld=compute_base_pld,
+        base_loss_discretization_count=loss_discretization_count,
+        num_steps=params.num_steps,
+        num_selected=params.num_selected,
+        num_epochs=params.num_epochs,
+        loss_discretization=config.loss_discretization,
+        tail_truncation=config.tail_truncation,
+        bound_type=bound_type,
+    )
+
+
 def gaussian_allocation_pld(
     params: PrivacyParams,
     config: AllocationSchemeConfig,
@@ -156,31 +212,21 @@ def gaussian_allocation_pld(
         A ``dp_accounting`` ``PrivacyLossDistribution`` for both privacy directions.
 
     """
-    # Input validation
-    validate_privacy_params(params)
-    validate_allocation_scheme_config(config)
-    validate_bound_type(bound_type)
-
-    compute_base_pld_remove = partial(
-        gaussian_allocation_pld_core,
+    remove_dist = gaussian_allocation_directional_pld(
+        params=params,
+        config=config,
         direction=Direction.REMOVE,
-        sigma=params.sigma,
-        config=config,
+        bound_type=bound_type,
     )
-    compute_base_pld_add = partial(
-        gaussian_allocation_pld_core,
+    add_dist = gaussian_allocation_directional_pld(
+        params=params,
+        config=config,
         direction=Direction.ADD,
-        sigma=params.sigma,
-        config=config,
+        bound_type=bound_type,
     )
-    return allocation_full_pld(
-        compute_base_pld_remove=compute_base_pld_remove,
-        compute_base_pld_add=compute_base_pld_add,
-        num_steps=params.num_steps,
-        num_selected=params.num_selected,
-        num_epochs=params.num_epochs,
-        loss_discretization=config.loss_discretization,
-        tail_truncation=config.tail_truncation,
+    return compose_full_pld(
+        remove_dist=remove_dist,
+        add_dist=add_dist,
         bound_type=bound_type,
     )
 
@@ -348,6 +394,17 @@ def general_allocation_pld(
             realization=remove_realization,
         ),
     )
+    remove_dist = allocation_directional_pld(
+        compute_base_pld=compute_base_pld_remove,
+        base_loss_discretization_count=remove_geometric_loss_discretization_count,
+        num_steps=num_steps,
+        num_selected=num_selected,
+        num_epochs=num_epochs,
+        loss_discretization=config.loss_discretization,
+        tail_truncation=config.tail_truncation,
+        bound_type=bound_type,
+    )
+
     compute_base_pld_add = partial(
         geometric_allocation_pld_base_add,
         base_distributions_creation=partial(
@@ -355,13 +412,18 @@ def general_allocation_pld(
             realization=add_realization,
         ),
     )
-    return allocation_full_pld(
-        compute_base_pld_remove=compute_base_pld_remove,
-        compute_base_pld_add=compute_base_pld_add,
+    add_dist = allocation_directional_pld(
+        compute_base_pld=compute_base_pld_add,
+        base_loss_discretization_count=add_geometric_loss_discretization_count,
         num_steps=num_steps,
         num_selected=num_selected,
         num_epochs=num_epochs,
         loss_discretization=config.loss_discretization,
         tail_truncation=config.tail_truncation,
+        bound_type=bound_type,
+    )
+    return compose_full_pld(
+        remove_dist=remove_dist,
+        add_dist=add_dist,
         bound_type=bound_type,
     )

@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 from dp_accounting.pld import privacy_loss_distribution as dp_pld
+
 from PLD_accounting.discrete_dist import PLDRealization
 from PLD_accounting.dp_accounting_support import linear_dist_to_dp_accounting_pmf
 from PLD_accounting.subsample_pld import subsample_pld
@@ -11,7 +12,7 @@ from PLD_accounting.subsample_pld import subsample_pld
 def _make_pld_remove_only() -> dp_pld.PrivacyLossDistribution:
     """Build a PLD with only the REMOVE direction."""
     dist = PLDRealization(
-        x_min=0.0,
+        x_0=0.0,
         step=0.5,
         prob_arr=np.array([0.4, 0.3, 0.2, 0.1], dtype=np.float64),
     )
@@ -22,12 +23,12 @@ def _make_pld_remove_only() -> dp_pld.PrivacyLossDistribution:
 def _make_pld_both_directions() -> dp_pld.PrivacyLossDistribution:
     """Build a PLD with both REMOVE and ADD directions."""
     remove_dist = PLDRealization(
-        x_min=0.0,
+        x_0=0.0,
         step=0.5,
         prob_arr=np.array([0.4, 0.3, 0.2, 0.1], dtype=np.float64),
     )
     add_dist = PLDRealization(
-        x_min=0.0,
+        x_0=0.0,
         step=0.25,
         prob_arr=np.array([0.24, 0.2, 0.18, 0.16, 0.14], dtype=np.float64),
         p_max=0.08,

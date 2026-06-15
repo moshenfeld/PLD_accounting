@@ -4,6 +4,7 @@ import math
 
 import numpy as np
 import pytest
+
 from PLD_accounting.discrete_dist import PLDRealization, SparseDiscreteDist
 from PLD_accounting.subsample_pld import (
     _calc_subsampled_grid,
@@ -15,7 +16,7 @@ from PLD_accounting.types import Direction
 
 def _simple_remove_dist() -> PLDRealization:
     return PLDRealization(
-        x_min=0.0,
+        x_0=0.0,
         step=0.5,
         prob_arr=np.array([0.4, 0.3, 0.2, 0.1], dtype=np.float64),
     )
@@ -89,7 +90,7 @@ def test_subsample_pld_realization_returns_valid_pld_realization_remove():
 def test_subsample_pld_realization_returns_valid_pld_realization_add():
     """Subsample pld realization returns valid pld realization add."""
     dist = PLDRealization(
-        x_min=0.0,
+        x_0=0.0,
         step=0.25,
         prob_arr=np.array([0.24, 0.2, 0.18, 0.16, 0.14], dtype=np.float64),
         p_max=0.08,
@@ -109,7 +110,7 @@ def test_subsample_pld_realization_add_places_positive_infinity_mass_at_max_add_
     """Subsample pld realization add places positive infinity mass at max add loss."""
     q = 0.3708686650516492
     dist = PLDRealization(
-        x_min=-6.305102226697834,
+        x_0=-6.305102226697834,
         step=0.02532892132180583,
         prob_arr=np.full(44, 0.0018884873605871 / 44.0, dtype=np.float64),
         p_max=0.998111512639413,

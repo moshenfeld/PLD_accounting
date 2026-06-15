@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 from dp_accounting.pld import privacy_loss_distribution as dp_pld
 from dp_accounting.pld.pld_pmf import DensePLDPmf
+
 from PLD_accounting.discrete_dist import (
     REALIZATION_MOMENT_TOL,
     DenseDiscreteDist,
@@ -24,13 +25,12 @@ from PLD_accounting.random_allocation_realization import (
 )
 from PLD_accounting.types import BoundType, SpacingType
 from PLD_accounting.utils import calc_pld_dual, negate_reverse_linear_distribution
-
 from tests.test_tolerances import TestTolerances as TOL
 
 
 def _make_realization() -> PLDRealization:
     return PLDRealization(
-        x_min=-0.5,
+        x_0=-0.5,
         step=0.5,
         prob_arr=np.array([0.2, 0.3, 0.25, 0.15], dtype=np.float64),
         p_max=0.1,
@@ -52,7 +52,7 @@ def test_dp_accounting_roundtrip_preserves_mass_and_grid_shape():
 def test_linear_dist_to_dp_accounting_handles_zero_finite_mass():
     """Test that distributions with all mass at infinity are handled correctly."""
     realization = DenseDiscreteDist(
-        x_min=0.0,
+        x_0=0.0,
         step=1.0,
         prob_arr=np.array([0.0, 0.0], dtype=np.float64),
         p_max=1.0,
@@ -94,7 +94,7 @@ def test_exp_moment_handles_very_negative_losses_with_tiny_mass():
     """Tiny mass at very negative loss should be handled without clipping artifacts."""
     tiny_prob = np.exp(-(MAX_SAFE_EXP_ARG + 21.0))
     realization = PLDRealization(
-        x_min=-(MAX_SAFE_EXP_ARG + 20.0),
+        x_0=-(MAX_SAFE_EXP_ARG + 20.0),
         step=MAX_SAFE_EXP_ARG + 21.0,
         prob_arr=np.array([tiny_prob, 1.0 - tiny_prob], dtype=np.float64),
     )
@@ -236,7 +236,7 @@ def test_realization_remove_base_distributions_is_dominated_clamps_when_refining
     exact_neg_dual = negate_reverse_linear_distribution(calc_pld_dual(remove_realization))
     expected_base = rediscretize_dist(
         dist=DenseDiscreteDist(
-            x_min=remove_realization.x_min,
+            x_0=remove_realization.x_0,
             step=remove_realization.step,
             prob_arr=remove_realization.prob_arr.copy(),
             p_min=remove_realization.p_min,
@@ -271,7 +271,7 @@ class TestRealizationAdapter:
     def test_dense_linear_to_dense_pmf(self):
         """Test that PLDRealization converts to DensePLDPmf."""
         realization = PLDRealization(
-            x_min=0.0,
+            x_0=0.0,
             step=0.5,
             prob_arr=np.array([0.2, 0.3, 0.4, 0.1]),
         )
@@ -284,7 +284,7 @@ class TestRealizationAdapter:
     def test_dense_linear_with_nonzero_base(self):
         """Test PLDRealization with non-zero x_min."""
         realization = PLDRealization(
-            x_min=1.0,
+            x_0=1.0,
             step=0.5,
             prob_arr=np.array([0.3, 0.4, 0.3]),
         )
@@ -297,7 +297,7 @@ class TestRealizationAdapter:
     def test_dense_linear_with_infinity_mass(self):
         """Test PLDRealization with p_max."""
         realization = PLDRealization(
-            x_min=0.0,
+            x_0=0.0,
             step=0.25,
             prob_arr=np.array([0.2, 0.5, 0.2]),
             p_max=0.1,
@@ -310,7 +310,7 @@ class TestRealizationAdapter:
     def test_dense_linear_roundtrip(self):
         """Test PLDRealization -> PMF -> PLDRealization roundtrip."""
         realization = PLDRealization(
-            x_min=0.5,
+            x_0=0.5,
             step=0.25,
             prob_arr=np.array([0.2, 0.3, 0.4, 0.1]),
         )

@@ -2,6 +2,7 @@
 
 import numpy as np
 import pytest
+
 from PLD_accounting.discrete_dist import DenseDiscreteDist, PLDRealization
 from PLD_accounting.fft_convolution import fft_convolve
 from PLD_accounting.mechanisms import gaussian_distribution, laplace_distribution

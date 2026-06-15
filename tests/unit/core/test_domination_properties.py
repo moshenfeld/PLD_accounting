@@ -8,6 +8,8 @@ import math
 
 import numpy as np
 import pytest
+from scipy import stats
+
 from PLD_accounting.discrete_dist import DenseDiscreteDist, Domain, SparseDiscreteDist
 from PLD_accounting.distribution_discretization import (
     discretize_continuous_distribution,
@@ -24,8 +26,6 @@ from PLD_accounting.subsample_pld import (
     _subsample_dist_mix,
 )
 from PLD_accounting.types import BoundType, Direction, SpacingType
-from scipy import stats
-
 from tests.test_tolerances import TestTolerances as TOL
 
 

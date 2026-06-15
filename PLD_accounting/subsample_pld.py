@@ -91,7 +91,8 @@ def subsample_pld_realization(
 ) -> PLDRealization:
     """Apply subsampling amplification to a PLD realization using the PLD-dual method.
 
-    Algorithms 8 and 9 (`PLD-subsam-remove/add`) in Appendix C.
+    Algorithms 8 and 9 (`PLD-subsam-remove/add`), using Algorithm 10
+    (`subsam-core`) for the shared transform.
 
     Args:
         base_pld: Base privacy-loss realization on a linear loss grid.
@@ -160,9 +161,10 @@ def _stable_subsampling_transformation(
     Remove direction: l' = log(1 + q * (exp(l) - 1))
     Add direction:    l' = -log(1 + q * (exp(-l) - 1))
 
-    Paper mapping: Appendix C Algorithms 8-9 inverse ``phi_lambda`` transform.
-    For positive losses we use a log-sum form to avoid overflow; for non-positive
-    losses we use ``log1p(expm1(.))`` for cancellation stability.
+    Paper mapping: Algorithm 10 (`subsam-core`), with Algorithm 9 using this
+    transform on ``-L`` and negating back. For positive losses we use a log-sum
+    form to avoid overflow; for non-positive losses we use ``log1p(expm1(.))``
+    for cancellation stability.
     """
     if sampling_prob <= 0 or sampling_prob > 1:
         raise ValueError("sampling_prob must be in (0, 1]")
@@ -190,9 +192,9 @@ def _mix_distributions(
 ) -> DenseDiscreteDist:
     """Mix two same-grid distributions with weight ``weight_first`` for ``dist_1``.
 
-    Paper mapping: Algorithm 8 line
-    ``f_{L_lambda} = lambda f_L + (1-lambda) f_D`` after both operands are
-    represented on the common transformed grid.
+    Paper mapping: Algorithm 8 in the paper's "Full Implementation Details"
+    section, mixture line ``f_{L_lambda} = lambda f_L + (1-lambda) f_D`` after
+    both operands are represented on the common transformed grid.
     """
     if not (
         isinstance(dist_1, DenseDiscreteDist) and dist_1.spacing_type == SpacingType.LINEAR
@@ -204,8 +206,8 @@ def _mix_distributions(
         )
     if dist_1.prob_arr.size != dist_2.prob_arr.size:
         raise ValueError("Distributions must have the same number of bins for mixing")
-    if not stable_isclose(a=dist_1.x_min, b=dist_2.x_min):
-        raise ValueError("Distributions must share the same x_min for mixing")
+    if not stable_isclose(a=dist_1.x_0, b=dist_2.x_0):
+        raise ValueError("Distributions must share the same x_0 for mixing")
     if not stable_isclose(a=dist_1.step, b=dist_2.step):
         raise ValueError("Distributions must share the same step for mixing")
     if weight_first < 0 or weight_first > 1:
@@ -219,7 +221,7 @@ def _mix_distributions(
         bound_type=BoundType.DOMINATES,
     )
     return DenseDiscreteDist(
-        x_min=dist_1.x_min,
+        x_0=dist_1.x_0,
         step=dist_1.step,
         prob_arr=mixed_probs,
         p_min=mixed_p_min,
@@ -270,7 +272,7 @@ def _calc_subsampled_grid(
     direction: Direction,
     include_right: float | None = None,
 ) -> NDArray[np.float64]:
-    """Compute the transformed linear target grid used by Algorithms 8/9."""
+    """Compute the transformed linear target grid used by Algorithms 8-10."""
     sampling_prob = grid_size
     if sampling_prob <= 0 or sampling_prob > 1:
         raise ValueError("grid_size must be in (0, 1]")
@@ -314,12 +316,12 @@ def _subsample_dist(
 ) -> DenseDiscreteDist:
     """Subsample a single distribution onto a linear target grid in DOMINATES mode.
 
-    Paper mapping: Appendix C Algorithm 9 finite-support transform and PMF
-    transfer. The implementation keeps these same components while making the
-    re-binning and infinite-mass placement explicit.
+    Paper mapping: Algorithm 10 (`subsam-core`), with the Algorithm 9 sign convention when
+    ``direction`` is ADD. The implementation keeps these same components while
+    making the re-binning and infinite-mass placement explicit.
     """
     if target_x_array is None:
-        # Algorithm 9, support update: build transformed target grid.
+        # Algorithm 10 support update: build transformed target grid.
         width = compute_bin_width(base_pld.x_array)
         include_right = None
         if direction == Direction.ADD and base_pld.p_max > 0.0:
@@ -340,7 +342,7 @@ def _subsample_dist(
                 f"-log(1-q)={max_loss:.15g}, got right endpoint={target_x_array[-1]:.15g}"
             )
 
-    # Algorithm 8/9 core transform: l -> l_lambda using stable inverse-phi.
+    # Algorithm 10 core transform: l -> l_lambda using stable inverse-phi.
     transformed_x_array = _stable_subsampling_transformation(
         x_array=base_pld.x_array, sampling_prob=sampling_prob, direction=direction
     )
@@ -396,9 +398,9 @@ def _subsample_dist_mix(
 ) -> DenseDiscreteDist:
     """Subsample and mix base and negative-dual distributions on a shared linear grid.
 
-    Paper mapping: Appendix C Algorithm 8 (`PLD-subsam-remove`) mixture line
-    ``lambda * f_L + (1-lambda) * f_D``. The implementation computes each
-    transformed branch on the same grid before applying that convex mixture.
+    Paper mapping: Algorithm 8 (`PLD-subsam-remove`), mixture line ``lambda * f_L +
+    (1-lambda) * f_D``. The implementation computes each transformed branch on
+    the same grid before applying that convex mixture.
     """
     if target_x_array is None:
         # Algorithm 8 support update for the base branch.

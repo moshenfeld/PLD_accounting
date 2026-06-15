@@ -5,18 +5,20 @@ from PLD_accounting.mechanisms import (
     gaussian_distribution,
     laplace_distribution,
 )
+from PLD_accounting.random_allocation_accounting import compose_full_pld
 from PLD_accounting.random_allocation_api import (
     gaussian_allocation_delta_configurable,
+    gaussian_allocation_directional_pld,
     gaussian_allocation_epsilon_configurable,
     gaussian_allocation_epsilon_range,
-    gaussian_allocation_PLD,
+    gaussian_allocation_pld,
     general_allocation_delta,
     general_allocation_epsilon,
-    general_allocation_PLD,
+    general_allocation_pld,
 )
-from PLD_accounting.subsample_PLD import (
-    subsample_PLD,
-    subsample_PLD_realization,
+from PLD_accounting.subsample_pld import (
+    subsample_pld,
+    subsample_pld_realization,
 )
 from PLD_accounting.types import (
     DEFAULT_LOSS_DISCRETIZATION,
@@ -39,15 +41,17 @@ __all__ = [
     "Direction",
     "PrivacyParams",
     "SpacingType",
-    "gaussian_allocation_PLD",
+    "compose_full_pld",
+    "gaussian_allocation_directional_pld",
+    "gaussian_allocation_pld",
     "gaussian_allocation_delta_configurable",
     "gaussian_allocation_epsilon_configurable",
     "gaussian_allocation_epsilon_range",
     "gaussian_distribution",
-    "general_allocation_PLD",
+    "general_allocation_pld",
     "general_allocation_delta",
     "general_allocation_epsilon",
     "laplace_distribution",
-    "subsample_PLD",
-    "subsample_PLD_realization",
+    "subsample_pld",
+    "subsample_pld_realization",
 ]

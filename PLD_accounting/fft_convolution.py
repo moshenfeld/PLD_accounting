@@ -47,7 +47,7 @@ def fft_convolve(
         raise ValueError(f"Grid spacing must match: w1={dist_1.step:.12g} vs w2={dist_2.step:.12g}")
 
     width = dist_1.step
-    conv_x_min = dist_1.x_min + dist_2.x_min
+    conv_x_min = dist_1.x_0 + dist_2.x_0
 
     # --- Manual rfft/irfft with in-place multiply (saves one complex128 buffer) ---
     conv_full_len = dist_1.prob_arr.size + dist_2.prob_arr.size - 1
@@ -102,7 +102,7 @@ def fft_convolve(
     )
 
     return DenseDiscreteDist(
-        x_min=conv_x_min,
+        x_0=conv_x_min,
         step=width,
         prob_arr=conv_pmf,
         p_min=p_min,
@@ -221,7 +221,7 @@ def _fft_self_convolve_direct(
     else:
         raise ValueError(f"Unknown BoundType: {bound_type}")
 
-    x_min = dist.x_min * T + shift_left * dist.step
+    x_min = dist.x_0 * T + shift_left * dist.step
     pmf_conv = rolled_conv[:window_size]
     pmf_conv, p_min_final, p_max_final = enforce_mass_conservation(
         prob_arr=pmf_conv,
@@ -231,7 +231,7 @@ def _fft_self_convolve_direct(
     )
 
     return DenseDiscreteDist(
-        x_min=x_min,
+        x_0=x_min,
         step=dist.step,
         prob_arr=pmf_conv,
         p_min=p_min_final,

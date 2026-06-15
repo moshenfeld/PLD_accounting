@@ -7,6 +7,7 @@ and transform functions between linear and geometric grids.
 
 import numpy as np
 import pytest
+
 from PLD_accounting.discrete_dist import (
     DenseDiscreteDist,
     Domain,
@@ -141,19 +142,19 @@ class TestDenseDiscreteDistLinear:
 
     def test_valid_dense_linear(self):
         """Test creating valid dense linear distribution."""
-        dist = DenseDiscreteDist(x_min=0.0, step=0.5, prob_arr=np.array([0.2, 0.5, 0.3]))
+        dist = DenseDiscreteDist(x_0=0.0, step=0.5, prob_arr=np.array([0.2, 0.5, 0.3]))
         expected_x = np.array([0.0, 0.5, 1.0])
         assert np.allclose(dist.x_array, expected_x)
 
     def test_skip_must_be_positive(self):
         """Test that negative step raises error."""
         with pytest.raises(ValueError, match="step must be positive"):
-            DenseDiscreteDist(x_min=0.0, step=-0.1, prob_arr=np.array([0.5, 0.5]))
+            DenseDiscreteDist(x_0=0.0, step=-0.1, prob_arr=np.array([0.5, 0.5]))
 
     def test_zero_skip_raises(self):
         """Test that zero step raises error."""
         with pytest.raises(ValueError, match="step must be positive"):
-            DenseDiscreteDist(x_min=0.0, step=0.0, prob_arr=np.array([0.5, 0.5]))
+            DenseDiscreteDist(x_0=0.0, step=0.0, prob_arr=np.array([0.5, 0.5]))
 
 
 class TestDenseDiscreteDistGeometric:
@@ -162,7 +163,7 @@ class TestDenseDiscreteDistGeometric:
     def test_valid_dense_geometric(self):
         """Test creating valid dense geometric distribution."""
         dist = DenseDiscreteDist(
-            x_min=1.0,
+            x_0=1.0,
             step=2.0,
             prob_arr=np.array([0.2, 0.5, 0.3]),
             spacing_type=SpacingType.GEOMETRIC,
@@ -171,11 +172,11 @@ class TestDenseDiscreteDistGeometric:
         expected_x = np.array([1.0, 2.0, 4.0])  # x_min * ratio^i
         assert np.allclose(dist.x_array, expected_x)
 
-    def test_x_min_must_be_positive(self):
-        """Test that non-positive x_min raises error for geometric grid."""
-        with pytest.raises(ValueError, match="x_min must be positive"):
+    def test_x_0_must_be_positive(self):
+        """Test that non-positive x_0 raises error for geometric grid."""
+        with pytest.raises(ValueError, match="x_0 must be positive"):
             DenseDiscreteDist(
-                x_min=0.0,
+                x_0=0.0,
                 step=2.0,
                 prob_arr=np.array([0.5, 0.5]),
                 spacing_type=SpacingType.GEOMETRIC,
@@ -186,7 +187,7 @@ class TestDenseDiscreteDistGeometric:
         """Test that step <= 1 raises error for geometric grid."""
         with pytest.raises(ValueError, match="step must be > 1"):
             DenseDiscreteDist(
-                x_min=1.0,
+                x_0=1.0,
                 step=1.0,
                 prob_arr=np.array([0.5, 0.5]),
                 spacing_type=SpacingType.GEOMETRIC,
@@ -199,7 +200,7 @@ class TestLinearGeometricTransforms:
 
     def test_dense_linear_to_geometric_roundtrip(self):
         """Test dense linear -> geometric -> linear preserves structure."""
-        dist_linear = DenseDiscreteDist(x_min=1.0, step=0.5, prob_arr=np.array([0.2, 0.5, 0.3]))
+        dist_linear = DenseDiscreteDist(x_0=1.0, step=0.5, prob_arr=np.array([0.2, 0.5, 0.3]))
 
         # Transform to geometric (exp)
         dist_geom = exp_linear_to_geometric(dist_linear)
@@ -216,7 +217,7 @@ class TestLinearGeometricTransforms:
         )
 
         # Check roundtrip preserves values
-        assert np.isclose(dist_linear.x_min, dist_linear_back.x_min)
+        assert np.isclose(dist_linear.x_0, dist_linear_back.x_0)
         assert np.isclose(dist_linear.step, dist_linear_back.step)
         assert np.allclose(dist_linear.prob_arr, dist_linear_back.prob_arr)
         assert dist_linear.p_min == dist_linear_back.p_min
@@ -225,7 +226,7 @@ class TestLinearGeometricTransforms:
     def test_dense_geometric_to_linear_roundtrip(self):
         """Test dense geometric -> linear -> geometric preserves structure."""
         dist_geom = DenseDiscreteDist(
-            x_min=2.0,
+            x_0=2.0,
             step=1.5,
             prob_arr=np.array([0.2, 0.5, 0.3]),
             spacing_type=SpacingType.GEOMETRIC,
@@ -247,7 +248,7 @@ class TestLinearGeometricTransforms:
         )
 
         # Check roundtrip preserves values
-        assert np.isclose(dist_geom.x_min, dist_geom_back.x_min)
+        assert np.isclose(dist_geom.x_0, dist_geom_back.x_0)
         assert np.isclose(dist_geom.step, dist_geom_back.step)
         assert np.allclose(dist_geom.prob_arr, dist_geom_back.prob_arr)
 
@@ -259,7 +260,7 @@ class TestLinearGeometricTransforms:
         """
         # REALS with p_min (mass at -inf) only
         dist_neg = DenseDiscreteDist(
-            x_min=1.0,
+            x_0=1.0,
             step=0.5,
             prob_arr=np.array([0.7, 0.2]),
             p_min=0.1,
@@ -273,7 +274,7 @@ class TestLinearGeometricTransforms:
 
         # REALS with p_max (mass at +inf) only
         dist_pos = DenseDiscreteDist(
-            x_min=1.0,
+            x_0=1.0,
             step=0.5,
             prob_arr=np.array([0.6, 0.2]),
             p_max=0.2,
@@ -287,7 +288,7 @@ class TestLinearGeometricTransforms:
 
         # POSITIVES with both non-zero is valid
         geom_both = DenseDiscreteDist(
-            x_min=np.exp(1.0),
+            x_0=np.exp(1.0),
             step=np.exp(0.5),
             prob_arr=np.array([0.3, 0.5]),
             p_min=0.1,

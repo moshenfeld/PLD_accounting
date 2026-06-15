@@ -13,8 +13,12 @@ from PLD_accounting.discrete_dist import (
     DenseDiscreteDist,
     DiscreteDistBase,
     Domain,
+    GridSpec,
     PLDRealization,
-    SparseDiscreteDist,
+)
+from PLD_accounting.distribution_discretization import (
+    fold_absorbable_boundary_atom,
+    project_dist_onto_grid,
 )
 from PLD_accounting.distribution_utils import (
     enforce_mass_conservation,
@@ -93,7 +97,7 @@ def binary_self_convolve(
 ) -> DenseDiscreteDist:
     """Exponentiation by squaring-based self-convolution using a provided convolve function.
 
-    Algorithm 3 (`self-conv`) in Appendix C.
+    Algorithm 3 (`self-conv`).
     """
     if T < 1:
         raise ValueError(f"T must be >= 1, got {T}")
@@ -127,12 +131,17 @@ def binary_self_convolve(
 
 
 def combine_distributions(
-    *, dist_1: DiscreteDistBase, dist_2: DiscreteDistBase, bound_type: BoundType
-) -> SparseDiscreteDist:
-    """Combine two distributions by tightening bounds via CCDF min/max.
+    *,
+    dist_1: DiscreteDistBase,
+    dist_2: DiscreteDistBase,
+    bound_type: BoundType,
+) -> DenseDiscreteDist:
+    """Combine two same-grid distributions by tightening bounds via CCDF min/max.
 
     For DOMINATES: returns tighter dominating distribution using pointwise min CCDF.
     For IS_DOMINATED: returns tighter dominated distribution using pointwise max CCDF.
+    Both inputs must already share an identical support grid; callers are
+    responsible for projecting one distribution onto the other's grid first.
     """
     ccdf_op: Any
     if bound_type == BoundType.DOMINATES:
@@ -142,32 +151,123 @@ def combine_distributions(
     else:
         raise ValueError(f"Unknown BoundType: {bound_type}")
 
-    if stable_array_equal(a=dist_1.x_array, b=dist_2.x_array):
-        dist_1_aligned, dist_2_aligned = dist_1, dist_2
-    else:
-        dist_1_aligned, dist_2_aligned = _align_distributions_to_union_grid(
-            dist_1=dist_1,
-            dist_2=dist_2,
+    if not stable_array_equal(a=dist_1.x_array, b=dist_2.x_array):
+        raise ValueError(
+            "combine_distributions requires identical support grids, got sizes "
+            f"{dist_1.x_array.size} and {dist_2.x_array.size} with ranges "
+            f"[{dist_1.x_array[0]}, {dist_1.x_array[-1]}] and "
+            f"[{dist_2.x_array[0]}, {dist_2.x_array[-1]}]"
         )
 
-    x_array = dist_1_aligned.x_array
-    ccdf_1 = _ccdf_from_pmf(dist_1_aligned)
-    ccdf_2 = _ccdf_from_pmf(dist_2_aligned)
+    x_array = dist_1.x_array
+    ccdf_1 = _ccdf_from_pmf(dist_1)
+    ccdf_2 = _ccdf_from_pmf(dist_2)
     combined_ccdf = ccdf_op(ccdf_1, ccdf_2)
     prob_arr = combined_ccdf[:-2] - combined_ccdf[1:-1]
 
+    # The boundary atoms are the CCDF limits, so the pointwise CCDF operation
+    # carries through to them: min CCDF gives max p_min and min p_max, max CCDF
+    # the reverse.
+    if bound_type == BoundType.DOMINATES:
+        expected_p_min = max(dist_1.p_min, dist_2.p_min)
+        expected_p_max = min(dist_1.p_max, dist_2.p_max)
+    else:
+        expected_p_min = min(dist_1.p_min, dist_2.p_min)
+        expected_p_max = max(dist_1.p_max, dist_2.p_max)
     prob_arr, p_min, p_max = enforce_mass_conservation(
         prob_arr=prob_arr,
-        expected_p_min=max(dist_1_aligned.p_min, dist_2_aligned.p_min),
-        expected_p_max=max(dist_1_aligned.p_max, dist_2_aligned.p_max),
+        expected_p_min=expected_p_min,
+        expected_p_max=expected_p_max,
         bound_type=bound_type,
     )
 
-    return SparseDiscreteDist(
+    return DenseDiscreteDist.from_x_array(
         x_array=x_array,
         prob_arr=prob_arr,
         p_min=p_min,
         p_max=p_max,
+    )
+
+
+def combine_best_of_two_plds(
+    *,
+    dist_1: DenseDiscreteDist,
+    dist_2: DenseDiscreteDist,
+    bound_type: BoundType,
+) -> DenseDiscreteDist:
+    """Combine two same-quantity directional PLDs on the finer of their grids.
+
+    Both inputs are complete directional PLDs of the same quantity (e.g. the
+    FFT and GEOM candidates of a BEST_OF_TWO build), each constructed with its
+    own correct budget scaling.  The coarser candidate is projected onto the
+    finer candidate's exact lattice with domination-aware rounding, and the
+    pointwise CCDF combination runs on that shared grid.  The anchored (finer)
+    candidate's values are untouched, so the result is never looser than it,
+    and never looser than the other candidate by more than one fine grid step.
+    On equal steps ``dist_1`` is the anchor.
+    """
+    if not (isinstance(dist_1, DenseDiscreteDist) and dist_1.spacing_type == SpacingType.LINEAR):
+        _st = getattr(dist_1, "spacing_type", "?")
+        raise TypeError(
+            "dist_1: expected DenseDiscreteDist with LINEAR spacing, "
+            f"got {type(dist_1).__name__} with spacing {_st}"
+        )
+    if not (isinstance(dist_2, DenseDiscreteDist) and dist_2.spacing_type == SpacingType.LINEAR):
+        _st = getattr(dist_2, "spacing_type", "?")
+        raise TypeError(
+            "dist_2: expected DenseDiscreteDist with LINEAR spacing, "
+            f"got {type(dist_2).__name__} with spacing {_st}"
+        )
+
+    if dist_1.step <= dist_2.step:
+        anchor_dist, other_dist = dist_1, dist_2
+    else:
+        anchor_dist, other_dist = dist_2, dist_1
+
+    # Extend the anchor lattice (preserving its offset) to cover the other support.
+    step = anchor_dist.step
+    other_x_max = other_dist.x_0 + (other_dist.prob_arr.size - 1) * other_dist.step
+    anchor_x_max = anchor_dist.x_0 + (anchor_dist.prob_arr.size - 1) * step
+    n_left = max(0, int(np.ceil((anchor_dist.x_0 - other_dist.x_0) / step)))
+    n_right = max(0, int(np.ceil((other_x_max - anchor_x_max) / step)))
+    out_grid = GridSpec(
+        x_0=anchor_dist.x_0 - n_left * step,
+        step=step,
+        n=n_left + anchor_dist.prob_arr.size + n_right,
+        spacing_type=SpacingType.LINEAR,
+    )
+
+    # Project the coarser candidate onto the shared lattice with
+    # domination-aware rounding.
+    other_working = fold_absorbable_boundary_atom(
+        dist=other_dist,
+        spacing_type=SpacingType.LINEAR,
+        bound_type=bound_type,
+    )
+    other_on_grid = project_dist_onto_grid(
+        dist=other_working,
+        grid=out_grid,
+        expected_p_min=other_working.p_min,
+        expected_p_max=other_working.p_max,
+        bound_type=bound_type,
+    )
+
+    # Embed the anchor candidate exactly (zero padding only; no rounding).
+    anchor_prob_out = np.zeros(out_grid.n, dtype=np.float64)
+    anchor_end = n_left + anchor_dist.prob_arr.size
+    anchor_prob_out[n_left:anchor_end] = anchor_dist.prob_arr
+    anchor_on_grid = DenseDiscreteDist(
+        x_0=out_grid.x_0,
+        step=out_grid.step,
+        prob_arr=anchor_prob_out,
+        p_min=anchor_dist.p_min,
+        p_max=anchor_dist.p_max,
+    )
+
+    return combine_distributions(
+        dist_1=anchor_on_grid,
+        dist_2=other_on_grid,
+        bound_type=bound_type,
     )
 
 
@@ -186,11 +286,11 @@ def exp_linear_to_geometric(dist: DenseDiscreteDist) -> DenseDiscreteDist:
         raise ValueError(
             f"exp_linear_to_geometric requires LINEAR spacing input, got {dist.spacing_type}"
         )
-    x_min_exp = float(np.exp(dist.x_min))
+    x_min_exp = float(np.exp(dist.x_0))
     ratio_exp = float(np.exp(dist.step))
 
     return DenseDiscreteDist(
-        x_min=x_min_exp,
+        x_0=x_min_exp,
         step=ratio_exp,
         prob_arr=dist.prob_arr.copy(),
         p_min=dist.p_min,  # −∞ atom → 0 atom (p_min identity preserved)
@@ -210,11 +310,11 @@ def log_geometric_to_linear(dist: DenseDiscreteDist) -> DenseDiscreteDist:
         raise ValueError(
             f"log_geometric_to_linear requires GEOMETRIC spacing input, got {dist.spacing_type}"
         )
-    x_min_log = float(np.log(dist.x_min))
+    x_min_log = float(np.log(dist.x_0))
     step_log = float(np.log(dist.step))
 
     return DenseDiscreteDist(
-        x_min=x_min_log,
+        x_0=x_min_log,
         step=step_log,
         prob_arr=dist.prob_arr.copy(),
         p_min=dist.p_min,  # 0 atom → −∞ atom (p_min identity preserved)
@@ -230,7 +330,7 @@ def negate_reverse_linear_distribution(
     """Map X -> -X, reverse PMF order, and swap boundary atoms."""
     n = dist.prob_arr.size
     return DenseDiscreteDist(
-        x_min=-(dist.x_min + dist.step * (n - 1)),
+        x_0=-(dist.x_0 + dist.step * (n - 1)),
         step=dist.step,
         prob_arr=np.flip(dist.prob_arr),
         p_min=dist.p_max,
@@ -241,7 +341,7 @@ def negate_reverse_linear_distribution(
 def calc_pld_dual(realization: PLDRealization) -> PLDRealization:
     """Compute the paper PLD dual ``D(L)`` (Definition 3.1).
 
-    Algorithm 7 (`PLD-dual`) in Appendix C.
+    Algorithm 7 (`PLD-dual`).
 
     For a PLD realization ``L`` with support ``l`` and mass ``f_L(l)``, the dual has:
     - finite mass ``f_D(-l) = f_L(l) * exp(-l)``,
@@ -264,7 +364,7 @@ def calc_pld_dual(realization: PLDRealization) -> PLDRealization:
         sum_prob = 1.0
 
     return PLDRealization(
-        x_min=-(realization.x_min + realization.step * (realization.prob_arr.size - 1)),
+        x_0=-(realization.x_0 + realization.step * (realization.prob_arr.size - 1)),
         step=realization.step,
         prob_arr=dual_probs,
         p_max=max(0.0, 1.0 - sum_prob),
@@ -275,46 +375,6 @@ def calc_pld_dual(realization: PLDRealization) -> PLDRealization:
 # =============================================================================
 # Internal Helper Functions
 # =============================================================================
-
-
-def _align_distributions_to_union_grid(
-    *,
-    dist_1: DiscreteDistBase,
-    dist_2: DiscreteDistBase,
-) -> tuple[SparseDiscreteDist, SparseDiscreteDist]:
-    """Return distributions on a shared grid by inserting zero-mass points."""
-    x_union = np.unique(np.concatenate((dist_1.x_array, dist_2.x_array)))
-    return (
-        _expand_to_grid(
-            dist=dist_1,
-            grid=x_union,
-        ),
-        _expand_to_grid(
-            dist=dist_2,
-            grid=x_union,
-        ),
-    )
-
-
-def _expand_to_grid(
-    *,
-    dist: DiscreteDistBase,
-    grid: NDArray[np.float64],
-) -> SparseDiscreteDist:
-    """Insert zero-mass points for missing support values."""
-    x = dist.x_array
-    pmf = dist.prob_arr
-    expanded_pmf = np.zeros_like(grid, dtype=np.float64)
-    indices = np.searchsorted(grid, x)
-    if not np.all(grid[indices] == x):
-        raise ValueError("Target grid must contain all original support points")
-    expanded_pmf[indices] = pmf
-    return SparseDiscreteDist(
-        x_array=grid,
-        prob_arr=expanded_pmf,
-        p_min=dist.p_min,
-        p_max=dist.p_max,
-    )
 
 
 def _ccdf_from_pmf(dist: DiscreteDistBase) -> NDArray[np.float64]:

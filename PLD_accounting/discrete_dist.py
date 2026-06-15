@@ -4,8 +4,8 @@ Class hierarchy:
 - DiscreteDistBase: abstract base for all discrete distributions
 - SparseDiscreteDist: arbitrary explicit support (explicit x_array)
 - DenseDiscreteDist: regular-grid distribution
-  - spacing_type=LINEAR:    x[i] = x_min + i * step
-  - spacing_type=GEOMETRIC: x[i] = x_min * step^i
+  - spacing_type=LINEAR:    x[i] = x_0 + i * step
+  - spacing_type=GEOMETRIC: x[i] = x_0 * step^i
 - PLDRealization: DenseDiscreteDist specialised for privacy loss (LINEAR + REALS)
 
 Domain semantics:
@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import Enum
 
 import numpy as np
@@ -41,6 +42,40 @@ class Domain(Enum):
 
     REALS = "reals"  # p_min = mass at −∞, p_max = mass at +∞
     POSITIVES = "positives"  # p_min = mass at 0,  p_max = mass at +∞
+
+
+@dataclass
+class GridSpec:
+    """Exact parameters of a regular grid -- the single source of truth for a lattice.
+
+    ``x[i] = x_0 + i * step``     for ``spacing_type == LINEAR``    (i in range(n))
+    ``x[i] = x_0 * step ** i``    for ``spacing_type == GEOMETRIC``
+
+    Threaded through the discretization pipeline so the resulting spacing is the
+    exact one requested, never re-derived from a materialized array. Also backs
+    the grid identity of :class:`DenseDiscreteDist`. Mutable: callers that own a
+    grid adjust ``n`` or ``x_0`` in place; ``DenseDiscreteDist`` always builds its
+    own grid, so dists never alias one another's.
+    """
+
+    x_0: float
+    step: float
+    n: int
+    spacing_type: SpacingType = SpacingType.LINEAR
+
+    def materialize(self) -> NDArray[np.float64]:
+        """Materialize the grid points (the canonical support array)."""
+        k = np.arange(self.n, dtype=np.float64)
+        if self.spacing_type == SpacingType.LINEAR:
+            return self.x_0 + k * self.step
+        return self.x_0 * np.power(self.step, k)
+
+    def last_point(self) -> float:
+        """Last grid point, computed exactly as :meth:`materialize` produces it."""
+        k_last = np.float64(self.n - 1)
+        if self.spacing_type == SpacingType.LINEAR:
+            return float(self.x_0 + k_last * self.step)
+        return float(self.x_0 * np.power(self.step, k_last))
 
 
 # =============================================================================
@@ -193,15 +228,15 @@ class SparseDiscreteDist(DiscreteDistBase):
 class DenseDiscreteDist(DiscreteDistBase):
     """Discrete distribution on a regular (linear or geometric) grid.
 
-    spacing_type = LINEAR:    x[i] = x_min + i * step   (step = additive gap > 0)
-    spacing_type = GEOMETRIC: x[i] = x_min * step^i     (step = ratio > 1, x_min > 0)
+    spacing_type = LINEAR:    x[i] = x_0 + i * step   (step = additive gap > 0)
+    spacing_type = GEOMETRIC: x[i] = x_0 * step^i     (step = ratio > 1, x_0 > 0)
 
-    For geometric grids the domain is always POSITIVES (x_min > 0 enforces positivity).
+    For geometric grids the domain is always POSITIVES (x_0 > 0 enforces positivity).
     """
 
     def __init__(
         self,
-        x_min: float,
+        x_0: float,
         step: float,
         prob_arr: NDArray[np.float64],
         p_min: float = 0.0,
@@ -210,19 +245,47 @@ class DenseDiscreteDist(DiscreteDistBase):
         domain: Domain = Domain.REALS,
     ) -> None:
         """Initialize regular-grid discrete distribution."""
-        self.x_min = float(x_min)
-        self.step = float(step)
-        self.spacing_type = spacing_type
         super().__init__(prob_arr, p_min, p_max, domain)
+        # The grid identity is held as a GridSpec; n is sourced from prob_arr.
+        self._grid = GridSpec(
+            x_0=float(x_0),
+            step=float(step),
+            n=self.prob_arr.size,
+            spacing_type=spacing_type,
+        )
         self._validate_grid()
+
+    @property
+    def grid(self) -> GridSpec:
+        """Grid parameters ``(x_0, step, n, spacing_type)`` of this distribution."""
+        return self._grid
+
+    @property
+    def x_0(self) -> float:
+        """Grid origin: the smallest finite support point."""
+        return self._grid.x_0
+
+    @x_0.setter
+    def x_0(self, value: float) -> None:
+        self._grid.x_0 = float(value)
+
+    @property
+    def step(self) -> float:
+        """Additive bin width (LINEAR) or multiplicative ratio (GEOMETRIC)."""
+        return self._grid.step
+
+    @property
+    def spacing_type(self) -> SpacingType:
+        """Grid spacing family."""
+        return self._grid.spacing_type
 
     def _validate_grid(self) -> None:
         if self.spacing_type == SpacingType.LINEAR:
             if self.step <= 0.0:
                 raise ValueError("step must be positive for linear grid")
         elif self.spacing_type == SpacingType.GEOMETRIC:
-            if self.x_min <= 0.0:
-                raise ValueError("x_min must be positive for geometric grid")
+            if self.x_0 <= 0.0:
+                raise ValueError("x_0 must be positive for geometric grid")
             if self.step <= 1.0:
                 raise ValueError("step must be > 1 for geometric grid")
             if self.domain != Domain.POSITIVES:
@@ -240,13 +303,13 @@ class DenseDiscreteDist(DiscreteDistBase):
         spacing_type: SpacingType = SpacingType.LINEAR,
         domain: Domain = Domain.REALS,
     ) -> "DenseDiscreteDist":
-        """Create DenseDiscreteDist from x_array by extracting x_min and step."""
+        """Create DenseDiscreteDist from x_array by extracting x_0 and step."""
         if spacing_type == SpacingType.LINEAR:
             step = compute_bin_width(x_array)
         else:
             step = compute_bin_ratio(x_array)
         return cls(
-            x_min=float(x_array[0]),
+            x_0=float(x_array[0]),
             step=step,
             prob_arr=prob_arr,
             p_min=p_min,
@@ -257,10 +320,7 @@ class DenseDiscreteDist(DiscreteDistBase):
 
     def get_x_array(self) -> NDArray[np.float64]:
         """Return materialized support points."""
-        n = self.prob_arr.size
-        if self.spacing_type == SpacingType.LINEAR:
-            return self.x_min + np.arange(n, dtype=np.float64) * self.step
-        return self.x_min * np.power(self.step, np.arange(n, dtype=np.float64))
+        return self._grid.materialize()
 
     def _create_truncated(
         self,
@@ -271,11 +331,11 @@ class DenseDiscreteDist(DiscreteDistBase):
         max_ind: int,
     ) -> "DenseDiscreteDist":
         if self.spacing_type == SpacingType.LINEAR:
-            new_x_min = self.x_min + min_ind * self.step
+            new_x_0 = self.x_0 + min_ind * self.step
         else:
-            new_x_min = self.x_min * (self.step ** float(min_ind))
+            new_x_0 = self.x_0 * (self.step ** float(min_ind))
         return self.__class__(
-            x_min=new_x_min,
+            x_0=new_x_0,
             step=self.step,
             prob_arr=new_prob_arr,
             p_min=new_p_min,
@@ -287,7 +347,7 @@ class DenseDiscreteDist(DiscreteDistBase):
     def copy(self) -> "DenseDiscreteDist":
         """Create a deep copy of this distribution."""
         return self.__class__(
-            x_min=self.x_min,
+            x_0=self.x_0,
             step=self.step,
             prob_arr=self.prob_arr.copy(),
             p_min=self.p_min,
@@ -307,7 +367,7 @@ class PLDRealization(DenseDiscreteDist):
 
     def __init__(
         self,
-        x_min: float,
+        x_0: float,
         step: float,
         prob_arr: NDArray[np.float64],
         p_min: float = 0.0,
@@ -315,7 +375,7 @@ class PLDRealization(DenseDiscreteDist):
     ) -> None:
         """Initialize PLD realization with privacy loss values and probabilities."""
         super().__init__(
-            x_min=x_min,
+            x_0=x_0,
             step=step,
             prob_arr=prob_arr,
             p_min=float(p_min),
@@ -333,7 +393,7 @@ class PLDRealization(DenseDiscreteDist):
                 f"from_linear_dist requires DenseDiscreteDist with LINEAR spacing, got {type(dist)}"
             )
         return cls(
-            x_min=dist.x_min,
+            x_0=dist.x_0,
             step=dist.step,
             prob_arr=dist.prob_arr,
             p_max=dist.p_max,
@@ -365,7 +425,7 @@ class PLDRealization(DenseDiscreteDist):
     def copy(self) -> "PLDRealization":
         """Create a deep copy of this PLD realization."""
         return PLDRealization(
-            x_min=self.x_min,
+            x_0=self.x_0,
             step=self.step,
             prob_arr=self.prob_arr.copy(),
             p_max=self.p_max,
@@ -385,7 +445,7 @@ class PLDRealization(DenseDiscreteDist):
             # IS_DOMINATED can set p_min > 0, violating PLDRealization.p_min = 0.
             # Delegate through a plain DenseDiscreteDist so the result is not a PLDRealization.
             return DenseDiscreteDist(
-                x_min=self.x_min,
+                x_0=self.x_0,
                 step=self.step,
                 prob_arr=self.prob_arr.copy(),
                 p_min=self.p_min,
@@ -404,7 +464,7 @@ class PLDRealization(DenseDiscreteDist):
         """Create a truncated PLD realization while preserving linear-loss semantics."""
         del max_ind
         return PLDRealization(
-            x_min=self.x_min + min_ind * self.step,
+            x_0=self.x_0 + min_ind * self.step,
             step=self.step,
             prob_arr=new_prob_arr,
             p_min=new_p_min,

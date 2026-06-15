@@ -38,7 +38,7 @@ def geometric_convolve(
 ) -> DenseDiscreteDist:
     """Convolve two geometric-grid distributions.
 
-    Algorithm 4 (`conv`) in Appendix C wrapper.
+    A wrapper of Algorithm 4 (`conv`).
     For POSITIVES-domain distributions the 0 atom is neutral (not absorbing),
     so cross-terms (0 + finite and finite + 0) are added to the finite PMF.
     """
@@ -112,7 +112,7 @@ def geometric_convolve(
     )
 
     return DenseDiscreteDist(
-        x_min=float(x_out[0]),
+        x_0=float(x_out[0]),
         step=ratio,
         prob_arr=pmf_conv,
         p_min=p_min,
@@ -169,7 +169,7 @@ def _compute_geometric_convolution(
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
     """Align grids, compute bin mapping parameters, and invoke the Numba kernel.
 
-    Algorithm 4 (`conv`) with internal Algorithm 5 (`range-renorm`) in Appendix C.
+    Algorithm 4 (`conv`) with internal Algorithm 5 (`range-renorm`).
     """
     # --- A. Standardization (Swap & Pad) ---
     # We normalize such that x_base (x1) starts at the lower value.
