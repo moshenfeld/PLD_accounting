@@ -34,7 +34,7 @@ def _linear_step_for_tail_truncation(
     tail_truncation: float,
     n_grid: int,
 ) -> float:
-    """Match legacy ``n_grid``-only grids: uniform step over the tail quantile span."""
+    """Return the uniform step for an ``n_grid`` tail-quantile reference grid."""
     x_min = float(dist.ppf(tail_truncation))
     x_max = float(dist.isf(tail_truncation))
     return (x_max - x_min) / (n_grid - 1)

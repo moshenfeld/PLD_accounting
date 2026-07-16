@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from functools import partial
 from typing import Any, Callable
 
@@ -9,7 +10,12 @@ import numpy as np
 from scipy import stats
 from scipy.stats._distn_infrastructure import rv_frozen
 
-from PLD_accounting.discrete_dist import DenseDiscreteDist, Domain, GridSpec
+from PLD_accounting.discrete_dist import (
+    DenseDiscreteDist,
+    Domain,
+    GridSpec,
+    PLDRealization,
+)
 from PLD_accounting.distribution_discretization import (
     aligned_grid_params,
     discretize_continuous_dist,
@@ -34,6 +40,7 @@ from PLD_accounting.types import (
     SpacingType,
 )
 from PLD_accounting.utils import (
+    calc_pld_dual,
     log_geometric_to_linear,
     negate_reverse_linear_distribution,
 )
@@ -158,6 +165,33 @@ def _gaussian_remove_geom_loss_factors(
 ) -> tuple[DenseDiscreteDist, DenseDiscreteDist]:
     """Build REMOVE GEOM one-step PLD factors as ``(base, dual_base)``."""
     sigma_inv = 1.0 / sigma
+
+    if bound_type == BoundType.DOMINATES:
+        loss_dist = stats.norm(loc=sigma_inv**2 / 2, scale=sigma_inv)
+        effective_step = float(loss_discretization)
+        if config.max_grid_mult > 0:
+            effective_step, _, _ = _coarsen_discretization_for_tail_quantile_range(
+                dist=loss_dist,
+                tail_truncation=tail_truncation,
+                target_discretization=effective_step,
+                max_points=config.max_grid_mult,
+                spacing_type=SpacingType.LINEAR,
+                align_to_multiples=True,
+            )
+        base_dist = discretize_continuous_distribution(
+            dist=loss_dist,
+            tail_truncation=tail_truncation,
+            bound_type=bound_type,
+            spacing_type=SpacingType.LINEAR,
+            step=effective_step,
+            align_to_multiples=True,
+        )
+        base_realization = PLDRealization.from_linear_dist(base_dist)
+        dual_realization = calc_pld_dual(base_realization)
+        return base_realization, negate_reverse_linear_distribution(dual_realization)
+
+    # Lower-bound truncation can create negative-infinity mass, so preserve the
+    # dual-first path and discretize the two continuous factors separately.
     factor_tail_truncation = tail_truncation / 2
     n_grid_geom = _geom_grid_size(
         sigma_inv=sigma_inv,
@@ -170,9 +204,6 @@ def _gaussian_remove_geom_loss_factors(
     base_norm_mean = sigma_inv**2 / 2
     exp_dual = stats.lognorm(s=sigma_inv, scale=np.exp(dual_norm_mean))
     exp_base = stats.lognorm(s=sigma_inv, scale=np.exp(base_norm_mean))
-
-    # Match ADD GEOM: cap aligned lattice length at ``n_grid_geom`` (``max_grid_mult``) by
-    # coarsening log-step from ``loss_discretization``; share one lattice for both factors.
     dual_step, dual_x_min, dual_x_max = _coarsen_discretization_for_tail_quantile_range(
         dist=exp_dual,
         tail_truncation=factor_tail_truncation,
@@ -209,7 +240,7 @@ def _gaussian_remove_geom_loss_factors(
         dist=exp_dual,
         grid=dual_grid,
         bound_type=bound_type,
-        PMF_min_increment=factor_tail_truncation,
+        pmf_min_increment=factor_tail_truncation,
     )
     if not (
         isinstance(dual_factor_dist, DenseDiscreteDist)
@@ -225,7 +256,7 @@ def _gaussian_remove_geom_loss_factors(
         dist=exp_base,
         grid=base_grid,
         bound_type=bound_type,
-        PMF_min_increment=factor_tail_truncation,
+        pmf_min_increment=factor_tail_truncation,
     )
     if not (
         isinstance(base_factor_dist, DenseDiscreteDist)
@@ -371,8 +402,16 @@ def _gaussian_allocation_fft_add(
             f"got {type(base_dist).__name__} with spacing {getattr(base_dist, 'spacing_type', '?')}"
         )
     # Fold zero-atom into leftmost finite bin before FFT convolution.
-    base_dist.prob_arr[0] += base_dist.p_min
-    base_dist.p_min = 0
+    base_prob_arr = base_dist.prob_arr.copy()
+    base_prob_arr[0] += base_dist.p_min
+    base_dist = DenseDiscreteDist(
+        x_0=base_dist.x_0,
+        step=base_dist.step,
+        prob_arr=base_prob_arr,
+        p_min=0.0,
+        p_max=base_dist.p_max,
+        domain=base_dist.domain,
+    )
 
     conv_dist = fft_self_convolve(
         dist=base_dist,
@@ -451,10 +490,16 @@ def _gaussian_allocation_fft_remove(
             f"got {type(dual_dist).__name__} with spacing {getattr(dual_dist, 'spacing_type', '?')}"
         )
     # Fold zero-atom into leftmost finite bin before FFT convolution.
-    dual_dist.prob_arr[0] += dual_dist.p_min
-    dual_dist.p_min = 0
-
-    dual_dist.x_0 -= dual_shift
+    dual_prob_arr = dual_dist.prob_arr.copy()
+    dual_prob_arr[0] += dual_dist.p_min
+    dual_dist = DenseDiscreteDist(
+        x_0=dual_dist.x_0 - dual_shift,
+        step=dual_dist.step,
+        prob_arr=dual_prob_arr,
+        p_min=0.0,
+        p_max=dual_dist.p_max,
+        domain=dual_dist.domain,
+    )
 
     dual_convolved_dist = fft_self_convolve(
         dist=dual_dist,
@@ -482,7 +527,7 @@ def _gaussian_allocation_fft_remove(
         dist=exp_base,
         grid=base_grid,
         bound_type=bound_type,
-        PMF_min_increment=factor_tail,
+        pmf_min_increment=factor_tail,
         domain=Domain.POSITIVES,
     )
     if not (
@@ -492,7 +537,14 @@ def _gaussian_allocation_fft_remove(
             f"Expected DenseDiscreteDist with LINEAR spacing, "
             f"got {type(base_dist).__name__} with spacing {getattr(base_dist, 'spacing_type', '?')}"
         )
-    base_dist.x_0 -= base_shift
+    base_dist = DenseDiscreteDist(
+        x_0=base_dist.x_0 - base_shift,
+        step=base_dist.step,
+        prob_arr=base_dist.prob_arr,
+        p_min=base_dist.p_min,
+        p_max=base_dist.p_max,
+        domain=base_dist.domain,
+    )
 
     conv_dist_raw = fft_convolve(
         dist_1=dual_convolved_dist,
@@ -500,7 +552,14 @@ def _gaussian_allocation_fft_remove(
         tail_truncation=core_tail,
         bound_type=bound_type,
     )
-    conv_dist_raw.x_0 += (num_steps - 1) * dual_shift + base_shift
+    conv_dist_raw = DenseDiscreteDist(
+        x_0=conv_dist_raw.x_0 + (num_steps - 1) * dual_shift + base_shift,
+        step=conv_dist_raw.step,
+        prob_arr=conv_dist_raw.prob_arr,
+        p_min=conv_dist_raw.p_min,
+        p_max=conv_dist_raw.p_max,
+        domain=conv_dist_raw.domain,
+    )
     exp_geom = rediscretize_dist(
         dist=conv_dist_raw,
         tail_truncation=0.0,
@@ -543,8 +602,7 @@ def _extend_base_grid_for_fft_remove(
     n_extra = int(np.ceil((x_max_target - x_last) / grid.step))
     if n_extra <= 0:
         return grid
-    grid.n += n_extra
-    return grid
+    return replace(grid, n=grid.n + n_extra)
 
 
 # =============================================================================
@@ -620,13 +678,13 @@ def _coarsen_discretization_for_tail_quantile_range(
 
     n_nominal = max(max_points - 2, 2)
     denom = max(n_nominal - 1, 1)
-    if spacing_type == SpacingType.LINEAR and not align_to_multiples:
+    if spacing_type == SpacingType.LINEAR:
         d_induced = float(x_max - x_min) / denom
     elif spacing_type == SpacingType.GEOMETRIC and align_to_multiples:
         d_induced = float(np.log(x_max / x_min)) / denom
     else:
         raise ValueError(
-            "Coarsening is only implemented for LINEAR/align_to_multiples=False "
+            "Coarsening is only implemented for LINEAR "
             f"or GEOMETRIC/align_to_multiples=True, got {spacing_type}, {align_to_multiples}"
         )
 

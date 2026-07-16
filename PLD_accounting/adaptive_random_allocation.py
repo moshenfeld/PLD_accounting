@@ -123,10 +123,7 @@ def optimize_allocation_epsilon_range(
             pld_builder=pld_builder,
         )
         new_upper = float(pld_upper.get_epsilon_for_delta(delta))
-        new_lower = min(
-            float(pld_lower.get_epsilon_for_delta(delta)),
-            new_upper,
-        )
+        new_lower = float(pld_lower.get_epsilon_for_delta(delta))
 
         if new_upper < new_lower:
             raise RuntimeError(

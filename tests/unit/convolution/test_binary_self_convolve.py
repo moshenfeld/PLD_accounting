@@ -7,7 +7,11 @@ import pytest
 
 from PLD_accounting.discrete_dist import DenseDiscreteDist, Domain
 from PLD_accounting.fft_convolution import fft_convolve, fft_self_convolve
-from PLD_accounting.geometric_convolution import geometric_convolve
+from PLD_accounting.geometric_convolution import (
+    _compute_geometric_convolution,
+    geometric_convolve,
+    geometric_self_convolve,
+)
 from PLD_accounting.types import BoundType, SpacingType
 from PLD_accounting.utils import binary_self_convolve
 from tests.test_tolerances import TestTolerances as TOL
@@ -84,6 +88,144 @@ def test_binary_self_convolve_matches_repeated_geometric():
     )
     assert np.allclose(result.x_array, repeated.x_array)
     assert np.allclose(result.prob_arr, repeated.prob_arr, atol=TOL.SPACING_ATOL)
+
+
+def test_binary_self_convolve_accumulates_anchor():
+    """The input anchor is summed through self-composition."""
+    anchors = []
+
+    def convolve(*, dist_1, target_anchor=None, **_kwargs):
+        anchors.append(target_anchor)
+        return dist_1
+
+    dist = _geometric_dist()
+    binary_self_convolve(
+        dist=dist,
+        T=3,
+        lattice_anchor=0.25,
+        tail_truncation=0.0,
+        bound_type=BoundType.DOMINATES,
+        convolve=convolve,
+    )
+
+    assert anchors == [0.5, 0.75]
+
+
+def test_geometric_self_convolve_keeps_anchored_lattice():
+    """Self-convolution returns a ``T * r**k`` grid without shifting its points."""
+    num_summands = 7
+    result = geometric_self_convolve(
+        dist=_geometric_dist(),
+        T=num_summands,
+        tail_truncation=0.0,
+        bound_type=BoundType.DOMINATES,
+        lattice_anchor=1.0,
+    )
+
+    final_anchor = float(num_summands)
+    lower_index = math.log(result.x_0 / final_anchor) / math.log(result.step)
+
+    assert lower_index == pytest.approx(round(lower_index), abs=TOL.SPACING_ATOL)
+
+
+@pytest.mark.parametrize(
+    ("bound_type", "expected_x"),
+    [(BoundType.DOMINATES, 4.0), (BoundType.IS_DOMINATED, 2.0)],
+)
+def test_anchored_convolution_uses_target_lattice(bound_type: BoundType, expected_x: float):
+    """Convolution rounds directly onto ``target_anchor * r**k``."""
+    ratio = 2.0
+    dist_1 = DenseDiscreteDist(
+        x_0=1.0,
+        step=ratio,
+        prob_arr=np.array([1.0]),
+        spacing_type=SpacingType.GEOMETRIC,
+        domain=Domain.POSITIVES,
+    )
+    dist_2 = DenseDiscreteDist(
+        x_0=2.0,
+        step=ratio,
+        prob_arr=np.array([1.0]),
+        spacing_type=SpacingType.GEOMETRIC,
+        domain=Domain.POSITIVES,
+    )
+
+    result = geometric_convolve(
+        dist_1=dist_1,
+        dist_2=dist_2,
+        target_anchor=2.0,
+        tail_truncation=0.0,
+        bound_type=bound_type,
+    )
+
+    np.testing.assert_allclose(result.x_array, np.array([expected_x]))
+    np.testing.assert_allclose(result.prob_arr, np.array([1.0]))
+
+
+def test_anchored_convolution_grid_is_bound_independent():
+    """The output grid covers the sum range independently of mass-rounding direction."""
+    origins_and_pmfs = [
+        _compute_geometric_convolution(
+            origin_1=1.0,
+            pmf_1=np.array([1.0]),
+            origin_2=2.0,
+            pmf_2=np.array([1.0]),
+            ratio=2.0,
+            target_anchor=2.0,
+            bound_type=bound_type,
+        )
+        for bound_type in (BoundType.DOMINATES, BoundType.IS_DOMINATED)
+    ]
+
+    assert origins_and_pmfs[0][0] == 2.0
+    assert origins_and_pmfs[1][0] == 2.0
+    np.testing.assert_array_equal(origins_and_pmfs[0][1], np.array([0.0, 1.0]))
+    np.testing.assert_array_equal(origins_and_pmfs[1][1], np.array([1.0, 0.0]))
+
+
+@pytest.mark.parametrize("step", [1e-3, 1e-4, 1e-5])
+@pytest.mark.parametrize("loss_origin", [-45.0, -5.0])
+def test_diagonal_exact_hits_stay_in_place_at_pld_magnitudes(step: float, loss_origin: float):
+    """Exact-hit diagonal sums keep their bin despite log-space fp noise.
+
+    In a self-squaring convolution every diagonal pair (i, i) sums to exactly
+    ``2 * origin * r**i``, a point of both the unanchored output grid and the
+    summed-anchor lattice. At realistic PLD magnitudes (tiny exp-space origins,
+    fine ratios) the index computation carries fp noise far above machine
+    epsilon, so this guards the snap tolerance against misrouting those hits.
+    """
+    ratio = float(np.exp(step))
+    anchor = 1.0 / 7.0
+    origin_index = math.floor(loss_origin / step)
+    origin = anchor * ratio**origin_index
+    pmf = np.full(4, 0.25)
+
+    # Unanchored: the output grid starts at 2 * origin, so bin 0 must hold
+    # exactly the (0, 0) diagonal mass.
+    _, pmf_out = _compute_geometric_convolution(
+        origin_1=origin,
+        pmf_1=pmf,
+        origin_2=origin,
+        pmf_2=pmf,
+        ratio=ratio,
+        bound_type=BoundType.DOMINATES,
+    )
+    assert pmf_out[0] == pytest.approx(0.0625, abs=0.0)
+
+    # Anchored on the summed lattice: the smallest sum sits exactly on lattice
+    # index ``origin_index``, so its mass must land there, not one bin above.
+    output_origin, pmf_out_anchored = _compute_geometric_convolution(
+        origin_1=origin,
+        pmf_1=pmf,
+        origin_2=origin,
+        pmf_2=pmf,
+        ratio=ratio,
+        bound_type=BoundType.DOMINATES,
+        target_anchor=2.0 * anchor,
+    )
+    first_mass_bin = int(np.argmax(pmf_out_anchored > 0.0))
+    output_origin_index = round(math.log(output_origin / (2.0 * anchor)) / step)
+    assert output_origin_index + first_mass_bin == origin_index
 
 
 def test_binary_self_convolve_preserves_mass_fft():

@@ -60,6 +60,23 @@ Common notes:
 - `BoundType.IS_DOMINATED` gives a lower (optimistic) bound.
 - Builders do not accept `BoundType.BOTH`; build two PLDs if both bounds are needed.
 
+#### Bound type and convolution method support
+
+Not every `ConvolutionMethod` can produce both bounds. Only the geometric backend
+builds the one-step factors in a way that rounds *down* throughout, which is what a
+valid lower bound requires; the FFT routes round up. Passing an unsupported pair
+raises `ValueError` rather than silently returning a bound that does not hold.
+
+| `ConvolutionMethod` | `DOMINATES` (upper) | `IS_DOMINATED` (lower) |
+|---|---|---|
+| `GEOM` | ✅ | ✅ |
+| `FFT` | ✅ | ❌ |
+| `COMBINED` | ✅ | ❌ |
+| `BEST_OF_TWO` | ✅ | ❌ |
+
+This applies to both `Direction.ADD` and `Direction.REMOVE`. Use
+`ConvolutionMethod.GEOM` whenever you need a lower bound.
+
 ### Mechanism PLD Helpers
 
 Factory helpers for building `PLDRealization` inputs from specific mechanisms:
@@ -89,6 +106,9 @@ Subsampling helpers use DOMINATES semantics (upper-bound style).
 ```bash
 pip install PLD_accounting  # distribution name; then: import PLD_accounting
 ```
+
+`numba` is optional. Install `PLD_accounting[performance]` to enable JIT
+kernels; without it, NumPy fallbacks are used and an `ImportWarning` is emitted.
 
 ## Where To Start
 

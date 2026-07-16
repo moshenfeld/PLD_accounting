@@ -99,6 +99,9 @@ def gaussian_allocation_epsilon_configurable(
         params: Privacy parameters with ``params.delta`` set.
         config: Discretization and convolution configuration.
         bound_type: Whether to compute a dominating or dominated bound.
+            ``BoundType.IS_DOMINATED`` is supported only with
+            ``ConvolutionMethod.GEOM``; the FFT-based methods round losses up
+            and cannot produce a valid lower bound, so they raise ``ValueError``.
 
     Returns:
         The epsilon value corresponding to ``params.delta``.
@@ -128,6 +131,9 @@ def gaussian_allocation_delta_configurable(
         params: Privacy parameters with ``params.epsilon`` set.
         config: Discretization and convolution configuration.
         bound_type: Whether to compute a dominating or dominated bound.
+            ``BoundType.IS_DOMINATED`` is supported only with
+            ``ConvolutionMethod.GEOM``; the FFT-based methods round losses up
+            and cannot produce a valid lower bound, so they raise ``ValueError``.
 
     Returns:
         The delta value corresponding to ``params.epsilon``.
@@ -152,12 +158,22 @@ def gaussian_allocation_directional_pld(
     direction: Direction,
     bound_type: BoundType = BoundType.DOMINATES,
 ) -> DenseDiscreteDist:
-    """Compute one directional PLD for Gaussian random-allocation."""
+    """Compute one directional PLD for Gaussian random-allocation.
+
+    ``BoundType.IS_DOMINATED`` is supported only by the GEOM convolution
+    method, for both directions.
+    """
     validate_privacy_params(params)
     validate_allocation_scheme_config(config)
     validate_bound_type(bound_type)
     if direction not in (Direction.ADD, Direction.REMOVE):
         raise ValueError(f"Invalid direction: {direction}")
+
+    if bound_type == BoundType.IS_DOMINATED and config.convolution_method != ConvolutionMethod.GEOM:
+        raise ValueError(
+            "BoundType.IS_DOMINATED is supported only with "
+            f"ConvolutionMethod.GEOM, got {config.convolution_method}"
+        )
 
     if config.convolution_method == ConvolutionMethod.BEST_OF_TWO:
         geom_dist = gaussian_allocation_directional_pld(
@@ -207,6 +223,9 @@ def gaussian_allocation_pld(
             and optional delta/epsilon query target.
         config: Discretization and convolution configuration.
         bound_type: Whether to compute a dominating or dominated discretized bound.
+            ``BoundType.IS_DOMINATED`` is supported only with
+            ``ConvolutionMethod.GEOM``; the FFT-based methods round losses up
+            and cannot produce a valid lower bound, so they raise ``ValueError``.
 
     Returns:
         A ``dp_accounting`` ``PrivacyLossDistribution`` for both privacy directions.

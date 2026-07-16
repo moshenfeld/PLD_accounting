@@ -28,13 +28,44 @@ from PLD_accounting.utils import calc_pld_dual, negate_reverse_linear_distributi
 from tests.test_tolerances import TestTolerances as TOL
 
 
-def _make_realization() -> PLDRealization:
-    return PLDRealization(
-        x_0=-0.5,
+def test_realization_remove_dominates_discretizes_once_at_requested_spacing(monkeypatch):
+    """The upper REMOVE path discretizes only the primary, at the requested spacing."""
+    remove_realization = PLDRealization(
+        x_0=0.0,
         step=0.5,
-        prob_arr=np.array([0.2, 0.3, 0.25, 0.15], dtype=np.float64),
-        p_max=0.1,
+        prob_arr=np.array([0.4, 0.35, 0.25], dtype=np.float64),
     )
+    requested_spacing = 0.25
+    calls = []
+    actual_rediscretize = rediscretize_dist
+
+    def recording_rediscretize(**kwargs):
+        calls.append(kwargs)
+        return actual_rediscretize(**kwargs)
+
+    monkeypatch.setattr(
+        "PLD_accounting.random_allocation_realization.rediscretize_dist",
+        recording_rediscretize,
+    )
+
+    base_dist, neg_dual_dist = realization_remove_base_distributions(
+        realization=remove_realization,
+        loss_discretization=requested_spacing,
+        tail_truncation=0.0,
+        bound_type=BoundType.DOMINATES,
+    )
+    expected_neg_dual = negate_reverse_linear_distribution(calc_pld_dual(base_dist))
+
+    assert len(calls) == 1
+    assert calls[0]["dist"] is remove_realization
+    assert calls[0]["loss_discretization"] == requested_spacing
+    assert base_dist.step == requested_spacing
+    assert neg_dual_dist.step == requested_spacing
+    assert isinstance(base_dist, PLDRealization)
+    np.testing.assert_array_equal(neg_dual_dist.x_array, expected_neg_dual.x_array)
+    np.testing.assert_array_equal(neg_dual_dist.prob_arr, expected_neg_dual.prob_arr)
+    assert neg_dual_dist.p_min == expected_neg_dual.p_min
+    assert neg_dual_dist.p_max == expected_neg_dual.p_max
 
 
 def test_dp_accounting_roundtrip_preserves_mass_and_grid_shape():
@@ -60,6 +91,88 @@ def test_linear_dist_to_dp_accounting_handles_zero_finite_mass():
     pmf = linear_dist_to_dp_accounting_pmf(dist=realization, pessimistic_estimate=True)
     assert pmf._infinity_mass == 1.0
     assert np.allclose(pmf._probs, np.array([0.0, 0.0]))
+
+
+@pytest.mark.parametrize(
+    ("x_0", "pessimistic", "expected_lower"),
+    [
+        # Nearest-lattice rounding would send both 0.49 cases to 0 and both
+        # -0.49 cases to 0, moving losses the wrong way for one bound each time.
+        (0.49, True, 1),
+        (0.49, False, 0),
+        (-0.49, True, 0),
+        (-0.49, False, -1),
+    ],
+)
+def test_linear_adapter_shifts_off_grid_origin_in_bound_direction(
+    x_0: float, pessimistic: bool, expected_lower: int
+):
+    """Off-lattice origins shift up for a dominating PLD and down for a dominated one."""
+    dist = DenseDiscreteDist(x_0=x_0, step=1.0, prob_arr=np.array([1.0]))
+
+    pmf = linear_dist_to_dp_accounting_pmf(
+        dist=dist,
+        pessimistic_estimate=pessimistic,
+    )
+
+    assert pmf._lower_loss == expected_lower
+
+
+@pytest.mark.parametrize("pessimistic", [True, False])
+@pytest.mark.parametrize("x_0", [0.0, np.finfo(np.float64).eps, -np.finfo(np.float64).eps])
+def test_linear_adapter_snaps_an_origin_that_is_aligned_up_to_ulp_noise(
+    x_0: float, pessimistic: bool
+):
+    """A lattice origin carrying float noise must not be rounded a whole step away.
+
+    Regression test: composed grids routinely land on ``x_0 = 2.2e-16`` where an
+    exact ``0.0`` is meant. Rounding that up (DOMINATES) or down (IS_DOMINATED)
+    without snapping first injects a full step of spurious privacy loss, which
+    turned a zero-loss PLD into epsilon ~= 1.
+    """
+    dist = DenseDiscreteDist(x_0=x_0, step=1.0, prob_arr=np.array([1.0]))
+
+    pmf = linear_dist_to_dp_accounting_pmf(dist=dist, pessimistic_estimate=pessimistic)
+
+    assert pmf._lower_loss == 0
+
+
+@pytest.mark.parametrize("x_0", [-0.351, -0.349, -0.375, 0.126])
+@pytest.mark.parametrize("pessimistic", [True, False])
+def test_linear_adapter_preserves_the_bound_between_lattice_knots(x_0: float, pessimistic: bool):
+    """The converted PMF bounds the source hockey-stick curve at every epsilon.
+
+    Regression test for nearest-lattice rounding, which shifted losses by up to
+    half a step in whichever direction happened to be closer and so could report
+    a delta below the truth for DOMINATES (an invalid upper bound) or above it
+    for IS_DOMINATED. The epsilon sweep deliberately falls between lattice knots.
+    """
+    dist = DenseDiscreteDist(
+        x_0=x_0,
+        step=0.1,
+        prob_arr=np.array([0.15, 0.25, 0.3, 0.2, 0.05], dtype=np.float64),
+        p_max=0.05,
+    )
+    epsilons = np.linspace(-0.6, 0.6, 601)
+    true_deltas = np.array(
+        [
+            dist.p_max
+            + math.fsum(
+                float(prob) * -math.expm1(float(epsilon - loss))
+                for loss, prob in zip(dist.x_array, dist.prob_arr, strict=True)
+                if loss > epsilon
+            )
+            for epsilon in epsilons
+        ]
+    )
+
+    pmf = linear_dist_to_dp_accounting_pmf(dist=dist, pessimistic_estimate=pessimistic)
+    deltas = np.asarray(pmf.get_delta_for_epsilon(list(epsilons)), dtype=np.float64)
+
+    if pessimistic:
+        assert np.all(deltas >= true_deltas - TOL.MASS_CONSERVATION)
+    else:
+        assert np.all(deltas <= true_deltas + TOL.MASS_CONSERVATION)
 
 
 def test_dp_accounting_composed_gaussian_add_pmf_converts_with_repair():
@@ -330,5 +443,14 @@ class TestRealizationAdapter:
             x_array=np.array([0.0, 0.5]),
             prob_arr=np.array([0.5, 0.5]),
         )
-        with pytest.raises(TypeError, match="requires DenseDiscreteDist"):
+        with pytest.raises(TypeError, match="expected DenseDiscreteDist with LINEAR spacing"):
             linear_dist_to_dp_accounting_pmf(dist=dist, pessimistic_estimate=True)
+
+
+def _make_realization() -> PLDRealization:
+    return PLDRealization(
+        x_0=-0.5,
+        step=0.5,
+        prob_arr=np.array([0.2, 0.3, 0.25, 0.15], dtype=np.float64),
+        p_max=0.1,
+    )

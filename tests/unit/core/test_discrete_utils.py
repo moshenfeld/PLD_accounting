@@ -10,7 +10,12 @@ import numpy as np
 import pytest
 from scipy import stats
 
-from PLD_accounting.discrete_dist import DenseDiscreteDist, Domain, SparseDiscreteDist
+from PLD_accounting.discrete_dist import (
+    DenseDiscreteDist,
+    Domain,
+    PLDRealization,
+    SparseDiscreteDist,
+)
 from PLD_accounting.distribution_discretization import (
     _compute_discrete_prob as compute_discrete_PMF,
 )
@@ -23,6 +28,7 @@ from PLD_accounting.distribution_discretization import (
     rediscretize_prob as pmf_remap_to_grid_kernel,
 )
 from PLD_accounting.distribution_utils import (
+    PMF_MASS_TOL,
     _zero_mass,
     compute_bin_ratio,
     compute_bin_width,
@@ -34,7 +40,7 @@ from PLD_accounting.utils import _ccdf_from_pmf
 from tests.test_tolerances import TestTolerances as TOL
 
 
-class TestDiscritizeRange:
+class TestDiscretizeRange:
     """Test discretize_aligned_range function."""
 
     def test_linear_spacing(self):
@@ -216,7 +222,7 @@ class TestComputeDiscretePMF:
         dist = stats.uniform(loc=0.0, scale=1.0)
         x_array = np.linspace(0.0, 1.0, 11)
         bin_prob, p_left, p_right = compute_discrete_PMF(
-            dist=dist, x_array=x_array, bound_type=BoundType.DOMINATES, PMF_min_increment=0.0
+            dist=dist, x_array=x_array, bound_type=BoundType.DOMINATES, pmf_min_increment=0.0
         )
 
         assert len(bin_prob) == 10  # n-1 bins
@@ -233,7 +239,7 @@ class TestComputeDiscretePMF:
         # Use more points for strict accuracy
         x_array = np.linspace(-3.0, 3.0, 1001)
         bin_prob, p_left, p_right = compute_discrete_PMF(
-            dist=dist, x_array=x_array, bound_type=BoundType.DOMINATES, PMF_min_increment=0.0
+            dist=dist, x_array=x_array, bound_type=BoundType.DOMINATES, pmf_min_increment=0.0
         )
 
         # Check that probabilities sum with tails to near 1 (strict tolerance)
@@ -245,7 +251,7 @@ class TestComputeDiscretePMF:
         dist = stats.expon(scale=1.0)
         x_array = np.linspace(0.0, 5.0, 51)
         _bin_prob, p_left, p_right = compute_discrete_PMF(
-            dist=dist, x_array=x_array, bound_type=BoundType.DOMINATES, PMF_min_increment=0.0
+            dist=dist, x_array=x_array, bound_type=BoundType.DOMINATES, pmf_min_increment=0.0
         )
 
         # Exponential should have near-zero left tail
@@ -325,6 +331,27 @@ def test_ccdf_from_pmf_padded():
 
 class TestEnforceMassConservation:
     """Test directional boundary enforcement semantics."""
+
+    @pytest.mark.parametrize("bound_type", [BoundType.DOMINATES, BoundType.IS_DOMINATED])
+    def test_tiny_excess_is_renormalized_proportionally(self, bound_type: BoundType) -> None:
+        """Sub-threshold floating-point excess scales every finite bin."""
+        prob_arr = np.array(
+            [0.2, 0.3, 0.5 + PMF_MASS_TOL / 2],
+            dtype=np.float64,
+        )
+        current_mass = math.fsum(map(float, prob_arr))
+        excess = current_mass - 1.0
+        assert 0.0 < excess < PMF_MASS_TOL
+
+        prob_out, _, _ = enforce_mass_conservation(
+            prob_arr=prob_arr,
+            expected_p_min=0.0,
+            expected_p_max=0.0,
+            bound_type=bound_type,
+        )
+
+        expected = prob_arr * (1.0 / current_mass)
+        assert np.array_equal(prob_out, expected)
 
     def test_dominates_can_consume_soft_p_min(self):
         """DOMINATES holds p_max fixed and trims from the left including p_min."""
@@ -510,6 +537,28 @@ class TestRediscretizeBoundaryFolding:
         assert np.isclose(
             math.fsum([*map(float, result.prob_arr), result.p_min, result.p_max]), 1.0
         )
+
+    def test_is_dominated_boundary_fold_downgrades_pld_realization(self):
+        """Folding positive-infinity mass need not remain an exact realization."""
+        dist = PLDRealization(
+            x_0=math.log(0.9),
+            step=0.1,
+            prob_arr=np.array([0.8, 0.1], dtype=np.float64),
+            p_max=0.1,
+        )
+
+        result = rediscretize_dist(
+            dist=dist,
+            tail_truncation=0.0,
+            loss_discretization=0.1,
+            spacing_type=SpacingType.LINEAR,
+            bound_type=BoundType.IS_DOMINATED,
+        )
+
+        assert isinstance(result, DenseDiscreteDist)
+        assert not isinstance(result, PLDRealization)
+        assert result.p_max == 0.0
+        assert math.fsum([*map(float, result.prob_arr), result.p_min]) == pytest.approx(1.0)
 
     def test_dominates_linear_moves_p_min_into_first_finite_cell(self):
         """Dominates linear moves p min into first finite cell."""

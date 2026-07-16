@@ -6,14 +6,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from PLD_accounting.discrete_dist import SparseDiscreteDist
-from PLD_accounting.types import AllocationSchemeConfig, PrivacyParams
-
 # Numba expects a writable cache directory in some environments.
 _DEFAULT_CACHE_DIR = Path(__file__).resolve().parent / ".numba_cache"
 _DEFAULT_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 os.environ["NUMBA_CACHE_DIR"] = str(_DEFAULT_CACHE_DIR)
 os.environ["NUMBA_DISABLE_FILE_SYSTEM_CACHE"] = "1"
+
+from PLD_accounting.discrete_dist import SparseDiscreteDist  # noqa: E402
+from PLD_accounting.types import AllocationSchemeConfig, PrivacyParams  # noqa: E402
 
 
 @pytest.fixture

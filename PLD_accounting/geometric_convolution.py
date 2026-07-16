@@ -5,7 +5,6 @@ from __future__ import annotations
 import math
 
 import numpy as np
-from numba import njit
 from numpy.typing import NDArray
 
 from PLD_accounting.discrete_dist import DenseDiscreteDist, Domain
@@ -13,16 +12,17 @@ from PLD_accounting.distribution_utils import (
     enforce_mass_conservation,
     stable_isclose,
 )
-from PLD_accounting.types import BoundType, SpacingType
-from PLD_accounting.utils import (
-    binary_self_convolve,
-    convolve_boundary_masses,
-)
+from PLD_accounting.types import BoundType, SpacingType, has_numba, optional_njit
+from PLD_accounting.utils import binary_self_convolve, convolve_boundary_masses
 from PLD_accounting.validation import validate_bound_type
 
-# Rounding tolerance for grid bin mapping — must stay at machine-epsilon scale
-# to avoid misrouting mass between bins.
-_GRID_ROUNDING_TOL = 10 * np.finfo(np.float64).eps
+# Snap tolerance, in units of output bins, for mapping pairwise sums to grid
+# indices. Log-space index computations carry absolute fp noise of up to
+# ~|log(x / anchor)| * eps / log(ratio) ~ 1e-9 bins at realistic PLD magnitudes,
+# so exact lattice hits need a tolerance above that to stay in their bin. A
+# false snap misplaces mass by at most a factor ratio**tol ~ 1 + 1e-12, and an
+# unsnapped hit still rounds in the conservative direction for its bound type.
+_BIN_SNAP_TOL = 1e-8
 
 # =============================================================================
 # PUBLIC API
@@ -35,12 +35,19 @@ def geometric_convolve(
     dist_2: DenseDiscreteDist,
     tail_truncation: float,
     bound_type: BoundType,
+    target_anchor: float | None = None,
 ) -> DenseDiscreteDist:
     """Convolve two geometric-grid distributions.
 
-    A wrapper of Algorithm 4 (`conv`).
+    A wrapper of Algorithm 4 (`conv`), in
+    Appendix C of https://arxiv.org/abs/2602.17284.
     For POSITIVES-domain distributions the 0 atom is neutral (not absorbing),
     so cross-terms (0 + finite and finite + 0) are added to the finite PMF.
+
+    If ``target_anchor`` is provided, the output lies on its ``target_anchor * r**k``
+    lattice. Rounding is directional for the bound type either way, so validity never
+    requires the inputs to sit on any particular lattice; input alignment only sharpens
+    the result by keeping exact-hit sums in their bin.
     """
     # Input validation
     if not (
@@ -61,7 +68,6 @@ def geometric_convolve(
         )
     if tail_truncation < 0:
         raise ValueError(f"tail_truncation must be non-negative, got {tail_truncation}")
-
     # Ensure both inputs share the same growth factor.
     if not stable_isclose(a=dist_1.step, b=dist_2.step):
         raise ValueError(
@@ -69,24 +75,27 @@ def geometric_convolve(
         )
     ratio = dist_1.step
 
+    if target_anchor is not None and target_anchor <= 0:
+        raise ValueError(f"target_anchor must be positive, got {target_anchor}")
+
     # Core Numeric Convolution
-    x_out, pmf_conv = _compute_geometric_convolution(
-        x1=dist_1.x_array,
-        p1=dist_1.prob_arr,
-        x2=dist_2.x_array,
-        p2=dist_2.prob_arr,
-        r=ratio,
+    output_origin, pmf_conv = _compute_geometric_convolution(
+        origin_1=dist_1.x_0,
+        pmf_1=dist_1.prob_arr,
+        origin_2=dist_2.x_0,
+        pmf_2=dist_2.prob_arr,
+        ratio=ratio,
         bound_type=bound_type,
+        target_anchor=target_anchor,
     )
 
     # Add cross-terms from the 0 atom
-    x_out_0 = float(x_out[0])
     pmf_conv = _add_single_zero_atom_cross_term(
         pmf_conv=pmf_conv,
         x_arr=dist_2.x_array,
         prob_arr=dist_2.prob_arr,
         zero_prob=dist_1.p_min,
-        x_out_0=x_out_0,
+        x_out_0=output_origin,
         r=ratio,
         bound_type=bound_type,
     )
@@ -95,7 +104,7 @@ def geometric_convolve(
         x_arr=dist_1.x_array,
         prob_arr=dist_1.prob_arr,
         zero_prob=dist_2.p_min,
-        x_out_0=x_out_0,
+        x_out_0=output_origin,
         r=ratio,
         bound_type=bound_type,
     )
@@ -112,7 +121,7 @@ def geometric_convolve(
     )
 
     return DenseDiscreteDist(
-        x_0=float(x_out[0]),
+        x_0=output_origin,
         step=ratio,
         prob_arr=pmf_conv,
         p_min=p_min,
@@ -128,29 +137,40 @@ def geometric_self_convolve(
     T: int,
     tail_truncation: float,
     bound_type: BoundType,
+    lattice_anchor: float | None = None,
 ) -> DenseDiscreteDist:
-    """Self-convolve distribution T times using binary exponentiation."""
+    """Self-convolve using either ordinary or anchored binary composition.
+
+    When ``lattice_anchor`` is provided, the input grid is interpreted as
+    ``lattice_anchor * r**k`` and each intermediate output uses the summed-anchor
+    lattice. Precondition: ``dist.x_0`` should lie on that lattice (up to fp noise);
+    a misaligned input still yields a valid bound, but the output no longer sits on
+    the claimed ``T * lattice_anchor * r**k`` grid.
+    """
     # Input validation
     if not (isinstance(dist, DenseDiscreteDist) and dist.spacing_type == SpacingType.GEOMETRIC):
-        raise TypeError(f"dist must be DenseDiscreteDist, got {type(dist)}")
+        spacing = getattr(dist, "spacing_type", "?")
+        raise TypeError(
+            "geometric_self_convolve requires DenseDiscreteDist input: "
+            "expected DenseDiscreteDist with GEOMETRIC spacing, "
+            f"got {type(dist).__name__} with spacing {spacing}"
+        )
     validate_bound_type(bound_type)
     if T < 1:
         raise ValueError(f"T must be >= 1, got {T}")
     if tail_truncation < 0:
         raise ValueError(f"tail_truncation must be non-negative, got {tail_truncation}")
+    if lattice_anchor is not None and lattice_anchor <= 0:
+        raise ValueError(f"lattice_anchor must be positive, got {lattice_anchor}")
 
-    self_conv = binary_self_convolve(
+    return binary_self_convolve(
         dist=dist,
         T=T,
         tail_truncation=tail_truncation,
         bound_type=bound_type,
         convolve=geometric_convolve,
+        lattice_anchor=lattice_anchor,
     )
-    if not (
-        isinstance(self_conv, DenseDiscreteDist) and self_conv.spacing_type == SpacingType.GEOMETRIC
-    ):
-        raise TypeError(f"Expected DenseDiscreteDist from self-convolution, got {type(self_conv)}")
-    return self_conv
 
 
 # =============================================================================
@@ -160,164 +180,170 @@ def geometric_self_convolve(
 
 def _compute_geometric_convolution(
     *,
-    x1: NDArray[np.float64],
-    p1: NDArray[np.float64],
-    x2: NDArray[np.float64],
-    p2: NDArray[np.float64],
-    r: float,
+    origin_1: float,
+    pmf_1: NDArray[np.float64],
+    origin_2: float,
+    pmf_2: NDArray[np.float64],
+    ratio: float,
     bound_type: BoundType,
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    target_anchor: float | None = None,
+) -> tuple[float, NDArray[np.float64]]:
     """Align grids, compute bin mapping parameters, and invoke the Numba kernel.
 
-    Algorithm 4 (`conv`) with internal Algorithm 5 (`range-renorm`).
+    Algorithm 4 (`conv`), with internal
+    Algorithm 5 (`range-renorm`),
+    in Appendix C of https://arxiv.org/abs/2602.17284.
+
+    Each geometric support is fully specified by its origin, shared ratio, and
+    PMF length, so materialized input grids are unnecessary.
     """
     # --- A. Standardization (Swap & Pad) ---
-    # We normalize such that x_base (x1) starts at the lower value.
-    # This ensures scale = x2[0]/x1[0] >= 1, simplifying log calculations.
+    # Keep the lower-origin distribution first to match the kernel's two orientations.
+    if origin_1 > origin_2:
+        origin_1, pmf_1, origin_2, pmf_2 = origin_2, pmf_2, origin_1, pmf_1
 
-    # 1. Swap if necessary so x1[0] <= x2[0]
-    if x1[0] > x2[0]:
-        x1, p1, x2, p2 = x2, p2, x1, p1
+    smallest_sum = origin_1 + origin_2
+    largest_sum = origin_1 * ratio ** (pmf_1.size - 1) + origin_2 * ratio ** (pmf_2.size - 1)
 
-    # 2. Calculate Scale (Relative Offset)
-    scale = x2[0] / x1[0]
+    # The kernel requires equal PMF lengths; missing high-grid bins have zero mass.
+    num_bins = max(pmf_1.size, pmf_2.size)
+    pmf_1 = np.pad(pmf_1, (0, num_bins - pmf_1.size), mode="constant")
+    pmf_2 = np.pad(pmf_2, (0, num_bins - pmf_2.size), mode="constant")
 
-    # 3. Equalize Lengths (Right-Padding)
-    # The Numba kernel assumes arrays of equal length 'n'.
-    target_n = max(x1.size, x2.size)
-    if x1.size < target_n:
-        x1, p1 = _pad_right_geometric(
-            x=x1,
-            p=p1,
-            r=r,
-            target_n=target_n,
-        )
-    elif x2.size < target_n:
-        x2, p2 = _pad_right_geometric(
-            x=x2,
-            p=p2,
-            r=r,
-            target_n=target_n,
-        )
-
-    # Convert to float64 for Numba compatibility
-    x_base = x1.astype(np.float64, copy=False)
-    pmf_base = p1.astype(np.float64, copy=False)
-    pmf_scaled = p2.astype(np.float64, copy=False)
+    # Convert to float64 for Numba compatibility.
+    lower_pmf = pmf_1.astype(np.float64, copy=False)
+    upper_pmf = pmf_2.astype(np.float64, copy=False)
 
     # --- B. Grid Mapping Parameters ---
-    n = x_base.size
+    log_ratio = np.log(ratio)
 
-    # Edge case: Single point
-    if n == 1:
-        mass = pmf_base[0] * pmf_scaled[0]
-        x_out = np.array([(scale + 1.0) * x_base[0]], dtype=np.float64)
-        pmf_out = np.array([mass], dtype=np.float64)
-        return x_out, pmf_out
+    # Use one bound-independent grid covering the complete input-grid sum range.
+    # When anchored, start at the lattice point at or below the smallest sum.
+    # smallest_sum_offset re-expresses the smallest sum in bins from that
+    # origin, reusing the same unrounded index so every later snap decision
+    # stays consistent with the floor taken here.
+    output_origin = smallest_sum
+    smallest_sum_offset = 0.0
+    if target_anchor is not None:
+        smallest_sum_index = math.log(smallest_sum / target_anchor) / log_ratio
+        output_index = math.floor(smallest_sum_index + _BIN_SNAP_TOL)
+        output_origin = target_anchor * ratio**output_index
+        smallest_sum_offset = smallest_sum_index - output_index
 
-    # Calculate shift parameters (delta)
-    log_r = np.log(r)
-    log_scale = np.log(scale)
-    log_ap1 = np.log(scale + 1.0)
+    # End at the lattice point at or above the largest sum.
+    last_output_index = math.ceil(
+        math.log(largest_sum / smallest_sum) / log_ratio + smallest_sum_offset - _BIN_SNAP_TOL
+    )
+    num_output_bins = last_output_index + 1
 
-    # Vectorized calculation for d=1..n-1
-    d_vec = np.arange(n, dtype=np.float64)
-    log_r_d = d_vec * log_r
+    index_differences = np.arange(num_bins, dtype=np.float64)
+    log_ratio_offsets = index_differences * log_ratio
+    # Normalized origin weights (w_1 + w_2 = 1) keep the log arguments O(1):
+    # (origin_1 + origin_2 * r**d) / smallest_sum = w_1 + w_2 * r**d, so the
+    # d = 0 diagonal offset is log(w_1 + w_2) ~ 0 to fp precision regardless of
+    # the origins' magnitudes, and exact lattice hits stay inside snap range.
+    log_weight_1 = np.log(origin_1 / smallest_sum)
+    log_weight_2 = np.log(origin_2 / smallest_sum)
 
-    log_lohi = np.logaddexp(0.0, log_scale + log_r_d)  # log(1 + scale*r^d)
-    tau_lohi = (log_lohi - log_ap1) / log_r
+    # For an index difference d, the pair can occur in either orientation.
+    # Measure both sums in output-grid bins from output_origin.
+    low_high_grid_offsets = (
+        np.logaddexp(log_weight_1, log_weight_2 + log_ratio_offsets) / log_ratio
+        + smallest_sum_offset
+    )
+    high_low_grid_offsets = (
+        np.logaddexp(log_weight_2, log_weight_1 + log_ratio_offsets) / log_ratio
+        + smallest_sum_offset
+    )
 
-    log_hilo = np.logaddexp(log_scale, log_r_d)  # log(scale + r^d)
-    tau_hilo = (log_hilo - log_ap1) / log_r
-
-    # Rounding strategy
-    delta_lohi = np.zeros(n, dtype=np.int64)
-    delta_hilo = np.zeros(n, dtype=np.int64)
-    rounding_eps = _GRID_ROUNDING_TOL
-
+    # Bound type affects only mass allocation, not output-grid construction.
     if bound_type == BoundType.DOMINATES:
-        # Pessimistic: Round UP
-        delta_lohi[1:] = np.ceil(tau_lohi[1:] - rounding_eps).astype(np.int64)
-        delta_hilo[1:] = np.ceil(tau_hilo[1:] - rounding_eps).astype(np.int64)
+        # A dominating discretization rounds each sum up to the next output bin.
+        low_high_bin_offsets = np.ceil(low_high_grid_offsets - _BIN_SNAP_TOL).astype(np.int64)
+        high_low_bin_offsets = np.ceil(high_low_grid_offsets - _BIN_SNAP_TOL).astype(np.int64)
     elif bound_type == BoundType.IS_DOMINATED:
-        # Optimistic: Round DOWN
-        delta_lohi[1:] = np.floor(tau_lohi[1:] + rounding_eps).astype(np.int64)
-        delta_hilo[1:] = np.floor(tau_hilo[1:] + rounding_eps).astype(np.int64)
+        # A dominated discretization rounds each sum down to the previous output bin.
+        low_high_bin_offsets = np.floor(low_high_grid_offsets + _BIN_SNAP_TOL).astype(np.int64)
+        high_low_bin_offsets = np.floor(high_low_grid_offsets + _BIN_SNAP_TOL).astype(np.int64)
     else:
         raise ValueError(f"Unknown BoundType: {bound_type}")
 
     # --- C. Kernel Execution ---
-    pmf_out = _numba_geometric_kernel(
-        PMF_base=pmf_base,
-        PMF_scaled=pmf_scaled,
-        delta_lohi=delta_lohi,
-        delta_hilo=delta_hilo,
+    pmf_out = _geometric_kernel(
+        PMF_base=lower_pmf,
+        PMF_scaled=upper_pmf,
+        delta_lohi=low_high_bin_offsets,
+        delta_hilo=high_low_bin_offsets,
+        output_size=num_output_bins,
     )
 
-    # Construct output X grid: x_out = x_base * (1 + scale)
-    x_out = x_base * (scale + 1.0)
-
-    return x_out, pmf_out
+    return output_origin, pmf_out
 
 
-def _pad_right_geometric(
+def _geometric_kernel(
     *,
-    x: NDArray[np.float64],
-    p: NDArray[np.float64],
-    r: float,
-    target_n: int,
-) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
-    """Extend grid to the right to reach target_n using ratio r."""
-    x = np.asarray(x, dtype=np.float64)
-    p = np.asarray(p, dtype=np.float64)
-    n = x.size
-    if n >= target_n:
-        return x, p
+    PMF_base: NDArray[np.float64],
+    PMF_scaled: NDArray[np.float64],
+    delta_lohi: NDArray[np.int64],
+    delta_hilo: NDArray[np.int64],
+    output_size: int,
+) -> NDArray[np.float64]:
+    """Dispatch geometric convolution to numba when available, else NumPy."""
+    if has_numba():
+        return _numba_geometric_kernel(
+            PMF_base=PMF_base,
+            PMF_scaled=PMF_scaled,
+            delta_lohi=delta_lohi,
+            delta_hilo=delta_hilo,
+            output_size=output_size,
+        )
+    return _numpy_geometric_kernel(
+        PMF_base=PMF_base,
+        PMF_scaled=PMF_scaled,
+        delta_lohi=delta_lohi,
+        delta_hilo=delta_hilo,
+        output_size=output_size,
+    )
 
-    k = target_n - n
-    if r == 1.0:
-        tail = np.full(k, x[-1], dtype=np.float64)
-    else:
-        tail = x[-1] * (r ** np.arange(1, k + 1, dtype=np.float64))
 
-    x_ext = np.concatenate([x, tail])
-    p_ext = np.pad(p, (0, k), mode="constant")
-    return x_ext, p_ext
-
-
-@njit(cache=True)
+@optional_njit()
 def _numba_geometric_kernel(
     *,
     PMF_base: NDArray[np.float64],
     PMF_scaled: NDArray[np.float64],
     delta_lohi: NDArray[np.int64],
     delta_hilo: NDArray[np.int64],
+    output_size: int,
 ) -> NDArray[np.float64]:
-    """Core convolution loop.
+    """Core convolution loop with compensated summation.
 
-    Calculates Z = X + Y by iterating over the difference 'd' between indices.
-
+    The diagonal ``d = 0`` is counted once and shifted to its rounded bin.
+    For ``d > 0`` both orderings ``(i, i + d)`` and ``(i + d, i)`` are
+    scattered to their rounded output bins.
     """
     n = PMF_base.size
-    pmf_out = np.zeros(n, dtype=np.float64)
-    comp = np.zeros(n, dtype=np.float64)
+    pmf_out = np.zeros(output_size, dtype=np.float64)
+    comp = np.zeros(output_size, dtype=np.float64)
 
+    diagonal_shift = delta_lohi[0]
     for i in range(n):
+        k = i + diagonal_shift
         mass = PMF_base[i] * PMF_scaled[i]
-        y = mass - comp[i]
-        t = pmf_out[i] + y
-        comp[i] = (t - pmf_out[i]) - y
-        pmf_out[i] = t
+        if 0 <= k < output_size:
+            y = mass - comp[k]
+            t = pmf_out[k] + y
+            comp[k] = (t - pmf_out[k]) - y
+            pmf_out[k] = t
 
     for d in range(1, n):
         imax = n - d
-        kshift1 = int(delta_lohi[d])
-        kshift2 = int(delta_hilo[d])
+        kshift1 = delta_lohi[d]
+        kshift2 = delta_hilo[d]
 
         for i in range(imax):
             k1 = i + kshift1
             mass1 = PMF_base[i] * PMF_scaled[i + d]
-            if 0 <= k1 < n:
+            if 0 <= k1 < output_size:
                 y = mass1 - comp[k1]
                 t = pmf_out[k1] + y
                 comp[k1] = (t - pmf_out[k1]) - y
@@ -325,12 +351,45 @@ def _numba_geometric_kernel(
 
             k2 = i + kshift2
             mass2 = PMF_base[i + d] * PMF_scaled[i]
-            if 0 <= k2 < n:
+            if 0 <= k2 < output_size:
                 y = mass2 - comp[k2]
                 t = pmf_out[k2] + y
                 comp[k2] = (t - pmf_out[k2]) - y
                 pmf_out[k2] = t
 
+    return pmf_out
+
+
+def _numpy_geometric_kernel(
+    *,
+    PMF_base: NDArray[np.float64],
+    PMF_scaled: NDArray[np.float64],
+    delta_lohi: NDArray[np.int64],
+    delta_hilo: NDArray[np.int64],
+    output_size: int,
+) -> NDArray[np.float64]:
+    """Numpy fallback for the geometric convolution kernel."""
+    n = PMF_base.size
+    pmf_out = np.zeros(output_size, dtype=np.float64)
+    diagonal_indices = np.arange(n) + delta_lohi[0]
+    valid_diagonal = (0 <= diagonal_indices) & (diagonal_indices < output_size)
+    np.add.at(
+        pmf_out,
+        diagonal_indices[valid_diagonal],
+        (PMF_base * PMF_scaled)[valid_diagonal],
+    )
+    for d in range(1, n):
+        imax = n - d
+        base_idx = np.arange(imax)
+        k1 = base_idx + delta_lohi[d]
+        mass1 = PMF_base[:imax] * PMF_scaled[d:]
+        valid1 = (0 <= k1) & (k1 < output_size)
+        np.add.at(pmf_out, k1[valid1], mass1[valid1])
+
+        k2 = base_idx + delta_hilo[d]
+        mass2 = PMF_base[d:] * PMF_scaled[:imax]
+        valid2 = (0 <= k2) & (k2 < output_size)
+        np.add.at(pmf_out, k2[valid2], mass2[valid2])
     return pmf_out
 
 
@@ -348,50 +407,21 @@ def _add_single_zero_atom_cross_term(
     if zero_prob == 0.0:
         return pmf_conv
 
-    return _numba_add_single_zero_atom_cross_term(
-        pmf_out=pmf_conv,
-        x_vals=np.asarray(x_arr, dtype=np.float64),
-        prob_arr=np.asarray(prob_arr, dtype=np.float64),
-        zero_prob=float(zero_prob),
-        x_out_0=float(x_out_0),
-        log_r=float(math.log(r)),
-        dominates=(bound_type == BoundType.DOMINATES),
-    )
+    x_vals = np.asarray(x_arr, dtype=np.float64)
+    masses = np.asarray(prob_arr, dtype=np.float64) * float(zero_prob)
+    valid = (masses > 0.0) & (x_vals > 0.0)
+    if not np.any(valid):
+        return pmf_conv
 
+    frac_k = np.log(x_vals[valid] / float(x_out_0)) / float(math.log(r))
+    if bound_type == BoundType.DOMINATES:
+        k = np.ceil(frac_k - _BIN_SNAP_TOL).astype(np.int64)
+        k = np.maximum(k, 0)
+    elif bound_type == BoundType.IS_DOMINATED:
+        k = np.floor(frac_k + _BIN_SNAP_TOL).astype(np.int64)
+    else:
+        raise ValueError(f"Unknown BoundType: {bound_type}")
 
-@njit(cache=True)
-def _numba_add_single_zero_atom_cross_term(
-    *,
-    pmf_out: NDArray[np.float64],
-    x_vals: NDArray[np.float64],
-    prob_arr: NDArray[np.float64],
-    zero_prob: float,
-    x_out_0: float,
-    log_r: float,
-    dominates: bool,
-) -> NDArray[np.float64]:
-    """Core loop for one 0+finite cross-term family."""
-    n = pmf_out.size
-
-    for i in range(prob_arr.size):
-        weight = prob_arr[i] * zero_prob
-        if weight == 0.0:
-            continue
-
-        x = x_vals[i]
-        if x <= 0.0:
-            continue
-
-        frac_k = math.log(x / x_out_0) / log_r
-        if dominates:
-            k = int(math.ceil(frac_k - _GRID_ROUNDING_TOL))
-        else:
-            k = int(math.floor(frac_k + _GRID_ROUNDING_TOL))
-
-        if 0 <= k < n:
-            pmf_out[k] += weight
-        elif k < 0 and dominates:
-            # Upper-bound rounding maps sub-grid mass to the first finite bin.
-            pmf_out[0] += weight
-
-    return pmf_out
+    in_range = (0 <= k) & (k < pmf_conv.size)
+    np.add.at(pmf_conv, k[in_range], masses[valid][in_range])
+    return pmf_conv

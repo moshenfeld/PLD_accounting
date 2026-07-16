@@ -36,17 +36,6 @@ Or run explicit paths, for example:
 pytest tests_extended/integration/test_pld_realizations.py -q
 ```
 
-## Legacy implementation tests
-
-Tests for the frozen reference implementation under `legacy/PLD_accounting/` are in `legacy/tests/`. Use an explicit path and set `PYTHONPATH` so `PLD_accounting` resolves to `legacy/PLD_accounting` and the in-tree `tests` package wins over any site-packages `tests`:
-
-```bash
-PYTHONPATH=legacy/tests:legacy \
-  pytest legacy/tests -q --import-mode=importlib --confcutdir=legacy/tests
-```
-
-Install runtime and test dependencies with `pip install -r experiments/requirements.txt` (not a separate `legacy/requirements.txt`).
-
 ## Markers
 
 Markers are defined in `public/pytest.ini` (on GitHub that file lives at the repository root). The private monorepo’s root `pytest.ini` repeats them for `public/tests` and `tests_extended` discovery. Keep expensive tests marked `slow` / `nightly` where appropriate.

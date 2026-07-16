@@ -132,7 +132,6 @@ def allocation_directional_pld(
     dist_floor, dist_ceil = _align_component_grids(
         dist_floor=dist_floor,
         dist_ceil=dist_ceil,
-        tail_truncation=tail_truncation,
         bound_type=bound_type,
     )
     return fft_convolve(
@@ -188,7 +187,7 @@ def geometric_allocation_pld_base_remove(
     if num_steps == 1:
         return base
 
-    # Subtract the average loss
+    # Normalize each factor by num_steps before moving to exp-space.
     log_num_steps = float(np.log(num_steps))
     centered_neg_dual = DenseDiscreteDist(
         x_0=neg_dual_base.x_0 - log_num_steps,
@@ -208,6 +207,7 @@ def geometric_allocation_pld_base_remove(
     # Factor preparation in exp-space.
     exp_neg_dual = exp_linear_to_geometric(centered_neg_dual)
     exp_base = exp_linear_to_geometric(centered_base)
+    factor_anchor = 1.0 / num_steps
 
     # V_{t-1} <- self-conv(V1, t-1, ...).
     exp_convolved_dual = geometric_self_convolve(
@@ -215,15 +215,17 @@ def geometric_allocation_pld_base_remove(
         T=num_steps - 1,
         tail_truncation=tail_truncation,
         bound_type=bound_type,
+        lattice_anchor=factor_anchor,
     )
-    # U_t <- conv(V_{t-1}, U1, ...).
+    # U_t <- conv(V_{t-1}, U1, ...). The T normalized factors sum to anchor 1.
     exp_convolved = geometric_convolve(
         dist_1=exp_convolved_dual,
         dist_2=exp_base,
         tail_truncation=tail_truncation,
         bound_type=bound_type,
+        target_anchor=1.0,
     )
-    # L_t <- log(U_t).
+    # The composed anchor is one, so the log-grid is aligned to zero loss.
     return log_geometric_to_linear(exp_convolved)
 
 
@@ -270,9 +272,8 @@ def geometric_allocation_pld_base_add(
     if num_steps == 1:
         return base
 
-    log_num_steps = float(np.log(num_steps))
-
     neg_base = negate_reverse_linear_distribution(base)
+    log_num_steps = float(np.log(num_steps))
     centered_neg_base = DenseDiscreteDist(
         x_0=neg_base.x_0 - log_num_steps,
         step=neg_base.step,
@@ -292,8 +293,9 @@ def geometric_allocation_pld_base_add(
         T=num_steps,
         tail_truncation=tail_truncation,
         bound_type=exp_bound_type,
+        lattice_anchor=1.0 / num_steps,
     )
-    # L_t <- -log(U_t).
+    # The composed anchor is one, so the log-grid is aligned to zero loss.
     log_dist = log_geometric_to_linear(exp_convolved)
     return negate_reverse_linear_distribution(log_dist)
 
@@ -374,7 +376,6 @@ def _align_component_grids(
     *,
     dist_floor: DenseDiscreteDist,
     dist_ceil: DenseDiscreteDist,
-    tail_truncation: float,
     bound_type: BoundType,
 ) -> tuple[DenseDiscreteDist, DenseDiscreteDist]:
     """Fallback-align floor/ceil grids before the final ``fft_convolve``.
@@ -393,7 +394,9 @@ def _align_component_grids(
     if dist_floor.step < target_step:
         dist_floor = rediscretize_dist(
             dist=dist_floor,
-            tail_truncation=tail_truncation,
+            # Alignment is a pure directional projection; tail mass was already
+            # budgeted by the component builders and must not be spent again.
+            tail_truncation=0.0,
             loss_discretization=target_step,
             spacing_type=SpacingType.LINEAR,
             bound_type=bound_type,
@@ -401,7 +404,7 @@ def _align_component_grids(
     else:
         dist_ceil = rediscretize_dist(
             dist=dist_ceil,
-            tail_truncation=tail_truncation,
+            tail_truncation=0.0,
             loss_discretization=target_step,
             spacing_type=SpacingType.LINEAR,
             bound_type=bound_type,

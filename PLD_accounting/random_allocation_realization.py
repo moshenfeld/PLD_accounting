@@ -17,7 +17,7 @@ def realization_remove_base_distributions(
 ) -> tuple[DenseDiscreteDist, DenseDiscreteDist]:
     """Prepare remove-direction factors from a loss-space realization.
 
-    Algorithm 1 (`rand-alloc-rem`).
+    Algorithm 1 (`rand-alloc-rem`), in Appendix C of https://arxiv.org/abs/2602.17284.
 
     Args:
         realization: REMOVE-direction realization in linear loss space.
@@ -26,31 +26,26 @@ def realization_remove_base_distributions(
         bound_type: Bound direction.
 
     Returns:
-        Tuple ``(base, dual_base)`` aligned to the requested linear grid.
+        Tuple ``(base, dual_base)`` with the requested linear-grid spacing.
 
     """
     # Since dual can be derived only from a PLD realization, discretization can
     # come first for DOMINATES, but dual derivation must come first for IS_DOMINATED.
+    # NOTE: the DOMINATES path slightly differs from Algorithm 1 in the paper (which
+    # dualizes the input first): here we discretize first and take the exact dual of
+    # the discretized base, avoiding a second discretization of the dual and thus
+    # improving accuracy. Both remain valid upper bounds.
     if bound_type == BoundType.DOMINATES:
-        # Avoid inflating the grid when the target is finer than the original one.
-        effective_disc = max(realization.step, loss_discretization)
-        coarsened_base = rediscretize_dist(
+        discrete_base = rediscretize_dist(
             dist=realization,
             tail_truncation=tail_truncation,
-            loss_discretization=effective_disc,
+            loss_discretization=loss_discretization,
             spacing_type=SpacingType.LINEAR,
             bound_type=bound_type,
         )
-        if not (
-            isinstance(coarsened_base, DenseDiscreteDist)
-            and coarsened_base.spacing_type == SpacingType.LINEAR
-        ):
-            _st = getattr(coarsened_base, "spacing_type", "?")
-            raise TypeError(
-                "Expected DenseDiscreteDist with LINEAR spacing, "
-                f"got {type(coarsened_base).__name__} with spacing {_st}"
-            )
-        base_realization = PLDRealization.from_linear_dist(coarsened_base)
+        # Conversion validates the real domain, zero negative-infinity mass,
+        # and reciprocal exponential-moment condition before dualization.
+        base_realization = PLDRealization.from_linear_dist(discrete_base)
         neg_dual_dist = negate_reverse_linear_distribution(calc_pld_dual(base_realization))
         return base_realization, neg_dual_dist
 
@@ -75,15 +70,6 @@ def realization_remove_base_distributions(
         spacing_type=SpacingType.LINEAR,
         bound_type=bound_type,
     )
-    if not (
-        isinstance(lower_base_dist, DenseDiscreteDist)
-        and lower_base_dist.spacing_type == SpacingType.LINEAR
-    ):
-        _st = getattr(lower_base_dist, "spacing_type", "?")
-        raise TypeError(
-            "Expected DenseDiscreteDist with LINEAR spacing, "
-            f"got {type(lower_base_dist).__name__} with spacing {_st}"
-        )
     neg_dual_dist = rediscretize_dist(
         dist=neg_dual_linear,
         tail_truncation=tail_truncation,
@@ -112,7 +98,7 @@ def realization_add_base_distribution(
 ) -> DenseDiscreteDist:
     """Prepare add-direction factors from a loss-space realization.
 
-    Algorithm 2 (`rand-alloc-add`).
+    Algorithm 2 (`rand-alloc-add`), in Appendix C of https://arxiv.org/abs/2602.17284.
 
     Args:
         realization: ADD-direction realization in linear loss space.

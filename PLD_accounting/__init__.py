@@ -29,6 +29,7 @@ from PLD_accounting.types import (
     Direction,
     PrivacyParams,
     SpacingType,
+    has_numba,
 )
 
 __all__ = [
@@ -41,6 +42,7 @@ __all__ = [
     "Direction",
     "PrivacyParams",
     "SpacingType",
+    "has_numba",
     "compose_full_pld",
     "gaussian_allocation_directional_pld",
     "gaussian_allocation_pld",

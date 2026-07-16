@@ -5,19 +5,10 @@ import math
 import numpy as np
 import pytest
 
-from PLD_accounting.discrete_dist import SparseDiscreteDist
+from PLD_accounting.discrete_dist import DenseDiscreteDist
 from PLD_accounting.types import BoundType
 from PLD_accounting.utils import combine_distributions
 from tests.test_tolerances import TestTolerances as TOL
-
-
-def _make_dist(x_values, probs, p_max=0.0, p_min=0.0):
-    return SparseDiscreteDist(
-        x_array=np.array(x_values, dtype=np.float64),
-        prob_arr=np.array(probs, dtype=np.float64),
-        p_min=p_min,
-        p_max=p_max,
-    )
 
 
 def test_combine_distributions_rejects_mismatched_grids():
@@ -81,3 +72,14 @@ def test_combine_distributions_is_dominated_takes_exact_min_p_min():
     assert np.isclose(combined.p_min, 0.05)
     total = math.fsum([combined.p_min, *map(float, combined.prob_arr), combined.p_max])
     assert np.isclose(total, 1.0)
+
+
+def _make_dist(x_values, probs, p_max=0.0, p_min=0.0):
+    x_array = np.array(x_values, dtype=np.float64)
+    return DenseDiscreteDist(
+        x_0=float(x_array[0]),
+        step=float(x_array[1] - x_array[0]),
+        prob_arr=np.array(probs, dtype=np.float64),
+        p_min=p_min,
+        p_max=p_max,
+    )

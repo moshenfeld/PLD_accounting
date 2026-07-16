@@ -5,6 +5,9 @@ This document describes the internal structure of `PLD_accounting` and how the i
 For user-facing examples, see [README.md](README.md) and
 [PLD_accounting_tutorial.ipynb](PLD_accounting_tutorial.ipynb).
 
+`numba` is an optional performance dependency. The implementation dispatches to
+NumPy fallbacks when it is unavailable.
+
 ## Paper-Aligned Semantics
 
 The package follows the `k`-out-of-`t` random-allocation language:
@@ -249,7 +252,7 @@ The module tracks best upper/lower bounds across iterations and returns `Adaptiv
 - `subsample_pld(pld, sampling_probability)`
 - `subsample_pld_realization(base_pld, sampling_prob, direction)`
 
-This module implements PLD-based subsampling amplification (the paper's "Full Implementation Details" appendix, Algorithms 8-10 mapping) and uses DOMINATES semantics.
+This module implements PLD-based subsampling amplification (Appendix C, Algorithms 8-10: `PLDsubsam-remove`, `PLDsubsam-add`, and `subsam-core`) and uses DOMINATES semantics.
 
 ## Numerical Invariants
 

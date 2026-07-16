@@ -11,7 +11,6 @@ from PLD_accounting.types import BoundType
 from PLD_accounting.validation import validate_discrete_pmf_and_boundaries
 
 PMF_MASS_TOL = 10 * np.finfo(float).eps  # total-mass tolerance (10× machine epsilon)
-RENORMALIZATION_THRESHOLD = 10 * np.finfo(float).eps
 SPACING_ATOL = 1e-12
 SPACING_RTOL = 1e-6
 MIN_GRID_SIZE = 100  # Minimum number of points in a  discretization grid.
@@ -60,8 +59,9 @@ def enforce_mass_conservation(
         current_mass = math.fsum(map(float, extended))
         excess = current_mass - target_mass
         if excess > 0:
-            if excess < RENORMALIZATION_THRESHOLD:
-                # Tiny excess (numerical noise): renormalize instead of trimming bins
+            if excess < PMF_MASS_TOL:
+                # Tiny excess is accepted as floating-point noise; proportional
+                # scaling avoids creating a directional artifact at one bin.
                 extended = extended * (target_mass / current_mass)
             else:
                 extended = _zero_mass(values=extended, mass=excess, from_left=True, exact=True)
@@ -80,8 +80,9 @@ def enforce_mass_conservation(
         current_mass = math.fsum(map(float, extended))
         excess = current_mass - target_mass
         if excess > 0:
-            if excess < RENORMALIZATION_THRESHOLD:
-                # Tiny excess (numerical noise): renormalize instead of trimming bins
+            if excess < PMF_MASS_TOL:
+                # Tiny excess is accepted as floating-point noise; proportional
+                # scaling avoids creating a directional artifact at one bin.
                 extended = extended * (target_mass / current_mass)
             else:
                 extended = _zero_mass(values=extended, mass=excess, from_left=False, exact=True)

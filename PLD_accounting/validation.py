@@ -6,10 +6,18 @@ across the codebase and eliminate repetitive validation code.
 
 from __future__ import annotations
 
+import math
+from numbers import Integral, Real
+
 import numpy as np
 from numpy.typing import NDArray
 
-from PLD_accounting.types import AllocationSchemeConfig, BoundType, PrivacyParams
+from PLD_accounting.types import (
+    AllocationSchemeConfig,
+    BoundType,
+    ConvolutionMethod,
+    PrivacyParams,
+)
 
 # =============================================================================
 # Discrete PMF validation
@@ -35,8 +43,13 @@ def validate_discrete_pmf_and_boundaries(
     prob_arr = np.asarray(prob_arr, dtype=np.float64)
     if prob_arr.ndim != 1:
         raise ValueError("PMF must be 1-D array")
+    if prob_arr.size == 0:
+        raise ValueError("PMF must contain at least one finite-support bin")
+    validate_finite_array(prob_arr, "PMF")
     if np.any(prob_arr < 0.0):
         raise ValueError("PMF must be nonnegative")
+    validate_finite_real(p_min, "p_min")
+    validate_finite_real(p_max, "p_max")
     if p_min < 0.0:
         raise ValueError(f"min must be nonnegative, got {p_min:.2e}")
     if p_max < 0.0:
@@ -93,6 +106,7 @@ def validate_gaussian_params(
         ValueError: If any parameter value is invalid.
 
     """
+    validate_finite_real(sigma, "sigma")
     if sigma <= 0:
         raise ValueError(f"sigma must be positive, got {sigma}")
     validate_allocation_params(num_steps, num_selected, num_epochs)
@@ -114,6 +128,12 @@ def validate_allocation_params(
         ValueError: If any parameter value is invalid.
 
     """
+    for value, name in (
+        (num_steps, "num_steps"),
+        (num_selected, "num_selected"),
+        (num_epochs, "num_epochs"),
+    ):
+        validate_integer(value, name)
     if num_steps < 1 or num_selected < 1 or num_epochs < 1:
         raise ValueError(
             f"num_steps (={num_steps}), num_selected (={num_selected}), "
@@ -133,7 +153,10 @@ def validate_delta(delta: float | None) -> None:
         ValueError: If delta is None or not in the valid range (0, 1).
 
     """
-    if delta is None or not 0 < delta < 1:
+    if delta is None:
+        raise ValueError("delta must be in (0, 1), got None")
+    validate_finite_real(delta, "delta")
+    if not 0 < delta < 1:
         raise ValueError(f"delta must be in (0, 1), got {delta}")
 
 
@@ -147,7 +170,10 @@ def validate_epsilon(epsilon: float | None) -> None:
         ValueError: If epsilon is None or not positive.
 
     """
-    if epsilon is None or epsilon <= 0:
+    if epsilon is None:
+        raise ValueError("epsilon must be positive, got None")
+    validate_finite_real(epsilon, "epsilon")
+    if epsilon <= 0:
         raise ValueError(f"epsilon must be positive, got {epsilon}")
 
 
@@ -189,6 +215,8 @@ def validate_discretization_params(
         ValueError: If any parameter is invalid.
 
     """
+    validate_finite_real(loss_discretization, "loss_discretization")
+    validate_finite_real(tail_truncation, "tail_truncation")
     if loss_discretization <= 0:
         raise ValueError(f"loss_discretization must be positive, got {loss_discretization}")
     if tail_truncation <= 0:
@@ -209,6 +237,18 @@ def validate_allocation_scheme_config(config: AllocationSchemeConfig) -> None:
     if not isinstance(config, AllocationSchemeConfig):
         raise TypeError(f"config must be AllocationSchemeConfig, got {type(config)}")
     validate_discretization_params(config.loss_discretization, config.tail_truncation)
+    if not isinstance(config.convolution_method, ConvolutionMethod):
+        raise TypeError(
+            "convolution_method must be ConvolutionMethod, "
+            f"got {type(config.convolution_method).__name__}"
+        )
+    for value, name in (
+        (config.max_grid_fft, "max_grid_fft"),
+        (config.max_grid_mult, "max_grid_mult"),
+        (config.cf_max_grid, "cf_max_grid"),
+        (config.cf_refine_factor, "cf_refine_factor"),
+    ):
+        validate_integer(value, name)
     if config.max_grid_fft <= 0:
         raise ValueError(f"max_grid_fft must be positive, got {config.max_grid_fft}")
     if config.max_grid_mult != -1 and config.max_grid_mult <= 0:
@@ -216,6 +256,10 @@ def validate_allocation_scheme_config(config: AllocationSchemeConfig) -> None:
             f"max_grid_mult must be -1 (no limit) or a positive integer, "
             f"got {config.max_grid_mult}"
         )
+    if config.cf_max_grid <= 0:
+        raise ValueError(f"cf_max_grid must be positive, got {config.cf_max_grid}")
+    if config.cf_refine_factor <= 0:
+        raise ValueError(f"cf_refine_factor must be positive, got {config.cf_refine_factor}")
 
 
 def validate_optional_discretization_params(
@@ -232,7 +276,35 @@ def validate_optional_discretization_params(
         ValueError: If any provided parameter is invalid.
 
     """
-    if initial_discretization is not None and initial_discretization <= 0:
-        raise ValueError(f"initial_discretization must be positive, got {initial_discretization}")
-    if initial_tail_truncation is not None and initial_tail_truncation <= 0:
-        raise ValueError(f"initial_tail_truncation must be positive, got {initial_tail_truncation}")
+    if initial_discretization is not None:
+        validate_finite_real(initial_discretization, "initial_discretization")
+        if initial_discretization <= 0:
+            raise ValueError(
+                f"initial_discretization must be positive, got {initial_discretization}"
+            )
+    if initial_tail_truncation is not None:
+        validate_finite_real(initial_tail_truncation, "initial_tail_truncation")
+        if initial_tail_truncation <= 0:
+            raise ValueError(
+                f"initial_tail_truncation must be positive, got {initial_tail_truncation}"
+            )
+
+
+def validate_finite_real(value: object, name: str) -> None:
+    """Require a non-boolean, finite real scalar."""
+    if isinstance(value, bool) or not isinstance(value, Real):
+        raise TypeError(f"{name} must be a real number, got {type(value).__name__}")
+    if not math.isfinite(float(value)):
+        raise ValueError(f"{name} must be finite, got {value!r}")
+
+
+def validate_finite_array(values: NDArray[np.float64], name: str) -> None:
+    """Require every entry in a numeric array to be finite."""
+    if not np.all(np.isfinite(values)):
+        raise ValueError(f"{name} entries must be finite")
+
+
+def validate_integer(value: object, name: str) -> None:
+    """Require an integer scalar while rejecting booleans."""
+    if isinstance(value, bool) or not isinstance(value, Integral):
+        raise TypeError(f"{name} must be an integer, got {type(value).__name__}")

@@ -44,6 +44,15 @@ def _stub_linear_dist() -> DenseDiscreteDist:
     )
 
 
+def _aligned_base_dist(step: float, origin_index: int) -> DenseDiscreteDist:
+    """Build a small loss distribution on exact integer multiples of ``step``."""
+    return DenseDiscreteDist(
+        x_0=origin_index * step,
+        step=step,
+        prob_arr=np.array([1e-8, 0.2, 0.5, 0.29999999]),
+    )
+
+
 class TestGeneralAllocationWiring:
     """Tests that general (geometric-base) allocation delegates to shared helpers."""
 
@@ -539,6 +548,100 @@ def test_geom_is_dominated_path_handles_tiny_nonpositive_exp_tail():
     assert epsilon > 0.0
 
 
+def test_gaussian_remove_geom_dominates_discretizes_only_primary(monkeypatch):
+    """Gaussian upper REMOVE derives its transformed dual after one discretization."""
+    calls = []
+    actual_discretize = random_allocation_gaussian_module.discretize_continuous_distribution
+
+    def recording_discretize(**kwargs):
+        calls.append(kwargs)
+        return actual_discretize(**kwargs)
+
+    monkeypatch.setattr(
+        random_allocation_gaussian_module,
+        "discretize_continuous_distribution",
+        recording_discretize,
+    )
+
+    base, neg_dual = random_allocation_gaussian_module._gaussian_remove_geom_loss_factors(
+        loss_discretization=0.1,
+        tail_truncation=1e-6,
+        bound_type=BoundType.DOMINATES,
+        sigma=2.0,
+        config=AllocationSchemeConfig(
+            loss_discretization=0.1,
+            tail_truncation=1e-6,
+            convolution_method=ConvolutionMethod.GEOM,
+        ),
+    )
+    expected = random_allocation_gaussian_module.negate_reverse_linear_distribution(
+        random_allocation_gaussian_module.calc_pld_dual(base)
+    )
+
+    assert len(calls) == 1
+    assert isinstance(base, PLDRealization)
+    assert np.isclose(base.step, neg_dual.step, atol=TOL.SPACING_ATOL)
+    np.testing.assert_array_equal(neg_dual.x_array, expected.x_array)
+    np.testing.assert_array_equal(neg_dual.prob_arr, expected.prob_arr)
+    assert neg_dual.p_min == expected.p_min
+    assert neg_dual.p_max == expected.p_max
+
+
+def test_gaussian_remove_geom_dominates_honors_max_grid_mult():
+    """Gaussian upper REMOVE coarsens its single primary grid to the configured cap."""
+    requested_step = 1e-4
+    max_grid_mult = 100
+
+    base, neg_dual = random_allocation_gaussian_module._gaussian_remove_geom_loss_factors(
+        loss_discretization=requested_step,
+        tail_truncation=1e-10,
+        bound_type=BoundType.DOMINATES,
+        sigma=1.0,
+        config=AllocationSchemeConfig(
+            loss_discretization=requested_step,
+            tail_truncation=1e-10,
+            max_grid_mult=max_grid_mult,
+            convolution_method=ConvolutionMethod.GEOM,
+        ),
+    )
+
+    assert base.prob_arr.size <= max_grid_mult
+    assert base.step > requested_step
+    assert neg_dual.prob_arr.size == base.prob_arr.size
+    assert neg_dual.step == base.step
+
+
+def test_gaussian_remove_geom_is_dominated_keeps_two_discretizations(monkeypatch):
+    """Gaussian lower REMOVE retains the continuous dual-first construction."""
+    calls = 0
+    actual_discretize = random_allocation_gaussian_module.discretize_continuous_dist
+
+    def recording_discretize(**kwargs):
+        nonlocal calls
+        calls += 1
+        return actual_discretize(**kwargs)
+
+    monkeypatch.setattr(
+        random_allocation_gaussian_module,
+        "discretize_continuous_dist",
+        recording_discretize,
+    )
+
+    random_allocation_gaussian_module._gaussian_remove_geom_loss_factors(
+        loss_discretization=0.1,
+        tail_truncation=1e-6,
+        bound_type=BoundType.IS_DOMINATED,
+        sigma=2.0,
+        config=AllocationSchemeConfig(
+            loss_discretization=0.1,
+            tail_truncation=1e-6,
+            convolution_method=ConvolutionMethod.GEOM,
+        ),
+    )
+
+    assert calls == 2
+
+
 class TestGeometricBaseTailScaling:
     """Tests how tail truncation is threaded into geometric base construction."""
 
@@ -640,4 +743,38 @@ class TestGeometricBaseTailScaling:
         assert len(captured_tails) == 2
         assert np.isclose(
             captured_tails[0] * 5, captured_tails[1] * 10, atol=TOL.TAIL_LINEAR_RELATION_ATOL
+        )
+
+
+@pytest.mark.parametrize("bound_type", [BoundType.DOMINATES, BoundType.IS_DOMINATED])
+def test_geometric_allocation_preserves_integer_loss_lattice(bound_type: BoundType):
+    """Anchored ADD and REMOVE composition return grids aligned to zero loss."""
+    num_steps = 7
+
+    remove = random_allocation_accounting_module.geometric_allocation_pld_base_remove(
+        base_distributions_creation=lambda loss_discretization, **_kwargs: (
+            _aligned_base_dist(loss_discretization, -2),
+            _aligned_base_dist(loss_discretization, -1),
+        ),
+        num_steps=num_steps,
+        loss_discretization=0.1,
+        tail_truncation=1e-6,
+        bound_type=bound_type,
+    )
+    add = random_allocation_accounting_module.geometric_allocation_pld_base_add(
+        base_distributions_creation=lambda loss_discretization, **_kwargs: _aligned_base_dist(
+            loss_discretization, -2
+        ),
+        num_steps=num_steps,
+        loss_discretization=0.1,
+        tail_truncation=1e-6,
+        bound_type=bound_type,
+    )
+
+    for dist in (remove, add):
+        lower_index = round(dist.x_0 / dist.step)
+        assert np.isclose(
+            dist.x_0,
+            lower_index * dist.step,
+            atol=TOL.SPACING_ATOL,
         )

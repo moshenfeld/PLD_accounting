@@ -54,13 +54,11 @@ def fft_convolve(
     fft_size = next_fast_len(conv_full_len)
     _check_fft_memory(fft_size, label="fft_convolve")
 
-    # Capture ghost-mass bounds and normalization factors before FFT buffers are allocated
+    # Capture reachable-support bounds before FFT buffers are allocated.
     nz1 = np.nonzero(dist_1.prob_arr)[0]
     nz2 = np.nonzero(dist_2.prob_arr)[0]
     min_idx = int(nz1[0] + nz2[0])
     max_idx = int(nz1[-1] + nz2[-1])
-    finite_prob_1 = math.fsum(map(float, dist_1.prob_arr))
-    finite_prob_2 = math.fsum(map(float, dist_2.prob_arr))
 
     # Self-squaring optimization: if both inputs are the same object,
     # compute rfft once and square in-place (saves one complex buffer)
@@ -80,20 +78,19 @@ def fft_convolve(
     # Zero negative roundoff and ghost mass outside reachable support
     conv_pmf[conv_pmf < 0] = 0.0
     conv_pmf[:min_idx] = 0.0
-    max_idx_plus_one = max_idx + 1
-    if max_idx_plus_one < conv_pmf.size:
-        conv_pmf[max_idx_plus_one:] = 0.0
+    if max_idx + 1 < conv_pmf.size:
+        first_unreachable = max_idx + 1
+        conv_pmf[first_unreachable:] = 0.0
 
-    current_finite_mass = math.fsum(map(float, conv_pmf))
-    if current_finite_mass <= 0.0:
+    if math.fsum(map(float, conv_pmf)) <= 0.0:
         raise ValueError("FFT convolution produced zero finite mass")
-    # Renormalize finite mass before reattaching the analytically computed
-    # infinity masses. This corrects small drift from FFT arithmetic/clipping.
-    conv_pmf *= finite_prob_1 * finite_prob_2 / current_finite_mass
 
     expected_p_min, expected_p_max = convolve_boundary_masses(
         dist_1.p_min, dist_1.p_max, dist_2.p_min, dist_2.p_max, dist_1.domain
     )
+    # Repair FFT/clipping drift directionally. A deficit goes to the enforced
+    # conservative boundary; an excess is removed from the opposite tail.
+    # Uniform scaling would move every loss atom and need not preserve a bound.
     conv_pmf, p_min, p_max = enforce_mass_conservation(
         prob_arr=conv_pmf,
         expected_p_min=expected_p_min,
@@ -121,7 +118,12 @@ def fft_self_convolve(
 ) -> DenseDiscreteDist:
     """T-fold self-convolution via FFT with optional direct exponentiation path."""
     if not (isinstance(dist, DenseDiscreteDist) and dist.spacing_type == SpacingType.LINEAR):
-        raise TypeError("fft_self_convolve requires DenseDiscreteDist input")
+        spacing = getattr(dist, "spacing_type", "?")
+        raise TypeError(
+            "fft_self_convolve requires DenseDiscreteDist input: "
+            "expected DenseDiscreteDist with LINEAR spacing, "
+            f"got {type(dist).__name__} with spacing {spacing}"
+        )
 
     if use_direct:
         try:
@@ -138,20 +140,13 @@ def fft_self_convolve(
                 f"Falling back to binary self-convolution."
             )
 
-    self_conv = binary_self_convolve(
+    return binary_self_convolve(
         dist=dist,
         T=T,
         tail_truncation=tail_truncation,
         bound_type=bound_type,
         convolve=fft_convolve,
     )
-    if not (
-        isinstance(self_conv, DenseDiscreteDist) and self_conv.spacing_type == SpacingType.LINEAR
-    ):
-        raise TypeError(
-            f"Expected DenseDiscreteDist from FFT self-convolution, got {type(self_conv)}"
-        )
-    return self_conv
 
 
 def _fft_self_convolve_direct(

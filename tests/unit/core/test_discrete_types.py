@@ -5,6 +5,8 @@ Tests all distribution types: General, Linear (Dense/Sparse), Geometric (Dense/S
 and transform functions between linear and geometric grids.
 """
 
+import copy
+
 import numpy as np
 import pytest
 
@@ -33,6 +35,70 @@ class TestGeneralDiscreteDist:
         assert np.allclose(dist.prob_arr, pmf)
         assert dist.p_min == 0.0
         assert dist.p_max == 0.0
+
+    def test_constructor_detaches_and_exposes_read_only_arrays(self):
+        """Validated support and probability arrays cannot be mutated by callers."""
+        x = np.array([1.0, 2.0])
+        pmf = np.array([0.4, 0.6])
+        dist = SparseDiscreteDist(x_array=x, prob_arr=pmf)
+        x[0] = -10.0
+        pmf[0] = 0.0
+
+        np.testing.assert_array_equal(dist.x_array, np.array([1.0, 2.0]))
+        np.testing.assert_array_equal(dist.prob_arr, np.array([0.4, 0.6]))
+        with pytest.raises(ValueError, match="read-only"):
+            dist.x_array[0] = -10.0
+        with pytest.raises(ValueError, match="read-only"):
+            dist.prob_arr[0] = 0.0
+
+    def test_deepcopy_preserves_read_only_arrays(self):
+        """Deep copies remain immutable rather than silently weakening invariants."""
+        dist = SparseDiscreteDist(
+            x_array=np.array([1.0, 2.0]),
+            prob_arr=np.array([0.4, 0.6]),
+        )
+        copied = copy.deepcopy(dist)
+
+        with pytest.raises(ValueError, match="read-only"):
+            copied.prob_arr[0] = 0.0
+
+    @pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
+    def test_rejects_nonfinite_support_and_probability_values(self, bad: float):
+        """NaN and infinity cannot bypass distribution invariants."""
+        with pytest.raises(ValueError, match="finite"):
+            SparseDiscreteDist(
+                x_array=np.array([1.0, 2.0]),
+                prob_arr=np.array([bad, 1.0]),
+            )
+        with pytest.raises(ValueError, match="finite"):
+            SparseDiscreteDist(
+                x_array=np.array([bad, 2.0]),
+                prob_arr=np.array([0.5, 0.5]),
+            )
+
+    @pytest.mark.parametrize("boundary", ["p_min", "p_max"])
+    @pytest.mark.parametrize("bad", [True, False, "0.0"])
+    def test_rejects_non_real_boundary_masses(self, boundary: str, bad: object):
+        """Boundary masses must be real scalars and must reject boolean coercion."""
+        kwargs = {boundary: bad}
+        with pytest.raises(TypeError, match=rf"{boundary} must be a real number"):
+            SparseDiscreteDist(
+                x_array=np.array([1.0]),
+                prob_arr=np.array([1.0]),
+                **kwargs,
+            )
+
+    @pytest.mark.parametrize("boundary", ["p_min", "p_max"])
+    @pytest.mark.parametrize("bad", [np.nan, np.inf, -np.inf])
+    def test_rejects_nonfinite_boundary_masses(self, boundary: str, bad: float):
+        """Boundary masses use the shared finite-real validation contract."""
+        kwargs = {boundary: bad}
+        with pytest.raises(ValueError, match=rf"{boundary} must be finite"):
+            SparseDiscreteDist(
+                x_array=np.array([1.0]),
+                prob_arr=np.array([1.0]),
+                **kwargs,
+            )
 
     def test_with_boundary_mass(self):
         """Test distribution with mass at boundaries (POSITIVES domain allows both)."""
@@ -69,7 +135,7 @@ class TestGeneralDiscreteDist:
         """Test that non-unit total mass raises error at construction."""
         x = np.array([1.0, 2.0, 3.0])
         pmf = np.array([0.2, 0.3, 0.4], dtype=np.float64)  # sums to 0.9
-        with pytest.raises(ValueError, match="MASS CONSERVATION ERROR"):
+        with pytest.raises(ValueError, match="PMF mass does not total 1"):
             SparseDiscreteDist(x_array=x, prob_arr=pmf)
 
     def test_mass_within_tolerance_accepted(self):
@@ -103,7 +169,7 @@ class TestMassConservationValidation:
 
     def test_violation_raises(self):
         """Test that mass violation raises detailed error at construction."""
-        with pytest.raises(ValueError, match="MASS CONSERVATION ERROR") as exc_info:
+        with pytest.raises(ValueError, match="PMF mass does not total 1") as exc_info:
             SparseDiscreteDist(
                 x_array=np.array([1.0, 2.0]), prob_arr=np.array([0.3, 0.3], dtype=np.float64)
             )

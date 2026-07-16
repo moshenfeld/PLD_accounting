@@ -7,8 +7,8 @@ linear grid. With ``bound_type=DOMINATES`` (default), returns a validated
 mass at negative infinity loss).
 
 For Laplace with sampling probability 1, ADD and REMOVE PLDs coincide; callers
-may use ``dist.copy()`` on a :class:`PLDRealization` for the ADD slot when a
-second object is required.
+may use ``copy.deepcopy(dist)`` on a :class:`PLDRealization` for the ADD slot
+when a second object is required.
 
 Sensitivity is fixed at 1 (L2 for Gaussian, L1 for Laplace).
 

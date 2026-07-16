@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
-from numba import njit
 from numpy.typing import NDArray
 from scipy import stats
 from scipy.stats._distn_infrastructure import rv_frozen
 
-from PLD_accounting.discrete_dist import DenseDiscreteDist, DiscreteDistBase, Domain, GridSpec
+from PLD_accounting.discrete_dist import (
+    DenseDiscreteDist,
+    DiscreteDistBase,
+    Domain,
+    GridSpec,
+    PLDRealization,
+)
 from PLD_accounting.distribution_utils import enforce_mass_conservation
-from PLD_accounting.types import BoundType, SpacingType
+from PLD_accounting.types import BoundType, SpacingType, has_numba, optional_njit
 
 # =============================================================================
 # Public API: Continuous Distribution Discretization
@@ -44,7 +50,7 @@ def discretize_continuous_distribution(
         Discretized distribution on a structured dense grid.
     """
 
-    grid = _discretize_continuous_to_grid(
+    grid = _continuous_to_grid(
         dist=dist,
         tail_truncation=tail_truncation,
         spacing_type=spacing_type,
@@ -53,16 +59,14 @@ def discretize_continuous_distribution(
     )
     if grid.x_0 <= 0 and domain == Domain.POSITIVES:
         dist_name = getattr(dist, "name", type(dist).__name__)
-        raise ValueError(
-            f"Cannot discretize {dist_name} to a positive range, got x_0={grid.x_0}"
-        )
+        raise ValueError(f"Cannot discretize {dist_name} to a positive range, got x_0={grid.x_0}")
 
     # 2. Map density to PMF with semantics.
     return discretize_continuous_dist(
         dist=dist,
         grid=grid,
         bound_type=bound_type,
-        PMF_min_increment=tail_truncation,
+        pmf_min_increment=tail_truncation,
         domain=domain,
     )
 
@@ -72,7 +76,7 @@ def discretize_continuous_dist(
     dist: stats.rv_continuous | rv_frozen[Any, Any],
     grid: GridSpec,
     bound_type: BoundType,
-    PMF_min_increment: float,
+    pmf_min_increment: float,
     domain: Domain = Domain.REALS,
 ) -> DenseDiscreteDist:
     """Convert continuous distribution to discrete PMF with bounding semantics.
@@ -83,9 +87,9 @@ def discretize_continuous_dist(
     ``compute_bin_width``.
     """
     x_array = grid.materialize()
-    # Compute raw probabilities for intervals [x_i, x_{i+1}) using PMF_min_increment.
+    # Compute raw probabilities for intervals [x_i, x_{i+1}) using pmf_min_increment.
     bin_probs, p_left, p_right = _compute_discrete_prob(
-        dist=dist, x_array=x_array, bound_type=bound_type, PMF_min_increment=PMF_min_increment
+        dist=dist, x_array=x_array, bound_type=bound_type, pmf_min_increment=pmf_min_increment
     )
 
     prob_arr = np.zeros(grid.n)
@@ -146,8 +150,23 @@ def rediscretize_dist(
     Implementation trims zero/tail regions, computes new grid size, then remaps
     using domination-aware rounding (e.g., linear grids for dp_accounting output).
 
-    Algorithm 6 (`disc-dist`).
+    Algorithm 6 (`disc-dist`), in Appendix C
+    of https://arxiv.org/abs/2602.17284.
     """
+
+    # A lower-bound discretization is not an exact PLD realization.  Convert
+    # explicitly before any mass-moving operation so every subsequent rebuild
+    # preserves the correct (weaker) representation type.
+    if isinstance(dist, PLDRealization) and bound_type == BoundType.IS_DOMINATED:
+        dist = DenseDiscreteDist(
+            x_0=dist.x_0,
+            step=dist.step,
+            prob_arr=dist.prob_arr,
+            p_min=dist.p_min,
+            p_max=dist.p_max,
+            spacing_type=dist.spacing_type,
+            domain=dist.domain,
+        )
 
     working_dist = fold_absorbable_boundary_atom(
         dist=dist,
@@ -192,18 +211,20 @@ def fold_absorbable_boundary_atom(
     bottom bin (linear output only -- geometric output keeps ``p_min`` as the
     mass at 0).  Returns a copy; the input is unchanged.
     """
-    working_dist = dist.copy()
-    if bound_type == BoundType.IS_DOMINATED and working_dist.p_max > 0.0:
-        working_dist.prob_arr[-1] += working_dist.p_max
-        working_dist.p_max = 0.0
-    elif (
-        bound_type == BoundType.DOMINATES
-        and spacing_type == SpacingType.LINEAR
-        and working_dist.p_min > 0.0
-    ):
-        working_dist.prob_arr[0] += working_dist.p_min
-        working_dist.p_min = 0.0
-    return working_dist
+    prob_arr = dist.prob_arr.copy()
+    p_min = dist.p_min
+    p_max = dist.p_max
+    if bound_type == BoundType.IS_DOMINATED and p_max > 0.0:
+        prob_arr[-1] += p_max
+        p_max = 0.0
+    elif bound_type == BoundType.DOMINATES and spacing_type == SpacingType.LINEAR and p_min > 0.0:
+        prob_arr[0] += p_min
+        p_min = 0.0
+    return dist.with_probabilities(
+        prob_arr=prob_arr,
+        p_min=p_min,
+        p_max=p_max,
+    )
 
 
 def project_dist_onto_grid(
@@ -327,20 +348,35 @@ def discretize_aligned_range(
     ).materialize()
 
 
-@njit(cache=True)
 def rediscretize_prob(
     x_array: NDArray[np.float64],
     prob_arr: NDArray[np.float64],
     x_array_out: NDArray[np.float64],
     dominates: bool,
 ) -> NDArray[np.float64]:
-    """Remap PMF onto new grid with domination-aware rounding.
+    """Dispatch PMF remapping to numba when available, else NumPy."""
+    if has_numba():
+        return _numba_rediscretize_prob(x_array, prob_arr, x_array_out, dominates)
+    return _numpy_rediscretize_prob(x_array, prob_arr, x_array_out, dominates)
+
+
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+
+@optional_njit()
+def _numba_rediscretize_prob(
+    x_array: NDArray[np.float64],
+    prob_arr: NDArray[np.float64],
+    x_array_out: NDArray[np.float64],
+    dominates: bool,
+) -> NDArray[np.float64]:
+    """Remap PMF onto a new grid with domination-aware rounding.
 
     Maps each probability mass to output grid position based on domination semantics.
     Implementation: dominates=True uses ceil (pessimistic), False uses floor (optimistic).
     Uses Kahan summation for numerical accuracy.
-    Returns: remapped PMF array.
-
     """
     n_out = x_array_out.size
     prob_arr_out = np.zeros(n_out)
@@ -397,16 +433,34 @@ def rediscretize_prob(
     return prob_arr_out
 
 
-# =============================================================================
-# Helper Functions
-# =============================================================================
+def _numpy_rediscretize_prob(
+    x_array: NDArray[np.float64],
+    prob_arr: NDArray[np.float64],
+    x_array_out: NDArray[np.float64],
+    dominates: bool,
+) -> NDArray[np.float64]:
+    """Numpy fallback for remapping PMF onto a new grid."""
+    n_out = x_array_out.size
+    prob_arr_out = np.zeros(n_out, dtype=np.float64)
+    positive = prob_arr > 0.0
+    if dominates:
+        indices = np.searchsorted(x_array_out, x_array[positive], side="left")
+        valid = indices < n_out
+    else:
+        indices = np.searchsorted(x_array_out, x_array[positive], side="right") - 1
+        valid = indices >= 0
+    np.add.at(prob_arr_out, indices[valid], prob_arr[positive][valid])
+    return prob_arr_out
 
 
 def _cover_x_max(grid: GridSpec, x_max: float) -> GridSpec:
     """Grow ``n`` until the materialized endpoint covers ``x_max`` after float rounding."""
-    while grid.last_point() < x_max:
-        grid.n += 1
-    return grid
+    n = grid.n
+    candidate = grid
+    while candidate.last_point() < x_max:
+        n += 1
+        candidate = replace(grid, n=n)
+    return candidate
 
 
 def _linear_grid_params(x_min: float, x_max: float, d: float, align_to_multiples: bool) -> GridSpec:
@@ -430,7 +484,10 @@ def _linear_grid_params(x_min: float, x_max: float, d: float, align_to_multiples
 def _geometric_grid_params(
     x_min: float, x_max: float, d: float, align_to_multiples: bool
 ) -> GridSpec:
-    """Return a ``GridSpec`` for a geometric grid covering [x_min, x_max]; d is the log-ratio per step."""
+    """Return a geometric ``GridSpec`` covering [x_min, x_max].
+
+    ``d`` is the log-ratio per step.
+    """
     step = float(np.exp(d))
     if align_to_multiples:
         k_lo = int(np.floor(np.log(x_min) / d))
@@ -448,7 +505,7 @@ def _geometric_grid_params(
     return _cover_x_max(GridSpec(x_0=x0, step=step, n=n, spacing_type=SpacingType.GEOMETRIC), x_max)
 
 
-@njit(cache=True)
+@optional_njit()
 def _adaptive_bins_from_cdf(
     *,
     cdf: NDArray[np.float64],
@@ -480,7 +537,7 @@ def _adaptive_bins_from_cdf(
     return bin_probs
 
 
-@njit(cache=True)
+@optional_njit()
 def _adaptive_bins_from_sf(
     *,
     sf: NDArray[np.float64],
@@ -544,11 +601,11 @@ def _compute_discrete_prob(
     dist: stats.rv_continuous | rv_frozen[Any, Any],
     x_array: NDArray[np.float64],
     bound_type: BoundType,
-    PMF_min_increment: float,
+    pmf_min_increment: float,
 ) -> tuple[NDArray[np.float64], float, float]:
     """Compute bin probabilities using adaptive CDF/SF increments with logcdf/logsf stability.
 
-    PMF_min_increment controls the minimum CDF/SF increment that becomes a bin mass.
+    pmf_min_increment controls the minimum CDF/SF increment that becomes a bin mass.
 
     """
     cdf, sf = _stable_cdf_and_sf(
@@ -557,19 +614,19 @@ def _compute_discrete_prob(
     )
     p_left = cdf[0]
     p_right = sf[-1]
-    PMF_min_increment = max(0.0, PMF_min_increment)
+    pmf_min_increment = max(0.0, pmf_min_increment)
 
     if bound_type == BoundType.DOMINATES:
         # Suppress intermediate debug logging.
         bin_probs = _adaptive_bins_from_cdf(
             cdf=cdf,
-            tail_truncation=PMF_min_increment,
+            tail_truncation=pmf_min_increment,
         )
     elif bound_type == BoundType.IS_DOMINATED:
         # Suppress intermediate debug logging.
         bin_probs = _adaptive_bins_from_sf(
             sf=sf,
-            tail_truncation=PMF_min_increment,
+            tail_truncation=pmf_min_increment,
         )
     else:
         raise ValueError(f"Unknown BoundType: {bound_type}")
@@ -577,7 +634,7 @@ def _compute_discrete_prob(
     return bin_probs, p_left, p_right
 
 
-def _discretize_continuous_to_grid(
+def _continuous_to_grid(
     *,
     dist: stats.rv_continuous | rv_frozen[Any, Any],
     tail_truncation: float,
@@ -596,10 +653,12 @@ def _discretize_continuous_to_grid(
         if step <= 1.0:
             raise ValueError(f"Geometric step must be > 1, got {step}")
         discretization = float(np.log(step))
-    else:
+    elif spacing_type == SpacingType.LINEAR:
         if step <= 0.0:
             raise ValueError(f"Linear step must be positive, got {step}")
         discretization = float(step)
+    else:
+        raise ValueError(f"Invalid spacing_type: {spacing_type}")
 
     return aligned_grid_params(
         x_min=x_min,

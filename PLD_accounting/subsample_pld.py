@@ -91,8 +91,8 @@ def subsample_pld_realization(
 ) -> PLDRealization:
     """Apply subsampling amplification to a PLD realization using the PLD-dual method.
 
-    Algorithms 8 and 9 (`PLD-subsam-remove/add`), using Algorithm 10
-    (`subsam-core`) for the shared transform.
+    Algorithms 8 and 9 (`PLDsubsam-remove` / `PLDsubsam-add`), in Appendix C of
+    https://arxiv.org/abs/2602.17284, using Algorithm 10 (`subsam-core`), for the shared transform.
 
     Args:
         base_pld: Base privacy-loss realization on a linear loss grid.
@@ -161,10 +161,11 @@ def _stable_subsampling_transformation(
     Remove direction: l' = log(1 + q * (exp(l) - 1))
     Add direction:    l' = -log(1 + q * (exp(-l) - 1))
 
-    Paper mapping: Algorithm 10 (`subsam-core`), with Algorithm 9 using this
-    transform on ``-L`` and negating back. For positive losses we use a log-sum
-    form to avoid overflow; for non-positive losses we use ``log1p(expm1(.))``
-    for cancellation stability.
+    Paper mapping: Algorithm 10 (`subsam-core`), in
+    Appendix C of https://arxiv.org/abs/2602.17284, with Algorithm 9
+    (`PLDsubsam-add`), using this transform on ``-L`` and negating back. For
+    positive losses we use a log-sum form to avoid overflow; for non-positive
+    losses we use ``log1p(expm1(.))`` for cancellation stability.
     """
     if sampling_prob <= 0 or sampling_prob > 1:
         raise ValueError("sampling_prob must be in (0, 1]")
@@ -192,9 +193,10 @@ def _mix_distributions(
 ) -> DenseDiscreteDist:
     """Mix two same-grid distributions with weight ``weight_first`` for ``dist_1``.
 
-    Paper mapping: Algorithm 8 in the paper's "Full Implementation Details"
-    section, mixture line ``f_{L_lambda} = lambda f_L + (1-lambda) f_D`` after
-    both operands are represented on the common transformed grid.
+    Paper mapping: Algorithm 8 (`PLDsubsam-remove`), in Appendix C of
+    https://arxiv.org/abs/2602.17284, mixture line ``f_{L_lambda} = lambda f_L
+    + (1-lambda) f_D`` after both operands are represented on the common
+    transformed grid.
     """
     if not (
         isinstance(dist_1, DenseDiscreteDist) and dist_1.spacing_type == SpacingType.LINEAR
@@ -398,7 +400,8 @@ def _subsample_dist_mix(
 ) -> DenseDiscreteDist:
     """Subsample and mix base and negative-dual distributions on a shared linear grid.
 
-    Paper mapping: Algorithm 8 (`PLD-subsam-remove`), mixture line ``lambda * f_L +
+    Paper mapping: Algorithm 8 (`PLDsubsam-remove`), in Appendix C of
+    https://arxiv.org/abs/2602.17284, mixture line ``lambda * f_L +
     (1-lambda) * f_D``. The implementation computes each transformed branch on
     the same grid before applying that convex mixture.
     """

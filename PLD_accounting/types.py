@@ -2,8 +2,40 @@
 
 from __future__ import annotations
 
+import warnings
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
+
+try:
+    from numba import njit as _NJIT
+
+    _HAS_NUMBA = True
+except ImportError:
+    _HAS_NUMBA = False
+    warnings.warn(
+        "numba is not installed; some operations will use NumPy fallbacks "
+        "and may be slower. Install numba for full performance.",
+        ImportWarning,
+        stacklevel=2,
+    )
+
+
+def optional_njit():
+    """Return numba's njit(cache=True) if available, else the identity decorator."""
+    if _HAS_NUMBA:
+        return _NJIT(cache=True)
+
+    def identity_decorator(function: Callable):
+        return function
+
+    return identity_decorator
+
+
+def has_numba() -> bool:
+    """Return whether numba JIT support is available."""
+    return _HAS_NUMBA
+
 
 # =============================================================================
 # Discrete Distribution Types
@@ -48,7 +80,7 @@ DEFAULT_LOSS_DISCRETIZATION = 1e-2
 DEFAULT_TAIL_TRUNCATION = 1e-12
 
 
-@dataclass
+@dataclass(frozen=True)
 class PrivacyParams:
     """Parameters common to all privacy schemes."""
 
@@ -60,7 +92,7 @@ class PrivacyParams:
     delta: float | None = None
 
 
-@dataclass
+@dataclass(frozen=True)
 class AllocationSchemeConfig:
     """Configuration for privacy schemes."""
 

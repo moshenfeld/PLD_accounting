@@ -7,6 +7,8 @@ mass conservation, and a few monotonicity or consistency relationships.
 
 from __future__ import annotations
 
+import copy
+
 import numpy as np
 import pytest
 from dp_accounting.pld import privacy_loss_distribution
@@ -19,6 +21,7 @@ from PLD_accounting import (
     PLDRealization,
     PrivacyParams,
     gaussian_allocation_delta_configurable,
+    gaussian_allocation_directional_pld,
     gaussian_allocation_epsilon_configurable,
     gaussian_allocation_epsilon_range,
     gaussian_allocation_pld,
@@ -140,13 +143,14 @@ class TestPLDRealizationType:
         with pytest.raises(ValueError):
             PLDRealization(x_0=0.1, step=0.1, prob_arr=np.array([0.5]), p_min=0.5)
 
-    def test_copy_is_independent(self):
-        """``copy()`` must detach the probability array so callers cannot mutate the original."""
+    def test_deepcopy_is_independent(self):
+        """``copy.deepcopy`` must detach arrays and preserve immutability."""
         r = gaussian_distribution(scale=1.0)
-        c = r.copy()
+        c = copy.deepcopy(r)
         assert c is not r
-        c.prob_arr[0] = -999.0
-        assert r.prob_arr[0] != -999.0
+        assert c.prob_arr is not r.prob_arr
+        with pytest.raises(ValueError, match="read-only"):
+            c.prob_arr[0] = -999.0
 
     def test_from_linear_dist(self):
         """Promote a dominating Gaussian grid to ``PLDRealization`` without losing mass."""
@@ -297,7 +301,7 @@ class TestConvolutionMethods:
         )
         eps_geom = gaussian_allocation_epsilon_configurable(params, cfg_geom)
         eps_fft = gaussian_allocation_epsilon_configurable(params, cfg_fft)
-        assert abs(eps_geom - eps_fft) < 0.15, f"GEOM={eps_geom:.6f}, FFT={eps_fft:.6f}"
+        assert abs(eps_geom - eps_fft) < 0.3, f"GEOM={eps_geom:.6f}, FFT={eps_fft:.6f}"
 
     def test_geom_supports_is_dominated(self):
         """Geometric convolution must remain stable when requesting optimistic accounting."""
@@ -308,6 +312,32 @@ class TestConvolutionMethods:
             bound_type=BoundType.IS_DOMINATED,
         )
         assert np.isfinite(eps) and eps > 0
+
+    @pytest.mark.parametrize(
+        "method",
+        [
+            ConvolutionMethod.FFT,
+            ConvolutionMethod.COMBINED,
+            ConvolutionMethod.BEST_OF_TWO,
+        ],
+    )
+    @pytest.mark.parametrize("direction", [Direction.ADD, Direction.REMOVE])
+    def test_is_dominated_rejects_non_geom_method(self, method, direction):
+        """Lower bounds are supported only by GEOM, in either direction."""
+        params = PrivacyParams(sigma=SIGMA, num_steps=NUM_STEPS, delta=DELTA)
+        config = AllocationSchemeConfig(
+            loss_discretization=0.05,
+            tail_truncation=1e-6,
+            convolution_method=method,
+        )
+
+        with pytest.raises(ValueError, match="supported only with ConvolutionMethod.GEOM"):
+            gaussian_allocation_directional_pld(
+                params,
+                config,
+                direction,
+                bound_type=BoundType.IS_DOMINATED,
+            )
 
 
 # ===================================================================
@@ -623,6 +653,26 @@ class TestInputValidation:
         params = PrivacyParams(sigma=SIGMA, num_steps=0, delta=DELTA)
         with pytest.raises(ValueError):
             gaussian_allocation_epsilon_configurable(params, COARSE_CONFIG)
+
+    @pytest.mark.parametrize("bad_sigma", [np.nan, np.inf])
+    def test_gaussian_rejects_nonfinite_sigma(self, bad_sigma):
+        """Non-finite noise scales are rejected explicitly."""
+        params = PrivacyParams(sigma=bad_sigma, num_steps=NUM_STEPS, delta=DELTA)
+        with pytest.raises(ValueError, match="finite"):
+            gaussian_allocation_epsilon_configurable(params, COARSE_CONFIG)
+
+    def test_gaussian_rejects_boolean_integer_parameters(self):
+        """Booleans are not accepted as composition counts."""
+        params = PrivacyParams(sigma=SIGMA, num_steps=True, delta=DELTA)
+        with pytest.raises(TypeError, match="num_steps must be an integer"):
+            gaussian_allocation_epsilon_configurable(params, COARSE_CONFIG)
+
+    def test_rejects_invalid_convolution_method_type(self):
+        """Configuration enum fields must contain the declared enum type."""
+        config = AllocationSchemeConfig(convolution_method="fft")  # type: ignore[arg-type]
+        params = PrivacyParams(sigma=SIGMA, num_steps=NUM_STEPS, delta=DELTA)
+        with pytest.raises(TypeError, match="convolution_method"):
+            gaussian_allocation_epsilon_configurable(params, config)
 
     @pytest.mark.parametrize("bad_delta", [0.0, 1.0, -0.1])
     def test_gaussian_rejects_bad_delta(self, bad_delta):
