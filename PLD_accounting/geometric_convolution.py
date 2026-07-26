@@ -69,7 +69,7 @@ def geometric_convolve(
     if tail_truncation < 0:
         raise ValueError(f"tail_truncation must be non-negative, got {tail_truncation}")
     # Ensure both inputs share the same growth factor.
-    if not stable_isclose(a=dist_1.step, b=dist_2.step):
+    if not stable_isclose(value_1=dist_1.step, value_2=dist_2.step):
         raise ValueError(
             f"Grid ratios must match: ratio_1={dist_1.step:.12g}, ratio_2={dist_2.step:.12g}"
         )
@@ -96,7 +96,7 @@ def geometric_convolve(
         prob_arr=dist_2.prob_arr,
         zero_prob=dist_1.p_min,
         x_out_0=output_origin,
-        r=ratio,
+        ratio=ratio,
         bound_type=bound_type,
     )
     pmf_conv = _add_single_zero_atom_cross_term(
@@ -105,7 +105,7 @@ def geometric_convolve(
         prob_arr=dist_1.prob_arr,
         zero_prob=dist_2.p_min,
         x_out_0=output_origin,
-        r=ratio,
+        ratio=ratio,
         bound_type=bound_type,
     )
 
@@ -134,7 +134,7 @@ def geometric_convolve(
 def geometric_self_convolve(
     *,
     dist: DenseDiscreteDist,
-    T: int,
+    num_convolutions: int,
     tail_truncation: float,
     bound_type: BoundType,
     lattice_anchor: float | None = None,
@@ -145,7 +145,7 @@ def geometric_self_convolve(
     ``lattice_anchor * r**k`` and each intermediate output uses the summed-anchor
     lattice. Precondition: ``dist.x_0`` should lie on that lattice (up to fp noise);
     a misaligned input still yields a valid bound, but the output no longer sits on
-    the claimed ``T * lattice_anchor * r**k`` grid.
+    the claimed ``num_convolutions * lattice_anchor * r**k`` grid.
     """
     # Input validation
     if not (isinstance(dist, DenseDiscreteDist) and dist.spacing_type == SpacingType.GEOMETRIC):
@@ -156,8 +156,8 @@ def geometric_self_convolve(
             f"got {type(dist).__name__} with spacing {spacing}"
         )
     validate_bound_type(bound_type)
-    if T < 1:
-        raise ValueError(f"T must be >= 1, got {T}")
+    if num_convolutions < 1:
+        raise ValueError(f"num_convolutions must be >= 1, got {num_convolutions}")
     if tail_truncation < 0:
         raise ValueError(f"tail_truncation must be non-negative, got {tail_truncation}")
     if lattice_anchor is not None and lattice_anchor <= 0:
@@ -165,7 +165,7 @@ def geometric_self_convolve(
 
     return binary_self_convolve(
         dist=dist,
-        T=T,
+        num_convolutions=num_convolutions,
         tail_truncation=tail_truncation,
         bound_type=bound_type,
         convolve=geometric_convolve,
@@ -270,8 +270,8 @@ def _compute_geometric_convolution(
 
     # --- C. Kernel Execution ---
     pmf_out = _geometric_kernel(
-        PMF_base=lower_pmf,
-        PMF_scaled=upper_pmf,
+        pmf_base=lower_pmf,
+        pmf_scaled=upper_pmf,
         delta_lohi=low_high_bin_offsets,
         delta_hilo=high_low_bin_offsets,
         output_size=num_output_bins,
@@ -282,8 +282,8 @@ def _compute_geometric_convolution(
 
 def _geometric_kernel(
     *,
-    PMF_base: NDArray[np.float64],
-    PMF_scaled: NDArray[np.float64],
+    pmf_base: NDArray[np.float64],
+    pmf_scaled: NDArray[np.float64],
     delta_lohi: NDArray[np.int64],
     delta_hilo: NDArray[np.int64],
     output_size: int,
@@ -291,15 +291,15 @@ def _geometric_kernel(
     """Dispatch geometric convolution to numba when available, else NumPy."""
     if has_numba():
         return _numba_geometric_kernel(
-            PMF_base=PMF_base,
-            PMF_scaled=PMF_scaled,
+            pmf_base=pmf_base,
+            pmf_scaled=pmf_scaled,
             delta_lohi=delta_lohi,
             delta_hilo=delta_hilo,
             output_size=output_size,
         )
     return _numpy_geometric_kernel(
-        PMF_base=PMF_base,
-        PMF_scaled=PMF_scaled,
+        pmf_base=pmf_base,
+        pmf_scaled=pmf_scaled,
         delta_lohi=delta_lohi,
         delta_hilo=delta_hilo,
         output_size=output_size,
@@ -309,8 +309,8 @@ def _geometric_kernel(
 @optional_njit()
 def _numba_geometric_kernel(
     *,
-    PMF_base: NDArray[np.float64],
-    PMF_scaled: NDArray[np.float64],
+    pmf_base: NDArray[np.float64],
+    pmf_scaled: NDArray[np.float64],
     delta_lohi: NDArray[np.int64],
     delta_hilo: NDArray[np.int64],
     output_size: int,
@@ -321,14 +321,14 @@ def _numba_geometric_kernel(
     For ``d > 0`` both orderings ``(i, i + d)`` and ``(i + d, i)`` are
     scattered to their rounded output bins.
     """
-    n = PMF_base.size
+    n = pmf_base.size
     pmf_out = np.zeros(output_size, dtype=np.float64)
     comp = np.zeros(output_size, dtype=np.float64)
 
     diagonal_shift = delta_lohi[0]
     for i in range(n):
         k = i + diagonal_shift
-        mass = PMF_base[i] * PMF_scaled[i]
+        mass = pmf_base[i] * pmf_scaled[i]
         if 0 <= k < output_size:
             y = mass - comp[k]
             t = pmf_out[k] + y
@@ -342,7 +342,7 @@ def _numba_geometric_kernel(
 
         for i in range(imax):
             k1 = i + kshift1
-            mass1 = PMF_base[i] * PMF_scaled[i + d]
+            mass1 = pmf_base[i] * pmf_scaled[i + d]
             if 0 <= k1 < output_size:
                 y = mass1 - comp[k1]
                 t = pmf_out[k1] + y
@@ -350,7 +350,7 @@ def _numba_geometric_kernel(
                 pmf_out[k1] = t
 
             k2 = i + kshift2
-            mass2 = PMF_base[i + d] * PMF_scaled[i]
+            mass2 = pmf_base[i + d] * pmf_scaled[i]
             if 0 <= k2 < output_size:
                 y = mass2 - comp[k2]
                 t = pmf_out[k2] + y
@@ -362,32 +362,32 @@ def _numba_geometric_kernel(
 
 def _numpy_geometric_kernel(
     *,
-    PMF_base: NDArray[np.float64],
-    PMF_scaled: NDArray[np.float64],
+    pmf_base: NDArray[np.float64],
+    pmf_scaled: NDArray[np.float64],
     delta_lohi: NDArray[np.int64],
     delta_hilo: NDArray[np.int64],
     output_size: int,
 ) -> NDArray[np.float64]:
     """Numpy fallback for the geometric convolution kernel."""
-    n = PMF_base.size
+    n = pmf_base.size
     pmf_out = np.zeros(output_size, dtype=np.float64)
     diagonal_indices = np.arange(n) + delta_lohi[0]
     valid_diagonal = (0 <= diagonal_indices) & (diagonal_indices < output_size)
     np.add.at(
         pmf_out,
         diagonal_indices[valid_diagonal],
-        (PMF_base * PMF_scaled)[valid_diagonal],
+        (pmf_base * pmf_scaled)[valid_diagonal],
     )
     for d in range(1, n):
         imax = n - d
         base_idx = np.arange(imax)
         k1 = base_idx + delta_lohi[d]
-        mass1 = PMF_base[:imax] * PMF_scaled[d:]
+        mass1 = pmf_base[:imax] * pmf_scaled[d:]
         valid1 = (0 <= k1) & (k1 < output_size)
         np.add.at(pmf_out, k1[valid1], mass1[valid1])
 
         k2 = base_idx + delta_hilo[d]
-        mass2 = PMF_base[d:] * PMF_scaled[:imax]
+        mass2 = pmf_base[d:] * pmf_scaled[:imax]
         valid2 = (0 <= k2) & (k2 < output_size)
         np.add.at(pmf_out, k2[valid2], mass2[valid2])
     return pmf_out
@@ -400,7 +400,7 @@ def _add_single_zero_atom_cross_term(
     prob_arr: NDArray[np.float64],
     zero_prob: float,
     x_out_0: float,
-    r: float,
+    ratio: float,
     bound_type: BoundType,
 ) -> NDArray[np.float64]:
     """Map one family of 0+finite cross-terms onto the fixed output grid."""
@@ -413,7 +413,7 @@ def _add_single_zero_atom_cross_term(
     if not np.any(valid):
         return pmf_conv
 
-    frac_k = np.log(x_vals[valid] / float(x_out_0)) / float(math.log(r))
+    frac_k = np.log(x_vals[valid] / float(x_out_0)) / float(math.log(ratio))
     if bound_type == BoundType.DOMINATES:
         k = np.ceil(frac_k - _BIN_SNAP_TOL).astype(np.int64)
         k = np.maximum(k, 0)

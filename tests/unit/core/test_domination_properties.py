@@ -12,20 +12,20 @@ from scipy import stats
 
 from PLD_accounting.discrete_dist import DenseDiscreteDist, Domain, SparseDiscreteDist
 from PLD_accounting.distribution_discretization import (
-    discretize_continuous_distribution,
+    discretize_continuous_stoch_dom,
 )
 from PLD_accounting.distribution_utils import compute_bin_width
 from PLD_accounting.geometric_convolution import (
     geometric_convolve,
 )
+from PLD_accounting.mechanisms import gaussian_distribution
 from PLD_accounting.subsample_pld import (
     _calc_subsampled_grid,
-    _mix_distributions,
     _stable_subsampling_transformation,
-    _subsample_dist,
     _subsample_dist_mix,
 )
 from PLD_accounting.types import BoundType, Direction, SpacingType
+from PLD_accounting.utils import calc_pld_dual, negate_reverse_linear_distribution
 from tests.test_tolerances import TestTolerances as TOL
 
 
@@ -46,13 +46,12 @@ class TestDominationSemantics:
     def test_dominates_has_no_neg_inf_mass(self):
         """Test that DOMINATES mode sets p_min= 0."""
         dist = stats.norm(loc=0.0, scale=1.0)
-        result = discretize_continuous_distribution(
+        result = discretize_continuous_stoch_dom(
             dist=dist,
             step=_linear_step_for_tail_truncation(dist, 0.01, 100),
             align_to_multiples=True,
             tail_truncation=0.01,
             bound_type=BoundType.DOMINATES,
-            spacing_type=SpacingType.LINEAR,
         )
 
         assert result.p_min == 0.0, f"DOMINATES mode should have p_min=0, got {result.p_min}"
@@ -60,13 +59,12 @@ class TestDominationSemantics:
     def test_is_dominated_has_no_pos_inf_mass(self):
         """Test that IS_DOMINATED mode sets p_max= 0."""
         dist = stats.norm(loc=0.0, scale=1.0)
-        result = discretize_continuous_distribution(
+        result = discretize_continuous_stoch_dom(
             dist=dist,
             step=_linear_step_for_tail_truncation(dist, 0.01, 100),
             align_to_multiples=True,
             tail_truncation=0.01,
             bound_type=BoundType.IS_DOMINATED,
-            spacing_type=SpacingType.LINEAR,
         )
 
         assert result.p_max == 0.0, f"IS_DOMINATED mode should have p_max=0, got {result.p_max}"
@@ -74,13 +72,12 @@ class TestDominationSemantics:
     def test_dominates_captures_left_tail(self):
         """Test that DOMINATES mode captures left tail in first bin."""
         dist = stats.norm(loc=0.0, scale=1.0)
-        result = discretize_continuous_distribution(
+        result = discretize_continuous_stoch_dom(
             dist=dist,
             step=_linear_step_for_tail_truncation(dist, 0.01, 100),
             align_to_multiples=True,
             tail_truncation=0.01,
             bound_type=BoundType.DOMINATES,
-            spacing_type=SpacingType.LINEAR,
         )
 
         # First bin should have mass from (-∞, x_0]
@@ -91,13 +88,12 @@ class TestDominationSemantics:
     def test_is_dominated_sends_left_tail_to_neg_inf(self):
         """Test that IS_DOMINATED mode sends left tail to -∞."""
         dist = stats.norm(loc=0.0, scale=1.0)
-        result = discretize_continuous_distribution(
+        result = discretize_continuous_stoch_dom(
             dist=dist,
             step=_linear_step_for_tail_truncation(dist, 0.01, 100),
             align_to_multiples=True,
             tail_truncation=0.01,
             bound_type=BoundType.IS_DOMINATED,
-            spacing_type=SpacingType.LINEAR,
         )
 
         # Should have some left tail mass at -∞
@@ -112,22 +108,20 @@ class TestStochasticDominance:
         """Test that E[upper] >= E[lower] (first-order stochastic dominance)."""
         dist = stats.norm(loc=0.0, scale=1.0)
 
-        upper = discretize_continuous_distribution(
+        upper = discretize_continuous_stoch_dom(
             dist=dist,
             step=_linear_step_for_tail_truncation(dist, 0.001, 200),
             align_to_multiples=True,
             tail_truncation=0.001,
             bound_type=BoundType.DOMINATES,
-            spacing_type=SpacingType.LINEAR,
         )
 
-        lower = discretize_continuous_distribution(
+        lower = discretize_continuous_stoch_dom(
             dist=dist,
             step=_linear_step_for_tail_truncation(dist, 0.001, 200),
             align_to_multiples=True,
             tail_truncation=0.001,
             bound_type=BoundType.IS_DOMINATED,
-            spacing_type=SpacingType.LINEAR,
         )
 
         # Compute expectations (over finite grid only)
@@ -144,22 +138,20 @@ class TestStochasticDominance:
         """Test that variance relationship is reasonable."""
         dist = stats.norm(loc=0.0, scale=1.0)
 
-        upper = discretize_continuous_distribution(
+        upper = discretize_continuous_stoch_dom(
             dist=dist,
             step=_linear_step_for_tail_truncation(dist, 0.001, 200),
             align_to_multiples=True,
             tail_truncation=0.001,
             bound_type=BoundType.DOMINATES,
-            spacing_type=SpacingType.LINEAR,
         )
 
-        lower = discretize_continuous_distribution(
+        lower = discretize_continuous_stoch_dom(
             dist=dist,
             step=_linear_step_for_tail_truncation(dist, 0.001, 200),
             align_to_multiples=True,
             tail_truncation=0.001,
             bound_type=BoundType.IS_DOMINATED,
-            spacing_type=SpacingType.LINEAR,
         )
 
         # Compute variances
@@ -274,13 +266,12 @@ class TestExponentialDistribution:
     def test_exponential_dominates_minimal_left_tail(self):
         """Test that exponential with DOMINATES has minimal left tail."""
         dist = stats.expon(scale=1.0)
-        result = discretize_continuous_distribution(
+        result = discretize_continuous_stoch_dom(
             dist=dist,
             step=_linear_step_for_tail_truncation(dist, 0.01, 100),
             align_to_multiples=True,
             tail_truncation=0.01,
             bound_type=BoundType.DOMINATES,
-            spacing_type=SpacingType.LINEAR,
         )
 
         # Exponential starts at 0, so left tail should be tiny
@@ -289,106 +280,36 @@ class TestExponentialDistribution:
     def test_exponential_is_dominated_no_pos_inf(self):
         """Test that exponential with IS_DOMINATED has no +∞ mass."""
         dist = stats.expon(scale=1.0)
-        result = discretize_continuous_distribution(
+        result = discretize_continuous_stoch_dom(
             dist=dist,
             step=_linear_step_for_tail_truncation(dist, 0.05, 100),
             align_to_multiples=True,
             tail_truncation=0.05,
             bound_type=BoundType.IS_DOMINATED,
-            spacing_type=SpacingType.LINEAR,
         )
 
         assert result.p_max == 0.0
 
 
-def _build_test_dist(x_array, pmf_array, *, p_min=0.0, p_max=0.0) -> SparseDiscreteDist:
-    finite_mass = 1.0 - p_min - p_max
-    if finite_mass <= 0.0:
-        raise ValueError("Boundary masses must leave positive finite mass")
-    pmf = np.array(pmf_array, dtype=np.float64)
-    pmf = pmf / math.fsum(map(float, pmf)) * finite_mass
-    return SparseDiscreteDist(
-        x_array=np.array(x_array, dtype=np.float64),
-        prob_arr=pmf,
-        p_min=p_min,
-        p_max=p_max,
+def _valid_subsampling_pair():
+    """Return a PLD realization and its transformed exact dual branch."""
+    base = gaussian_distribution(
+        2.0,
+        value_discretization=0.5,
+        tail_truncation=1e-8,
     )
+    neg_dual = negate_reverse_linear_distribution(calc_pld_dual(base))
+    return base, neg_dual
 
 
 class TestSubsampleDistMix:
-    """``_subsample_dist_mix`` should match explicit sequential subsample + mix semantics."""
-
-    _BASE_X = np.linspace(-3.0, 1.0, 6)
-    _BASE_PMF = np.array([0.1, 0.15, 0.2, 0.25, 0.15, 0.15], dtype=np.float64)
-    _REF_X = np.linspace(-2.5, 2.0, 6)
-    _REF_PMF = np.array([0.15, 0.2, 0.25, 0.2, 0.1, 0.1], dtype=np.float64)
-
-    @pytest.mark.parametrize(
-        "base_inf, ref_inf",
-        [
-            (
-                {"p_min": 0.0, "p_max": 0.05},
-                {"p_min": 0.0, "p_max": 0.03},
-            ),
-            (
-                {"p_min": 0.04, "p_max": 0.0},
-                {"p_min": 0.02, "p_max": 0.0},
-            ),
-        ],
-    )
-    def test_matches_sequential_discretization(self, base_inf, ref_inf):
-        """Mixed subsampled PLD must equal subsampling each factor then mixing with weight ``q``."""
-        sampling_prob = 0.37
-        direction = Direction.REMOVE
-        base_dist = _build_test_dist(self._BASE_X, self._BASE_PMF, **base_inf)
-        ref_dist = _build_test_dist(self._REF_X, self._REF_PMF, **ref_inf)
-
-        result = _subsample_dist_mix(
-            base_pld=base_dist,
-            neg_dual_pld=ref_dist,
-            sampling_prob=sampling_prob,
-            direction=direction,
-        )
-
-        base_subsampled = _subsample_dist(
-            base_pld=base_dist,
-            sampling_prob=sampling_prob,
-            direction=direction,
-            target_x_array=result.x_array,
-        )
-        ref_subsampled = _subsample_dist(
-            base_pld=ref_dist,
-            sampling_prob=sampling_prob,
-            direction=direction,
-            target_x_array=result.x_array,
-        )
-        coupled = _mix_distributions(
-            dist_1=base_subsampled,
-            dist_2=ref_subsampled,
-            weight_first=sampling_prob,
-        )
-
-        np.testing.assert_allclose(
-            result.x_array,
-            coupled.x_array,
-            rtol=TOL.ARRAY_RTOL_ULTRA,
-            atol=TOL.GRID_EXACT_ATOL,
-        )
-        np.testing.assert_allclose(
-            result.prob_arr,
-            coupled.prob_arr,
-            rtol=TOL.PMF_COUPLED_RTOL,
-            atol=TOL.PMF_COUPLED_ATOL,
-        )
-        assert np.isclose(result.p_min, coupled.p_min, rtol=TOL.INF_MASS_RTOL)
-        assert np.isclose(result.p_max, coupled.p_max, rtol=TOL.INF_MASS_RTOL)
+    """``_subsample_dist_mix`` transforms, mixes, and CtD-projects once."""
 
     def test_grid_covers_transformed_range(self):
         """The coupled lattice must span the transformed finite endpoints and subsampling caps."""
         sampling_prob = 0.4
         direction = Direction.REMOVE
-        base_dist = _build_test_dist(self._BASE_X, self._BASE_PMF, p_min=0.0, p_max=0.02)
-        ref_dist = _build_test_dist(self._REF_X, self._REF_PMF, p_min=0.0, p_max=0.01)
+        base_dist, ref_dist = _valid_subsampling_pair()
 
         result = _subsample_dist_mix(
             base_pld=base_dist,
@@ -425,13 +346,12 @@ class TestSubsampleDistMix:
         """With ``target_x_array`` set, the mixture must use that lattice exactly."""
         sampling_prob = 0.25
         direction = Direction.REMOVE
-        base_dist = _build_test_dist(self._BASE_X, self._BASE_PMF, p_min=0.0, p_max=0.0)
-        ref_dist = _build_test_dist(self._REF_X, self._REF_PMF, p_min=0.0, p_max=0.0)
+        base_dist, ref_dist = _valid_subsampling_pair()
         target_grid = _calc_subsampled_grid(
             min_loss=base_dist.x_array[0],
             discretization=compute_bin_width(base_dist.x_array),
             num_buckets=int(base_dist.x_array.size),
-            grid_size=sampling_prob,
+            sampling_prob=sampling_prob,
             direction=direction,
         )
 

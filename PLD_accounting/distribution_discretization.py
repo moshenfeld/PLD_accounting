@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import replace
 from typing import Any
 
@@ -11,58 +12,89 @@ from scipy import stats
 from scipy.stats._distn_infrastructure import rv_frozen
 
 from PLD_accounting.discrete_dist import (
+    REALIZATION_MOMENT_TOL,
     DenseDiscreteDist,
     DiscreteDistBase,
     Domain,
     GridSpec,
     PLDRealization,
 )
-from PLD_accounting.distribution_utils import enforce_mass_conservation
-from PLD_accounting.types import BoundType, SpacingType, has_numba, optional_njit
+from PLD_accounting.distribution_utils import (
+    PMF_MASS_TOL,
+    enforce_mass_conservation,
+    exp_moment_terms,
+    kahan_reverse_exclusive_cumsum,
+)
+from PLD_accounting.types import (
+    BoundType,
+    SpacingType,
+    has_numba,
+    optional_njit,
+)
+from PLD_accounting.validation import validate_finite_array
 
 # =============================================================================
 # Public API: Continuous Distribution Discretization
 # =============================================================================
 
 
-def discretize_continuous_distribution(
+def discretize_continuous_ctd(
+    *,
+    dist: stats.rv_continuous | rv_frozen[Any, Any],
+    dual_dist: stats.rv_continuous | rv_frozen[Any, Any],
+    tail_truncation: float,
+    step: float,
+    align_to_multiples: bool,
+) -> PLDRealization:
+    """Construct a dominating fixed-gap real-loss PLD with connect-the-dots.
+
+    Args:
+        dist: Continuous privacy-loss distribution.
+        dual_dist: Exact dual privacy-loss distribution.
+        tail_truncation: Tail probability used to define finite grid bounds.
+        step: Linear bin width.
+        align_to_multiples: Whether to align the quantile-derived bounds to integer step multiples.
+    """
+    grid = aligned_grid_params(
+        x_min=float(dist.ppf(tail_truncation)),
+        x_max=float(dist.isf(tail_truncation)),
+        spacing_type=SpacingType.LINEAR,
+        align_to_multiples=align_to_multiples,
+        discretization=step,
+    )
+    privacy_profile = _continuous_real_privacy_profile(
+        pld_in=dist,
+        dual_pld_in=dual_dist,
+        eps_out=grid.materialize(),
+    )
+    return _pld_from_privacy_profile_ctd(
+        privacy_profile=privacy_profile,
+        x_0_out=grid.x_0,
+        step_out=grid.step,
+    )
+
+
+def discretize_continuous_stoch_dom(
     *,
     dist: stats.rv_continuous | rv_frozen[Any, Any],
     tail_truncation: float,
     bound_type: BoundType,
-    spacing_type: SpacingType,
     step: float,
     align_to_multiples: bool,
     domain: Domain = Domain.REALS,
 ) -> DenseDiscreteDist:
-    """Discretize a continuous distribution to a typed structured representation.
-
-    Args:
-        dist: Continuous distribution to discretize.
-        tail_truncation: Tail mass budget used to define quantile bounds and bin increment floor.
-        bound_type: Tie-breaking direction for interval mass assignment.
-        spacing_type: Output grid spacing family (linear or geometric).
-        step: Linear bin width or geometric multiplicative ratio.
-        align_to_multiples: Whether to align the quantile-derived bounds to integer step multiples.
-        domain: Domain semantics for boundary masses in the output discrete distribution.
-
-    Returns:
-        Discretized distribution on a structured dense grid.
-    """
-
-    grid = _continuous_to_grid(
-        dist=dist,
-        tail_truncation=tail_truncation,
-        spacing_type=spacing_type,
-        step=step,
+    """Discretize a continuous law with directional stochastic domination."""
+    grid = aligned_grid_params(
+        x_min=float(dist.ppf(tail_truncation)),
+        x_max=float(dist.isf(tail_truncation)),
+        spacing_type=SpacingType.LINEAR,
         align_to_multiples=align_to_multiples,
+        discretization=step,
     )
     if grid.x_0 <= 0 and domain == Domain.POSITIVES:
         dist_name = getattr(dist, "name", type(dist).__name__)
         raise ValueError(f"Cannot discretize {dist_name} to a positive range, got x_0={grid.x_0}")
-
-    # 2. Map density to PMF with semantics.
-    return discretize_continuous_dist(
+    return discretize_continuous_stoch_dom_on_grid(
         dist=dist,
         grid=grid,
         bound_type=bound_type,
@@ -71,7 +103,7 @@ def discretize_continuous_distribution(
     )
 
 
-def discretize_continuous_dist(
+def discretize_continuous_stoch_dom_on_grid(
     *,
     dist: stats.rv_continuous | rv_frozen[Any, Any],
     grid: GridSpec,
@@ -79,24 +111,31 @@ def discretize_continuous_dist(
     pmf_min_increment: float,
     domain: Domain = Domain.REALS,
 ) -> DenseDiscreteDist:
-    """Convert continuous distribution to discrete PMF with bounding semantics.
+    """Discretize a continuous law onto a caller-supplied grid with stochastic domination.
 
-    The grid is described by an exact :class:`GridSpec` rather than a materialized
-    ``x_array``; its ``step`` is carried straight through to the result, so the
-    output spacing is exactly the requested one -- no round-trip through
-    ``compute_bin_width``.
+    Interval mass is assigned to the upper knot for ``DOMINATES`` and the
+    lower knot for ``IS_DOMINATED``; the opposite tail remains a boundary mass.
+
+    Args:
+        dist: Continuous law to discretize.
+        grid: Exact output grid; no quantile-derived range is computed here.
+        bound_type: Rounding direction for interval mass.
+        pmf_min_increment: Minimum CDF/SF increment that becomes a bin mass.
+        domain: Support-domain semantics of the result.
+
+    Returns:
+        The discretized distribution on ``grid``.
     """
     x_array = grid.materialize()
-    # Compute raw probabilities for intervals [x_i, x_{i+1}) using pmf_min_increment.
+    # Compute the finite interval probabilities; tails remain separate boundary masses.
     bin_probs, p_left, p_right = _compute_discrete_prob(
         dist=dist, x_array=x_array, bound_type=bound_type, pmf_min_increment=pmf_min_increment
     )
-
     prob_arr = np.zeros(grid.n)
 
     if bound_type == BoundType.DOMINATES:
         # Shift mass right: left tail (-inf, x0) -> x0,
-        # each interval [x_i, x_{i+1}) -> x_{i+1}, right tail (x_n, inf) -> inf,
+        # each interval [x_i, x_{i+1}) -> x_{i+1}, right tail (x_n, inf) -> +inf.
         prob_arr[0] = p_left
         prob_arr[1:] = bin_probs
         p_min = 0.0
@@ -104,39 +143,88 @@ def discretize_continuous_dist(
 
     elif bound_type == BoundType.IS_DOMINATED:
         # Shift mass left: left tail (-inf, x0) -> -inf,
-        # each interval [x_i, x_{i+1}) -> x_i, right tail (x_n, inf) -> x_n,
+        # each interval [x_i, x_{i+1}) -> x_i, right tail (x_n, inf) -> x_n.
         prob_arr[:-1] = bin_probs
         prob_arr[-1] = p_right
         p_min = p_left
         p_max = 0.0
+
     else:
         raise ValueError(f"Unknown BoundType: {bound_type}")
+    return DenseDiscreteDist(
+        x_0=grid.x_0,
+        step=grid.step,
+        prob_arr=prob_arr,
+        p_min=p_min,
+        p_max=p_max,
+        domain=domain,
+    )
 
-    if grid.spacing_type == SpacingType.LINEAR:
-        return DenseDiscreteDist(
-            x_0=grid.x_0,
-            step=grid.step,
-            prob_arr=prob_arr,
-            p_min=p_min,
-            p_max=p_max,
-            domain=domain,
+
+def rediscretize_dist_by_bound(
+    *,
+    dist: DiscreteDistBase,
+    tail_truncation: float,
+    loss_discretization: float,
+    bound_type: BoundType,
+) -> DenseDiscreteDist:
+    """Rediscretize a real-loss distribution using its fixed bound semantics.
+
+    Dominating fixed-gap real-loss outputs use CtD. Dominated outputs use
+    directional stochastic domination. This is structural routing by the
+    mathematical bound direction, not a configurable discretization method.
+    """
+    if bound_type == BoundType.DOMINATES:
+        return rediscretize_dist_ctd(
+            dist=dist,
+            tail_truncation=tail_truncation,
+            loss_discretization=loss_discretization,
         )
-
-    if grid.spacing_type == SpacingType.GEOMETRIC:
-        return DenseDiscreteDist(
-            x_0=grid.x_0,
-            step=grid.step,
-            prob_arr=prob_arr,
-            p_min=p_min,
-            p_max=p_max,
-            spacing_type=SpacingType.GEOMETRIC,
-            domain=Domain.POSITIVES,
+    if bound_type == BoundType.IS_DOMINATED:
+        return rediscretize_dist_stoch_dom(
+            dist=dist,
+            tail_truncation=tail_truncation,
+            loss_discretization=loss_discretization,
+            spacing_type=SpacingType.LINEAR,
+            bound_type=bound_type,
         )
+    raise ValueError(f"Unknown BoundType: {bound_type}")
 
-    raise ValueError(f"Invalid spacing_type: {grid.spacing_type}")
+
+def rediscretize_dist_ctd(
+    *,
+    dist: DiscreteDistBase,
+    tail_truncation: float,
+    loss_discretization: float,
+) -> PLDRealization:
+    """Rediscretize a real-loss PLD onto a fixed-gap grid with CtD."""
+    working_dist = fold_absorbable_boundary_atom(
+        dist=dist,
+        spacing_type=SpacingType.LINEAR,
+        bound_type=BoundType.DOMINATES,
+    )
+    trunc_dist = working_dist.truncate_edges(
+        tail_truncation=tail_truncation / 2,
+        bound_type=BoundType.DOMINATES,
+    )
+    x_min = float(trunc_dist.x_array[0])
+    x_max = float(trunc_dist.x_array[-1])
+    if x_max == x_min:
+        raise ValueError(
+            "rediscretize_dist_ctd requires at least two distinct finite "
+            f"support points after truncation, got x_min=x_max={x_min}"
+        )
+    grid_out = aligned_grid_params(
+        x_min=x_min,
+        x_max=x_max,
+        spacing_type=SpacingType.LINEAR,
+        align_to_multiples=True,
+        discretization=loss_discretization,
+    )
+    return project_dist_onto_grid_ctd(dist=trunc_dist, grid=grid_out)
 
 
-def rediscretize_dist(
+def rediscretize_dist_stoch_dom(
     *,
     dist: DiscreteDistBase,
     tail_truncation: float,
@@ -144,7 +232,7 @@ def rediscretize_dist(
     spacing_type: SpacingType,
     bound_type: BoundType,
 ) -> DenseDiscreteDist:
-    """Rediscretize a distribution onto a requested grid spacing.
+    """Rediscretize a distribution with directional stochastic domination.
 
     Remaps PMF onto a new grid with the requested spacing and discretization.
     Implementation trims zero/tail regions, computes new grid size, then remaps
@@ -153,7 +241,6 @@ def rediscretize_dist(
     Algorithm 6 (`disc-dist`), in Appendix C
     of https://arxiv.org/abs/2602.17284.
     """
-
     # A lower-bound discretization is not an exact PLD realization.  Convert
     # explicitly before any mass-moving operation so every subsequent rebuild
     # preserves the correct (weaker) representation type.
@@ -188,7 +275,7 @@ def rediscretize_dist(
         discretization=loss_discretization,
     )
 
-    return project_dist_onto_grid(
+    return project_dist_onto_grid_stoch_dom(
         dist=trunc_dist,
         grid=grid_out,
         expected_p_min=working_dist.p_min,
@@ -227,7 +314,33 @@ def fold_absorbable_boundary_atom(
     )
 
 
-def project_dist_onto_grid(
+def project_dist_onto_grid_ctd(
+    *,
+    dist: DiscreteDistBase,
+    grid: GridSpec,
+) -> PLDRealization:
+    """CtD-project a valid real-loss PLD source onto a fixed-gap grid.
+
+    CtD accepts any discrete source that is itself a semantically valid PLD
+    realization.  This validates the source object only; callers remain
+    responsible for ensuring that it dominates the external mechanism being
+    accounted for.
+    """
+    if grid.spacing_type != SpacingType.LINEAR:
+        raise ValueError("CtD projection requires a fixed-gap linear grid")
+    _validate_ctd_source(dist)
+    privacy_profile = _discrete_dist_privacy_profile(
+        dist_in=dist,
+        eps_out=grid.materialize(),
+    )
+    return _pld_from_privacy_profile_ctd(
+        privacy_profile=privacy_profile,
+        x_0_out=grid.x_0,
+        step_out=grid.step,
+    )
+
+
+def project_dist_onto_grid_stoch_dom(
     *,
     dist: DiscreteDistBase,
     grid: GridSpec,
@@ -235,13 +348,7 @@ def project_dist_onto_grid(
     expected_p_max: float,
     bound_type: BoundType,
 ) -> DenseDiscreteDist:
-    """Project a distribution onto ``grid`` with domination-aware rounding.
-
-    Remaps the PMF onto the target grid (DOMINATES rounds up, IS_DOMINATED rounds
-    down) and re-enforces mass conservation against the expected boundary atoms.
-    ``grid.step`` is carried through to the result unchanged, so the output spacing
-    is exactly the requested one.
-    """
+    """Project a distribution onto ``grid`` with directional rounding."""
     x_array_out = grid.materialize()
     prob_arr_out = rediscretize_prob(
         x_array=dist.x_array,
@@ -291,9 +398,8 @@ def aligned_grid_params(
     """Return a :class:`GridSpec` covering [x_min, x_max].
 
     The returned spec is the single source of truth for a uniform grid and is
-    meant to be passed straight to grid consumers (e.g. ``discretize_continuous_dist``,
-    ``project_dist_onto_grid``), avoiding any re-derivation of the spacing from a
-    materialized array.
+    meant to be passed straight to grid consumers, avoiding any re-derivation
+    of the spacing from a materialized array.
 
     Args:
         x_min: Minimum value of the range.
@@ -322,30 +428,6 @@ def aligned_grid_params(
     if spacing_type == SpacingType.LINEAR:
         return _linear_grid_params(x_min, x_max, d, align_to_multiples)
     return _geometric_grid_params(x_min, x_max, d, align_to_multiples)
-
-
-def discretize_aligned_range(
-    *,
-    x_min: float,
-    x_max: float,
-    spacing_type: SpacingType,
-    align_to_multiples: bool,
-    discretization: float,
-) -> NDArray[np.float64]:
-    """Return a materialized grid covering [x_min, x_max].
-
-    Thin wrapper over :func:`aligned_grid_params` that materializes the grid into
-    an array, for callers that genuinely need the points. Callers that build a
-    discrete distribution should prefer ``aligned_grid_params`` and thread the
-    ``GridSpec`` through unchanged.
-    """
-    return aligned_grid_params(
-        x_min=x_min,
-        x_max=x_max,
-        spacing_type=spacing_type,
-        align_to_multiples=align_to_multiples,
-        discretization=discretization,
-    ).materialize()
 
 
 def rediscretize_prob(
@@ -440,27 +522,185 @@ def _numpy_rediscretize_prob(
     dominates: bool,
 ) -> NDArray[np.float64]:
     """Numpy fallback for remapping PMF onto a new grid."""
-    n_out = x_array_out.size
-    prob_arr_out = np.zeros(n_out, dtype=np.float64)
+    prob_arr_out = np.zeros(x_array_out.size, dtype=np.float64)
     positive = prob_arr > 0.0
+    values = x_array[positive]
     if dominates:
-        indices = np.searchsorted(x_array_out, x_array[positive], side="left")
-        valid = indices < n_out
+        indices = np.searchsorted(x_array_out, values, side="left").astype(np.intp, copy=False)
+        valid = indices < x_array_out.size
     else:
-        indices = np.searchsorted(x_array_out, x_array[positive], side="right") - 1
+        indices = np.searchsorted(x_array_out, values, side="right").astype(np.intp, copy=False) - 1
         valid = indices >= 0
     np.add.at(prob_arr_out, indices[valid], prob_arr[positive][valid])
     return prob_arr_out
 
 
-def _cover_x_max(grid: GridSpec, x_max: float) -> GridSpec:
-    """Grow ``n`` until the materialized endpoint covers ``x_max`` after float rounding."""
-    n = grid.n
-    candidate = grid
-    while candidate.last_point() < x_max:
-        n += 1
-        candidate = replace(grid, n=n)
-    return candidate
+def _continuous_real_privacy_profile(
+    *,
+    pld_in: stats.rv_continuous | rv_frozen[Any, Any],
+    dual_pld_in: stats.rv_continuous | rv_frozen[Any, Any],
+    eps_out: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Evaluate ``delta(eps)`` from a PLD and its dual.
+
+    Atoms at ``L = eps`` contribute zero to the hockey-stick divergence. Use
+    the strict identity
+    ``delta(eps) = Pr[L > eps] - exp(eps) Pr[D(L) < -eps]``. The dual's strict
+    CDF is evaluated at the representable point immediately below ``-eps``.
+    """
+    eps = np.asarray(eps_out, dtype=np.float64)
+    validate_finite_array(eps, "privacy-profile epsilon")
+    pld_sf = np.asarray(pld_in.sf(eps), dtype=np.float64)
+    dual_left_limit = np.nextafter(-eps, -np.inf)
+    dual_log_cdf = np.asarray(dual_pld_in.logcdf(dual_left_limit), dtype=np.float64)
+    if np.any(~np.isfinite(pld_sf)) or np.any(np.isnan(dual_log_cdf)):
+        raise ValueError("PLD and dual CDF evaluations must not be NaN")
+    dual_cdf_eps = _safe_exp(eps + dual_log_cdf)
+    return _validate_real_privacy_profile(eps=eps, profile=pld_sf - dual_cdf_eps)
+
+
+def _discrete_dist_privacy_profile(
+    *,
+    dist_in: DiscreteDistBase,
+    eps_out: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Evaluate a PLD realization's hockey-stick profile."""
+    eps = np.asarray(eps_out, dtype=np.float64)
+    validate_finite_array(eps, "privacy-profile epsilon")
+    # Include the positive-infinity boundary atom locally so the tail sums use
+    # one representation for both finite and boundary mass.
+    losses = np.concatenate((dist_in.x_array, np.array([np.inf])))
+    masses = np.concatenate((dist_in.prob_arr, np.array([dist_in.p_max])))
+    reciprocal_moment = exp_moment_terms(prob_arr=masses, x_vals=losses)
+    reciprocal_moment_total = math.fsum(map(float, reciprocal_moment))
+
+    tail_mass = kahan_reverse_exclusive_cumsum(np.concatenate(([0.0], masses)))
+    tail_moment = kahan_reverse_exclusive_cumsum(np.concatenate(([0.0], reciprocal_moment)))
+    indices = np.asarray(np.searchsorted(losses, eps, side="right"), dtype=np.intp)
+
+    selected_moment = tail_moment[indices]
+    log_selected_moment = np.full_like(selected_moment, -np.inf)
+    positive = selected_moment > 0.0
+    log_selected_moment[positive] = np.log(selected_moment[positive])
+    profile = tail_mass[indices] - _safe_exp(eps + log_selected_moment)
+    return _validate_real_privacy_profile(
+        eps=eps,
+        profile=profile,
+        reciprocal_moment=reciprocal_moment_total,
+    )
+
+
+def _pld_from_privacy_profile_ctd(
+    *,
+    privacy_profile: NDArray[np.float64],
+    x_0_out: float,
+    step_out: float,
+) -> PLDRealization:
+    """PLD-validating inversion on output knots ``x_0_out + k * step_out``."""
+    delta = np.asarray(privacy_profile, dtype=np.float64)
+    if step_out <= 0.0:
+        raise ValueError("CtD output step must be positive")
+    if delta.size < 2:
+        raise ValueError("CtD profile inversion requires at least two values")
+    validate_finite_array(delta, "CtD privacy profile")
+    if np.any(delta < 0.0) or np.any(delta > 1.0):
+        raise ValueError("CtD privacy profile must be finite and lie in [0, 1]")
+    # Privacy profiles are non-increasing in epsilon. Evaluators can violate
+    # this by a few ULPs in extreme tails; remove only that numerical noise
+    # before the fixed-gap CtD inversion, and reject material violations.
+    increases = np.diff(delta)
+    if np.any(increases > PMF_MASS_TOL):
+        raise ValueError(
+            "privacy profile is not convex/monotone enough for fixed-gap CtD inversion"
+        )
+    delta = np.minimum.accumulate(delta)
+
+    exp_step = math.exp(-step_out)
+    denominator = -math.expm1(-step_out)
+    diff = np.diff(delta)
+    prob = np.empty_like(delta)
+    prob[0] = 1.0 - delta[0] + exp_step * diff[0] / denominator
+    prob[1:-1] = (exp_step * diff[1:] - diff[:-1]) / denominator
+    prob[-1] = -diff[-1] / denominator
+    # The division by ``denominator`` amplifies cancellation noise in the
+    # delta differences by 1/(1 - exp(-step)), so test convexity in delta
+    # space (numerator scale) rather than on the amplified probabilities.
+    if np.min(prob) < -PMF_MASS_TOL / denominator:
+        raise ValueError("privacy profile is not convex enough for fixed-gap CtD inversion")
+    prob = np.maximum(prob, 0.0)
+    prob, p_min, p_max = enforce_mass_conservation(
+        prob_arr=prob,
+        expected_p_min=0.0,
+        expected_p_max=float(delta[-1]),
+        bound_type=BoundType.DOMINATES,
+    )
+    return PLDRealization(
+        x_0=float(x_0_out),
+        step=float(step_out),
+        prob_arr=prob,
+        p_min=p_min,
+        p_max=p_max,
+    )
+
+
+def _validate_real_privacy_profile(
+    *,
+    eps: NDArray[np.float64],
+    profile: NDArray[np.float64],
+    reciprocal_moment: float | None = None,
+) -> NDArray[np.float64]:
+    """Validate universal range and negative-epsilon PLD constraints."""
+    profile = np.asarray(profile, dtype=np.float64)
+    validate_finite_array(profile, "privacy profile")
+    if profile.shape != eps.shape:
+        raise ValueError("privacy profile shape must match epsilon shape")
+    if np.any(profile < -PMF_MASS_TOL) or np.any(profile > 1.0 + PMF_MASS_TOL):
+        raise ValueError("privacy profile must lie in [0, 1]")
+    profile = np.clip(profile, 0.0, 1.0)
+    negative = eps < 0.0
+    moment_for_floor = (
+        1.0 + REALIZATION_MOMENT_TOL
+        if reciprocal_moment is None
+        else min(reciprocal_moment, 1.0 + REALIZATION_MOMENT_TOL)
+    )
+    pld_floor = 1.0 - np.exp(eps[negative]) * moment_for_floor
+    if np.any(profile[negative] < pld_floor - PMF_MASS_TOL):
+        raise ValueError("privacy profile violates the PLD lower bound for negative epsilon")
+    return profile
+
+
+def _validate_ctd_source(dist: DiscreteDistBase) -> None:
+    """Validate the semantic PLD-realization contract required by CtD."""
+    if dist.domain != Domain.REALS:
+        raise ValueError("CtD projection requires a real-domain source")
+    if dist.p_min != 0.0:
+        raise ValueError(f"CtD projection requires p_min = 0 exactly, got {dist.p_min:.2e}")
+    support = np.asarray(dist.x_array, dtype=np.float64)
+    validate_finite_array(support, "CtD source support")
+    if support.size == 0 or np.any(np.diff(support) <= 0.0):
+        raise ValueError("CtD projection requires finite, strictly increasing support")
+    moment_terms = exp_moment_terms(prob_arr=dist.prob_arr, x_vals=support)
+    if np.any(~np.isfinite(moment_terms)):
+        raise ValueError("CtD source reciprocal moment must be finite")
+    reciprocal_moment = math.fsum(map(float, moment_terms))
+    if reciprocal_moment > 1.0 + REALIZATION_MOMENT_TOL:
+        raise ValueError(
+            "CtD source reciprocal-moment violates E[exp(-L)] <= 1 under the "
+            "PLD invariant tolerance"
+        )
+
+
+def _safe_exp(log_values_in: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Exponentiate log-values, flushing underflow to 0 and clamping overflow.
+
+    Privacy-profile terms routinely underflow in deep tails, where the exact
+    value is indistinguishable from zero; clamping the upper end keeps a single
+    ``inf`` from poisoning an otherwise finite profile.
+    """
+    out = np.zeros_like(log_values_in, dtype=np.float64)
+    active = log_values_in > math.log(np.finfo(float).tiny)
+    out[active] = np.exp(np.minimum(log_values_in[active], math.log(np.finfo(float).max)))
+    return out
 
 
 def _linear_grid_params(x_min: float, x_max: float, d: float, align_to_multiples: bool) -> GridSpec:
@@ -503,6 +743,16 @@ def _geometric_grid_params(
         x0 = x_min
         n = int(np.ceil(np.log(x_max / x_min) / d)) + 1
     return _cover_x_max(GridSpec(x_0=x0, step=step, n=n, spacing_type=SpacingType.GEOMETRIC), x_max)
+
+
+def _cover_x_max(grid: GridSpec, x_max: float) -> GridSpec:
+    """Grow ``n`` until the materialized endpoint covers ``x_max`` after float rounding."""
+    n = grid.n
+    candidate = grid
+    while candidate.last_point() < x_max:
+        n += 1
+        candidate = replace(grid, n=n)
+    return candidate
 
 
 @optional_njit()
@@ -575,6 +825,13 @@ def _stable_cdf_and_sf(
     dist: stats.rv_continuous | rv_frozen[Any, Any],
     x_array: NDArray[np.float64],
 ) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Evaluate CDF and survival function without catastrophic cancellation.
+
+    Below the median the CDF is the small quantity and the SF is recovered from
+    it; above the median the roles swap. Both are computed through the log
+    variants so the small side keeps full relative precision instead of being
+    formed as ``1 - (nearly 1)``.
+    """
     median = dist.median()
     cdf = np.empty_like(x_array, dtype=np.float64)
     sf = np.empty_like(x_array, dtype=np.float64)
@@ -617,13 +874,15 @@ def _compute_discrete_prob(
     pmf_min_increment = max(0.0, pmf_min_increment)
 
     if bound_type == BoundType.DOMINATES:
-        # Suppress intermediate debug logging.
+        # A dominating bin mass accumulates upward from the CDF, so mass lands on
+        # the upper knot of each interval.
         bin_probs = _adaptive_bins_from_cdf(
             cdf=cdf,
             tail_truncation=pmf_min_increment,
         )
     elif bound_type == BoundType.IS_DOMINATED:
-        # Suppress intermediate debug logging.
+        # A dominated bin mass accumulates downward from the survival function,
+        # so mass lands on the lower knot of each interval.
         bin_probs = _adaptive_bins_from_sf(
             sf=sf,
             tail_truncation=pmf_min_increment,
@@ -632,38 +891,3 @@ def _compute_discrete_prob(
         raise ValueError(f"Unknown BoundType: {bound_type}")
 
     return bin_probs, p_left, p_right
-
-
-def _continuous_to_grid(
-    *,
-    dist: stats.rv_continuous | rv_frozen[Any, Any],
-    tail_truncation: float,
-    spacing_type: SpacingType,
-    step: float,
-    align_to_multiples: bool,
-) -> GridSpec:
-    """Return a ``GridSpec`` covering the quantile range defined by tail_truncation."""
-    # Determine support bounds via quantiles
-    x_min = float(dist.ppf(tail_truncation))
-    x_max = float(dist.isf(tail_truncation))
-    if not np.isfinite(x_min) or not np.isfinite(x_max):
-        raise ValueError(f"Quantiles not finite: x_min={x_min}, x_max={x_max}")
-
-    if spacing_type == SpacingType.GEOMETRIC:
-        if step <= 1.0:
-            raise ValueError(f"Geometric step must be > 1, got {step}")
-        discretization = float(np.log(step))
-    elif spacing_type == SpacingType.LINEAR:
-        if step <= 0.0:
-            raise ValueError(f"Linear step must be positive, got {step}")
-        discretization = float(step)
-    else:
-        raise ValueError(f"Invalid spacing_type: {spacing_type}")
-
-    return aligned_grid_params(
-        x_min=x_min,
-        x_max=x_max,
-        spacing_type=spacing_type,
-        align_to_multiples=align_to_multiples,
-        discretization=discretization,
-    )

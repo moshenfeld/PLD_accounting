@@ -1,6 +1,15 @@
 # PLD_accounting
 
-``PLD_accounting`` is a Python package for tight differential privacy accounting for random allocation and subsampling using Privacy Loss Distributions (PLDs) as described in: [Efficient privacy loss accounting for subsampling and random allocation](https://arxiv.org/pdf/2602.17284)
+``PLD_accounting`` is a Python package for tight differential privacy accounting for random allocation and subsampling using Privacy Loss Distributions (PLDs), as described in:
+
+> Vitaly Feldman and Moshe Shenfeld. *[Efficient Privacy Loss Accounting for Subsampling and Random Allocation](https://arxiv.org/abs/2602.17284).* International Conference on Machine Learning (ICML), 2026.
+
+## Paper version
+
+The [`PLD-paper`](https://github.com/moshenfeld/PLD_accounting/tree/PLD-paper)
+branch preserves the code snapshot corresponding to the paper. Refer to that
+branch for a stable paper-version reference; the default branch continues to
+receive subsequent development changes.
 
 ## Purpose
 
@@ -66,16 +75,20 @@ Not every `ConvolutionMethod` can produce both bounds. Only the geometric backen
 builds the one-step factors in a way that rounds *down* throughout, which is what a
 valid lower bound requires; the FFT routes round up. Passing an unsupported pair
 raises `ValueError` rather than silently returning a bound that does not hold.
-
-| `ConvolutionMethod` | `DOMINATES` (upper) | `IS_DOMINATED` (lower) |
-|---|---|---|
-| `GEOM` | ✅ | ✅ |
-| `FFT` | ✅ | ❌ |
-| `COMBINED` | ✅ | ❌ |
-| `BEST_OF_TWO` | ✅ | ❌ |
-
 This applies to both `Direction.ADD` and `Direction.REMOVE`. Use
 `ConvolutionMethod.GEOM` whenever you need a lower bound.
+
+Dominating fixed-gap real-loss construction always uses connect-the-dots
+(CtD). Lower bounds, FFT positive/exp-space factors, and geometric-grid
+regridding use the internal stochastic-domination engine required by those
+representations. This routing is fixed by the operation; there is no public
+discretization-method option.
+
+For fixed-gap real-loss regridding, use
+`rediscretize_dist_by_bound(dist, tail_truncation, loss_discretization,
+bound_type)`. This public entry point selects CtD for `DOMINATES` and
+directional stochastic domination for `IS_DOMINATED`; callers do not choose a
+discretization engine.
 
 ### Mechanism PLD Helpers
 
@@ -87,8 +100,14 @@ Factory helpers for building `PLDRealization` inputs from specific mechanisms:
 - `laplace_distribution(scale, value_discretization, tail_truncation, bound_type=BoundType.DOMINATES)`
   - Discretizes the Laplace mechanism PLD (L1 sensitivity 1) onto a linear grid.
   - Same return semantics as `gaussian_distribution`.
+- `discrete_distribution(*, noise_dist, loss_discretization, tail_truncation, sensitivity=1)`
+  - Builds the dominating `(remove_realization, add_realization)` pair for an integer count query with additive noise described by a unit-spaced `DenseDiscreteDist`.
+  - Builds exact sparse directional loss distributions, then delegates truncation and fixed-gap projection to `rediscretize_dist_by_bound`.
+  - Treats the input distribution's distinct `p_min` and `p_max` masses as unmatched noise tails and maps both entirely to positive-infinity privacy loss.
 
-For both, `scale` is the noise standard deviation (Gaussian) or Laplace scale parameter. Pass the result directly as `remove_realization` and `add_realization` to the general allocation APIs.
+For Gaussian and Laplace, `scale` is the noise standard deviation or Laplace scale parameter,
+respectively. Pass mechanism results directly as `remove_realization` and `add_realization` to
+the general allocation APIs.
 
 ### Subsampling APIs
 

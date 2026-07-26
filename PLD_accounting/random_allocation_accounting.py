@@ -10,7 +10,9 @@ import numpy as np
 from dp_accounting.pld import privacy_loss_distribution
 
 from PLD_accounting.discrete_dist import DenseDiscreteDist
-from PLD_accounting.distribution_discretization import rediscretize_dist
+from PLD_accounting.distribution_discretization import (
+    rediscretize_dist_by_bound,
+)
 from PLD_accounting.distribution_utils import stable_isclose
 from PLD_accounting.dp_accounting_support import linear_dist_to_dp_accounting_pmf
 from PLD_accounting.fft_convolution import (
@@ -167,11 +169,11 @@ def geometric_allocation_pld_base_remove(
         # stages together stay within loss_discretization.
         loss_discretization /= remove_geometric_loss_discretization_count(num_steps)
         # Tail: three phases each receive tail_truncation / 3:
-        #   Phase 1 (base_distributions_creation): per-factor budget /(3T); the dual is
-        #            self-convolved T-1 times and the base convolved once, amplifying the
-        #            total contribution back to budget/3.
-        #   Phase 2 (geometric_self_convolve, T-1) and Phase 3 (geometric_convolve):
-        #            budget/3 each.
+        #   Phase 1 (base_distributions_creation): per-factor budget /(3 * num_steps); the
+        #            dual is self-convolved num_steps-1 times and the base convolved once,
+        #            amplifying the total contribution back to budget/3.
+        #   Phase 2 (geometric_self_convolve, num_steps-1) and Phase 3
+        #            (geometric_convolve): budget/3 each.
         tail_truncation /= 3
     # Each base factor's tail error is amplified by num_steps through self-convolution,
     # so scale its budget down by num_steps to stay within the phase budget.
@@ -212,12 +214,12 @@ def geometric_allocation_pld_base_remove(
     # V_{t-1} <- self-conv(V1, t-1, ...).
     exp_convolved_dual = geometric_self_convolve(
         dist=exp_neg_dual,
-        T=num_steps - 1,
+        num_convolutions=num_steps - 1,
         tail_truncation=tail_truncation,
         bound_type=bound_type,
         lattice_anchor=factor_anchor,
     )
-    # U_t <- conv(V_{t-1}, U1, ...). The T normalized factors sum to anchor 1.
+    # U_t <- conv(V_{t-1}, U1, ...). The num_convolutions normalized factors sum to anchor 1.
     exp_convolved = geometric_convolve(
         dist_1=exp_convolved_dual,
         dist_2=exp_base,
@@ -290,7 +292,7 @@ def geometric_allocation_pld_base_add(
     # U_t <- self-conv(U, t, lower).
     exp_convolved = geometric_self_convolve(
         dist=exp_base,
-        T=num_steps,
+        num_convolutions=num_steps,
         tail_truncation=tail_truncation,
         bound_type=exp_bound_type,
         lattice_anchor=1.0 / num_steps,
@@ -322,10 +324,9 @@ def compose_full_pld(
             "PLD construction requires remove-direction distribution. "
             "Provide remove_realization or use both directions."
         )
-    pessimistic_estimate = bound_type == BoundType.DOMINATES
     pmf_remove = linear_dist_to_dp_accounting_pmf(
         dist=remove_dist,
-        pessimistic_estimate=pessimistic_estimate,
+        bound_type=bound_type,
     )
     if add_dist is None:
         return privacy_loss_distribution.PrivacyLossDistribution(
@@ -333,7 +334,7 @@ def compose_full_pld(
         )
     pmf_add = linear_dist_to_dp_accounting_pmf(
         dist=add_dist,
-        pessimistic_estimate=pessimistic_estimate,
+        bound_type=bound_type,
     )
     return privacy_loss_distribution.PrivacyLossDistribution(
         pmf_remove=pmf_remove,
@@ -384,7 +385,7 @@ def _align_component_grids(
     coarsening inside ``compute_base_pld`` can still produce unequal ones.
     Align to the coarser of the two and warn.
     """
-    if stable_isclose(a=dist_floor.step, b=dist_ceil.step):
+    if stable_isclose(value_1=dist_floor.step, value_2=dist_ceil.step):
         return dist_floor, dist_ceil
     floor_step_before = dist_floor.step
     ceil_step_before = dist_ceil.step
@@ -392,21 +393,18 @@ def _align_component_grids(
     ceil_size_before = dist_ceil.prob_arr.size
     target_step = max(dist_floor.step, dist_ceil.step)
     if dist_floor.step < target_step:
-        dist_floor = rediscretize_dist(
+        dist_floor = rediscretize_dist_by_bound(
             dist=dist_floor,
-            # Alignment is a pure directional projection; tail mass was already
-            # budgeted by the component builders and must not be spent again.
+            # Alignment must not spend the tail budget a second time.
             tail_truncation=0.0,
             loss_discretization=target_step,
-            spacing_type=SpacingType.LINEAR,
             bound_type=bound_type,
         )
     else:
-        dist_ceil = rediscretize_dist(
+        dist_ceil = rediscretize_dist_by_bound(
             dist=dist_ceil,
             tail_truncation=0.0,
             loss_discretization=target_step,
-            spacing_type=SpacingType.LINEAR,
             bound_type=bound_type,
         )
     warnings.warn(
@@ -441,12 +439,12 @@ def _allocation_directional_pld_core(
         #            (compute_base_pld, truncate_edges, optional rediscretize_dist), each with
         #            base_tail_truncation = tail_truncation / (3 * num_epochs).  Amplified total:
         #            num_epochs * 3 * tail_truncation / (3 * num_epochs) = tail_truncation.
-        #   Phase 2 (fft_self_convolve, T=num_epochs): tail_truncation directly.
+        #   Phase 2 (fft_self_convolve, num_convolutions=num_epochs): tail_truncation directly.
         #   Phase 3 (final truncate_edges): tail_truncation directly.
         tail_truncation /= 3
-        # Loss: T-fold convolution of a base distribution with step s accumulates quantization
-        # error of at most num_epochs * s, so divide by num_epochs.  FFT self-convolution is
-        # algebraically exact and introduces no additional rounding.
+        # Loss: composing a base distribution with step s num_epochs times accumulates
+        # quantization error of at most num_epochs * s, so divide by num_epochs.  FFT
+        # self-convolution is algebraically exact and introduces no additional rounding.
         base_loss_discretization = loss_discretization / num_epochs
     else:
         # num_epochs == 1: fft_self_convolve is SKIPPED, so only Phases 1 and 3 are active;
@@ -469,18 +467,18 @@ def _allocation_directional_pld_core(
         isinstance(prepared_base_dist, DenseDiscreteDist)
         and prepared_base_dist.spacing_type == SpacingType.LINEAR
     ):
-        _st = getattr(prepared_base_dist, "spacing_type", "?")
         raise TypeError(
             "Expected DenseDiscreteDist with LINEAR spacing, "
-            f"got {type(prepared_base_dist).__name__} with spacing {_st}"
+            f"got {type(prepared_base_dist).__name__} with spacing "
+            f"{getattr(prepared_base_dist, 'spacing_type', '?')}"
         )
 
     if num_epochs == 1:
         composed_dist = prepared_base_dist
     else:
-        # Cap base distribution so fft_self_convolve(T=num_epochs) stays within
-        # MAX_FFT_BYTES.  For the direct method the FFT size is T * pmf_size;
-        # for the binary method the worst-case FFT size is also T * pmf_size
+        # Cap base distribution so fft_self_convolve(num_convolutions=num_epochs) stays within
+        # MAX_FFT_BYTES.  For the direct method the FFT size is num_convolutions * pmf_size;
+        # for the binary method the worst-case FFT size is also num_convolutions * pmf_size
         # (before truncation shrinks intermediate steps).
         max_base_pmf = max(
             _MIN_BASE_PMF_BINS,
@@ -490,16 +488,15 @@ def _allocation_directional_pld_core(
             capped_step = prepared_base_dist.step * math.ceil(
                 prepared_base_dist.prob_arr.size / max_base_pmf
             )
-            prepared_base_dist = rediscretize_dist(
+            prepared_base_dist = rediscretize_dist_by_bound(
                 dist=prepared_base_dist,
                 tail_truncation=base_tail_truncation,
                 loss_discretization=capped_step,
-                spacing_type=SpacingType.LINEAR,
                 bound_type=bound_type,
             )
         composed_dist = fft_self_convolve(
             dist=prepared_base_dist,
-            T=num_epochs,
+            num_convolutions=num_epochs,
             tail_truncation=tail_truncation,
             bound_type=bound_type,
             use_direct=True,
@@ -511,9 +508,9 @@ def _allocation_directional_pld_core(
     if not (
         isinstance(final_dist, DenseDiscreteDist) and final_dist.spacing_type == SpacingType.LINEAR
     ):
-        _st = getattr(final_dist, "spacing_type", "?")
         raise TypeError(
             "Expected DenseDiscreteDist with LINEAR spacing, "
-            f"got {type(final_dist).__name__} with spacing {_st}"
+            f"got {type(final_dist).__name__} with spacing "
+            f"{getattr(final_dist, 'spacing_type', '?')}"
         )
     return final_dist

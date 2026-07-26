@@ -14,14 +14,17 @@ from dp_accounting.pld.pld_pmf import DensePLDPmf, PLDPmf, SparsePLDPmf
 from PLD_accounting.discrete_dist import (
     REALIZATION_MOMENT_TOL,
     DenseDiscreteDist,
+    Domain,
     PLDRealization,
 )
 from PLD_accounting.distribution_utils import (
     MAX_SAFE_EXP_ARG,
+    PMF_MASS_TOL,
     SPACING_ATOL,
     exp_moment_terms,
 )
-from PLD_accounting.types import SpacingType
+from PLD_accounting.types import BoundType, SpacingType
+from PLD_accounting.validation import validate_bound_type
 
 # ============================================================================
 # Public conversion adapters
@@ -31,7 +34,7 @@ from PLD_accounting.types import SpacingType
 def linear_dist_to_dp_accounting_pmf(
     *,
     dist: DenseDiscreteDist,
-    pessimistic_estimate: bool = True,
+    bound_type: BoundType,
 ) -> DensePLDPmf:
     """Convert a linear-grid loss PMF to a dp_accounting PMF.
 
@@ -52,8 +55,11 @@ def linear_dist_to_dp_accounting_pmf(
     ``dist.p_max`` (mass at ``+inf``) becomes the PMF's infinity mass.
 
     Args:
-        dist: Linear-grid loss distribution. Must be a linear DenseDiscreteDist.
-        pessimistic_estimate: Whether to use pessimistic estimate in dp_accounting.
+        dist: Linear-grid loss distribution whose origin may be off the
+            integer lattice used by dp_accounting.
+        bound_type: Direction in which the lattice conversion must bound
+            ``dist``. Dominating conversion shifts the grid up; dominated
+            conversion shifts it down.
 
     Returns:
         dp_accounting DensePLDPmf with infinity mass taken from dist.p_max.
@@ -65,17 +71,22 @@ def linear_dist_to_dp_accounting_pmf(
             "expected DenseDiscreteDist with LINEAR spacing, "
             f"got {type(dist).__name__} with spacing {spacing}"
         )
+    validate_bound_type(bound_type)
+    if dist.domain != Domain.REALS:
+        raise ValueError("dp_accounting PMF conversion requires a real-domain loss distribution")
+    if bound_type == BoundType.DOMINATES and dist.p_min > PMF_MASS_TOL:
+        raise ValueError("Dominating PMF conversion requires p_min = 0")
 
     ratio = dist.x_0 / dist.step
     base_index = int(np.rint(ratio))
     if abs(dist.x_0 - base_index * dist.step) > SPACING_ATOL:
-        base_index = math.ceil(ratio) if pessimistic_estimate else math.floor(ratio)
+        base_index = math.ceil(ratio) if bound_type == BoundType.DOMINATES else math.floor(ratio)
     return DensePLDPmf(
         discretization=dist.step,
         lower_loss=base_index,
         probs=dist.prob_arr.astype(np.float64),
         infinity_mass=dist.p_max,
-        pessimistic_estimate=pessimistic_estimate,
+        pessimistic_estimate=bound_type == BoundType.DOMINATES,
     )
 
 
@@ -106,7 +117,7 @@ def dp_accounting_pmf_to_pld_realization(pmf: PLDPmf) -> PLDRealization:
 
 
 # ============================================================================
-# Conversion and lattice helpers
+# Conversion helpers
 # ============================================================================
 
 

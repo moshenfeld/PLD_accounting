@@ -59,7 +59,7 @@ Both input modes share this shape:
 
 The active runtime is built on:
 
-- `DenseDiscreteDist`: regular-grid distribution with `x_min`, `step`,
+- `DenseDiscreteDist`: regular-grid distribution with `x_0`, `step`,
   `spacing_type`, `prob_arr`, `p_min`, and `p_max`.
 - `SparseDiscreteDist`: explicit-support distribution with `x_array`,
   `prob_arr`, `p_min`, and `p_max`.
@@ -73,6 +73,46 @@ Boundary semantics depend on `Domain`:
 - `Domain.POSITIVES`:
   - `p_min` is mass at `0`
   - `p_max` is mass at `+inf`
+
+CtD is the fixed engine for dominating fixed-gap real-loss construction. It
+reconstructs a PLD from its hockey-stick profile; there is no public method
+selector. Lower bounds, FFT positive/exp-space factors, and geometric-grid
+regridding use separate stochastic-domination functions because CtD is not
+defined for those representations. A CtD target grid must be linear and
+fixed-gap. A discrete source may be dense or sparse, but must use
+`Domain.REALS`, have exact `p_min == 0`, finite strictly ordered support,
+conserved mass, and reciprocal moment `E[exp(-L)] <= 1` under the shared
+realization tolerance. These checks certify the object as a realizable PLD,
+not its domination relationship to an external mechanism.
+
+Linear real-loss callers route through the public
+`rediscretize_dist_by_bound` helper. Bound direction alone selects the
+engine: `DOMINATES` uses CtD and `IS_DOMINATED` uses stochastic domination.
+
+CtD is used because repeatedly rounding every atom upward can accumulate an
+`O(compositions * step)` loss-space shift. CtD instead evaluates the source's
+hockey-stick profile on the target knots and inverts those values to a
+fixed-gap PLD. Convex interpolation in `exp(epsilon)` preserves the upper-bound
+profile without the systematic one-cell shift at every projection. This is a
+structural domination argument, not a universal accuracy guarantee; numerical
+accuracy must still be assessed against converged or independent references.
+
+The CtD source check is intentionally local to
+`distribution_discretization.py`: it validates the algorithm-specific semantic
+contract after generic distribution constructors have already checked shape,
+mass, and boundary nonnegativity. In particular, CtD cannot accept lower
+infinite mass, non-real support, unordered support, or a reciprocal moment
+above one. The reciprocal moment is `E[exp(-L)]`, the total mass of the implied
+dual law on the source's finite support. It is also used when validating the
+negative-epsilon profile floor `delta(epsilon) >= 1 - exp(epsilon) E[exp(-L)]`;
+using the measured value gives the correct stronger floor when the dual law is
+a sub-probability because of singular mass.
+
+For continuous and mixed laws, an atom at `L = epsilon` contributes exactly
+zero to the hockey-stick integrand. The implementation uses the strict identity
+`delta(epsilon) = Pr[L > epsilon] - exp(epsilon) Pr[D < -epsilon]`, evaluating
+the dual CDF immediately below `-epsilon` with `nextafter` so an atom at the
+threshold is excluded while retaining the standard `sf`/`logcdf` interfaces.
 
 ## Parameter Budget Conventions
 
@@ -131,11 +171,11 @@ discretization before shared composition finalization.
 | `PLD_accounting/random_allocation_gaussian.py` | Gaussian-specific factor construction and convolution method selection. |
 | `PLD_accounting/random_allocation_realization.py` | Realization-specific factor construction from `PLDRealization` inputs. |
 | `PLD_accounting/adaptive_random_allocation.py` | Adaptive upper/lower range refinement for epsilon/delta queries. |
-| `PLD_accounting/mechanisms.py` | Mechanism PLD factory helpers (`gaussian_distribution`, `laplace_distribution`). |
+| `PLD_accounting/mechanisms.py` | Mechanism PLD factory helpers (`gaussian_distribution`, `laplace_distribution`, `discrete_distribution`). |
 | `PLD_accounting/validation.py` | Centralized input validation (`validate_privacy_params`, `validate_allocation_params`, etc.). |
 | `PLD_accounting/discrete_dist.py` | Distribution classes (`DenseDiscreteDist`, `SparseDiscreteDist`, `PLDRealization`, `Domain`). |
 | `PLD_accounting/distribution_discretization.py` | Continuous-to-discrete conversion and spacing changes (linear/geometric). |
-| `PLD_accounting/FFT_convolution.py` | FFT-based convolution and self-convolution on linear grids. |
+| `PLD_accounting/fft_convolution.py` | FFT-based convolution and self-convolution on linear grids. |
 | `PLD_accounting/geometric_convolution.py` | Convolution and self-convolution on geometric grids. |
 | `PLD_accounting/utils.py` | PLD transforms (`exp`, `log`, dual, negate-reverse, composition helpers). |
 | `PLD_accounting/distribution_utils.py` | Numerical utilities (mass conservation, spacing checks, stable comparisons). |
@@ -160,6 +200,8 @@ Mechanism PLD helpers (defined in `PLD_accounting/mechanisms.py`):
 
 - `gaussian_distribution(scale, value_discretization, tail_truncation, bound_type)`
 - `laplace_distribution(scale, value_discretization, tail_truncation, bound_type)`
+- `discrete_distribution(*, noise_dist, loss_discretization, tail_truncation, sensitivity=1)`
+  - Maps both input noise-boundary masses (`p_min` and `p_max`) to positive-infinity privacy loss; they are separate unmatched tails and need not agree.
 
 Subsampling (defined in `PLD_accounting/subsample_pld.py`):
 
@@ -168,6 +210,7 @@ Subsampling (defined in `PLD_accounting/subsample_pld.py`):
 
 Distribution type (defined in `PLD_accounting/discrete_dist.py`):
 
+- `DenseDiscreteDist` — regular-grid distribution used to describe integer count noise.
 - `PLDRealization` — linear-grid privacy-loss distribution used as input to realization APIs.
 
 Notes:

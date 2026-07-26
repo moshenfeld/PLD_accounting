@@ -43,7 +43,7 @@ def fft_convolve(
         raise ValueError(f"Input domains must be identical, got {dist_1.domain} vs {dist_2.domain}")
     if not np.any(dist_1.prob_arr) or not np.any(dist_2.prob_arr):
         raise ValueError("FFT convolution requires nonzero finite mass in both inputs")
-    if not stable_isclose(a=dist_1.step, b=dist_2.step):
+    if not stable_isclose(value_1=dist_1.step, value_2=dist_2.step):
         raise ValueError(f"Grid spacing must match: w1={dist_1.step:.12g} vs w2={dist_2.step:.12g}")
 
     width = dist_1.step
@@ -111,12 +111,12 @@ def fft_convolve(
 def fft_self_convolve(
     *,
     dist: DenseDiscreteDist,
-    T: int,
+    num_convolutions: int,
     tail_truncation: float,
     bound_type: BoundType,
     use_direct: bool,
 ) -> DenseDiscreteDist:
-    """T-fold self-convolution via FFT with optional direct exponentiation path."""
+    """Self-convolve ``num_convolutions`` times via FFT, optionally by direct exponentiation."""
     if not (isinstance(dist, DenseDiscreteDist) and dist.spacing_type == SpacingType.LINEAR):
         spacing = getattr(dist, "spacing_type", "?")
         raise TypeError(
@@ -129,20 +129,21 @@ def fft_self_convolve(
         try:
             return _fft_self_convolve_direct(
                 dist=dist,
-                T=T,
+                num_convolutions=num_convolutions,
                 tail_truncation=tail_truncation,
                 bound_type=bound_type,
             )
         except MemoryError:
             warnings.warn(
                 f"fft_self_convolve: direct method exceeded {MAX_FFT_BYTES / 1024**3:.0f} GB "
-                f"memory limit for T={T}, pmf_size={dist.prob_arr.size:,}. "
+                f"memory limit for num_convolutions={num_convolutions}, "
+                f"pmf_size={dist.prob_arr.size:,}. "
                 f"Falling back to binary self-convolution."
             )
 
     return binary_self_convolve(
         dist=dist,
-        T=T,
+        num_convolutions=num_convolutions,
         tail_truncation=tail_truncation,
         bound_type=bound_type,
         convolve=fft_convolve,
@@ -152,10 +153,18 @@ def fft_self_convolve(
 def _fft_self_convolve_direct(
     *,
     dist: DenseDiscreteDist,
-    T: int,
+    num_convolutions: int,
     tail_truncation: float,
     bound_type: BoundType,
 ) -> DenseDiscreteDist:
+    """Self-convolve in one shot by raising the PMF's DFT to the ``num_convolutions`` power.
+
+    A Chernoff bound sizes the retained output window, so the single transform
+    stays bounded instead of growing with the full ``num_convolutions``-fold
+    support. Raises ``MemoryError`` when that window still exceeds the FFT
+    safety limit, which the caller treats as a signal to fall back to binary
+    self-convolution.
+    """
     # Budget split: the input tail_truncation is divided into three equal thirds.
     #   _calc_fft_window_size: Chernoff-based window determines the one-sided tail
     #          cutoff (right-tail for DOMINATES, folded-back mass bound for IS_DOMINATED).
@@ -175,13 +184,17 @@ def _fft_self_convolve_direct(
     tail_truncation_rescaled = tail_truncation / finite_mass
 
     shift_left, window_size = _calc_fft_window_size(
-        pmf=normalized_pmf, num_convolutions=T, tail_truncation=tail_truncation_rescaled
+        pmf=normalized_pmf,
+        num_convolutions=num_convolutions,
+        tail_truncation=tail_truncation_rescaled,
     )
 
     fft_size = next_fast_len(max(window_size, dist.prob_arr.size))
-    _check_fft_memory(fft_size, label=f"_fft_self_convolve_direct(T={T})")
+    _check_fft_memory(
+        fft_size, label=f"_fft_self_convolve_direct(num_convolutions={num_convolutions})"
+    )
     fft_data = rfft(dist.prob_arr, n=fft_size)
-    fft_data **= T  # in-place power: avoids allocating a second complex buffer
+    fft_data **= num_convolutions  # in-place power: avoids allocating a second complex buffer
     raw_conv = np.asarray(irfft(fft_data, n=fft_size, overwrite_x=True), dtype=np.float64)
     del fft_data  # free complex buffer
     raw_conv[raw_conv < 0] = 0.0
@@ -189,7 +202,7 @@ def _fft_self_convolve_direct(
     # that window to index 0 so truncation logic can work in-place.
     rolled_conv = np.roll(raw_conv, -shift_left)
 
-    conv_p_min, conv_p_max = self_convolve_boundary_masses(dist, num_convolutions=T)
+    conv_p_min, conv_p_max = self_convolve_boundary_masses(dist, num_convolutions=num_convolutions)
     if bound_type == BoundType.DOMINATES:
         # For an upper bound, any dropped left-tail mass is pushed to +inf.
         cumsum = np.cumsum(rolled_conv)
@@ -216,7 +229,7 @@ def _fft_self_convolve_direct(
     else:
         raise ValueError(f"Unknown BoundType: {bound_type}")
 
-    x_min = dist.x_0 * T + shift_left * dist.step
+    x_min = dist.x_0 * num_convolutions + shift_left * dist.step
     pmf_conv = rolled_conv[:window_size]
     pmf_conv, p_min_final, p_max_final = enforce_mass_conservation(
         prob_arr=pmf_conv,

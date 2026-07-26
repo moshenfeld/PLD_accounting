@@ -7,6 +7,7 @@ from dp_accounting.pld import privacy_loss_distribution as dp_pld
 from PLD_accounting.discrete_dist import PLDRealization
 from PLD_accounting.dp_accounting_support import linear_dist_to_dp_accounting_pmf
 from PLD_accounting.subsample_pld import subsample_pld
+from PLD_accounting.types import BoundType
 
 
 def _make_pld_remove_only() -> dp_pld.PrivacyLossDistribution:
@@ -16,7 +17,7 @@ def _make_pld_remove_only() -> dp_pld.PrivacyLossDistribution:
         step=0.5,
         prob_arr=np.array([0.4, 0.3, 0.2, 0.1], dtype=np.float64),
     )
-    pmf = linear_dist_to_dp_accounting_pmf(dist=dist, pessimistic_estimate=True)
+    pmf = linear_dist_to_dp_accounting_pmf(dist=dist, bound_type=BoundType.DOMINATES)
     return dp_pld.PrivacyLossDistribution(pmf_remove=pmf)
 
 
@@ -33,8 +34,8 @@ def _make_pld_both_directions() -> dp_pld.PrivacyLossDistribution:
         prob_arr=np.array([0.24, 0.2, 0.18, 0.16, 0.14], dtype=np.float64),
         p_max=0.08,
     )
-    remove_pmf = linear_dist_to_dp_accounting_pmf(dist=remove_dist, pessimistic_estimate=True)
-    add_pmf = linear_dist_to_dp_accounting_pmf(dist=add_dist, pessimistic_estimate=True)
+    remove_pmf = linear_dist_to_dp_accounting_pmf(dist=remove_dist, bound_type=BoundType.DOMINATES)
+    add_pmf = linear_dist_to_dp_accounting_pmf(dist=add_dist, bound_type=BoundType.DOMINATES)
     return dp_pld.PrivacyLossDistribution(pmf_remove=remove_pmf, pmf_add=add_pmf)
 
 

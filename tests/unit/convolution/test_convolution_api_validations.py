@@ -34,7 +34,7 @@ def test_fft_requires_linear_spacing():
     with pytest.raises(TypeError, match="DenseDiscreteDist"):
         fft_self_convolve(
             dist=geometric,
-            T=2,
+            num_convolutions=2,
             tail_truncation=0.0,
             bound_type=BoundType.DOMINATES,
             use_direct=True,

@@ -17,9 +17,11 @@ from PLD_accounting import (
     AllocationSchemeConfig,
     BoundType,
     ConvolutionMethod,
+    DenseDiscreteDist,
     Direction,
     PLDRealization,
     PrivacyParams,
+    discrete_distribution,
     gaussian_allocation_delta_configurable,
     gaussian_allocation_directional_pld,
     gaussian_allocation_epsilon_configurable,
@@ -30,10 +32,10 @@ from PLD_accounting import (
     general_allocation_epsilon,
     general_allocation_pld,
     laplace_distribution,
+    rediscretize_dist_by_bound,
     subsample_pld,
     subsample_pld_realization,
 )
-from PLD_accounting.discrete_dist import DenseDiscreteDist
 
 # ---------------------------------------------------------------------------
 # Shared constants — deliberately coarse for speed
@@ -95,6 +97,23 @@ class TestMechanismDistributions:
         d = laplace_distribution(scale=1.0, bound_type=BoundType.IS_DOMINATED)
         assert isinstance(d, DenseDiscreteDist)
         assert not isinstance(d, PLDRealization)
+
+    def test_count_noise_returns_directional_realizations(self):
+        """The public discrete-noise helper returns valid REMOVE and ADD PLDs."""
+        noise_dist = DenseDiscreteDist(
+            x_0=-2.0,
+            step=1.0,
+            prob_arr=np.array([0.1, 0.2, 0.4, 0.2, 0.1]),
+        )
+        remove, add = discrete_distribution(
+            noise_dist=noise_dist,
+            loss_discretization=0.05,
+            tail_truncation=0.0,
+        )
+        assert isinstance(remove, PLDRealization)
+        assert isinstance(add, PLDRealization)
+        assert _total_mass(remove) == pytest.approx(1.0)
+        assert _total_mass(add) == pytest.approx(1.0)
 
     @pytest.mark.parametrize("mech", [gaussian_distribution, laplace_distribution])
     @pytest.mark.parametrize("bt", [BoundType.DOMINATES, BoundType.IS_DOMINATED])
@@ -167,6 +186,27 @@ class TestPLDRealizationType:
         assert isinstance(t, PLDRealization)
         assert len(t.prob_arr) <= orig_len
         assert abs(_total_mass(t) - 1.0) < MASS_TOL
+
+    @pytest.mark.parametrize(
+        ("bound_type", "expected_type"),
+        [
+            (BoundType.DOMINATES, PLDRealization),
+            (BoundType.IS_DOMINATED, DenseDiscreteDist),
+        ],
+    )
+    def test_public_linear_rediscretization_routes_by_bound(self, bound_type, expected_type):
+        """The public router fixes CtD/stochastic selection from bound semantics."""
+        source = gaussian_distribution(scale=2.0, value_discretization=0.05)
+        result = rediscretize_dist_by_bound(
+            dist=source,
+            tail_truncation=0.0,
+            loss_discretization=0.1,
+            bound_type=bound_type,
+        )
+
+        assert isinstance(result, expected_type)
+        if bound_type == BoundType.IS_DOMINATED:
+            assert not isinstance(result, PLDRealization)
 
 
 # ===================================================================

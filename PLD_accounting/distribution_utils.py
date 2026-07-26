@@ -7,13 +7,13 @@ import math
 import numpy as np
 from numpy.typing import NDArray
 
-from PLD_accounting.types import BoundType
+from PLD_accounting.types import BoundType, optional_njit
 from PLD_accounting.validation import validate_discrete_pmf_and_boundaries
 
 PMF_MASS_TOL = 10 * np.finfo(float).eps  # total-mass tolerance (10× machine epsilon)
 SPACING_ATOL = 1e-12
 SPACING_RTOL = 1e-6
-MIN_GRID_SIZE = 100  # Minimum number of points in a  discretization grid.
+MIN_GRID_SIZE = 100  # Minimum number of points in a discretization grid.
 MAX_SAFE_EXP_ARG = math.log(np.finfo(np.float64).max)
 
 # =============================================================================
@@ -104,7 +104,7 @@ def compute_bin_ratio_two_arrays(
     """Compute geometric spacing ratio for two grids and return their average."""
     r1 = compute_bin_ratio(x_array_1)
     r2 = compute_bin_ratio(x_array_2)
-    if not stable_isclose(a=r1, b=r2):
+    if not stable_isclose(value_1=r1, value_2=r2):
         raise ValueError(f"Grid ratios must match: ratio_1={r1:.12g}, ratio_2={r2:.12g}")
     return (r1 + r2) / 2
 
@@ -115,7 +115,7 @@ def compute_bin_width_two_arrays(
     """Compute linear spacing width for two grids and return their average."""
     w1 = compute_bin_width(x_array_1)
     w2 = compute_bin_width(x_array_2)
-    if not stable_isclose(a=w1, b=w2):
+    if not stable_isclose(value_1=w1, value_2=w2):
         raise ValueError(f"Grid spacing must match: w1={w1:.12g} vs w2={w2:.12g}")
     return (w1 + w2) / 2
 
@@ -157,14 +157,39 @@ def compute_bin_width(x_array: NDArray[np.float64]) -> float:
     return float(median_diff)
 
 
-def stable_isclose(*, a: float, b: float) -> bool:
+# =============================================================================
+# Numerical Stability Utilities
+# =============================================================================
+
+
+@optional_njit()
+def kahan_reverse_exclusive_cumsum(
+    values: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Compute ``out[i] = sum(values[i + 1:])`` with Kahan summation."""
+    n = len(values)
+    ccdf = np.zeros(n, dtype=np.float64)
+    running_sum = 0.0
+    compensation = 0.0
+    for i in range(n - 1, -1, -1):
+        ccdf[i] = running_sum
+        y = values[i] - compensation
+        updated = running_sum + y
+        compensation = (updated - running_sum) - y
+        running_sum = updated
+    return ccdf
+
+
+def stable_isclose(*, value_1: float, value_2: float) -> bool:
     """Consistent closeness check using shared spacing tolerances."""
-    return bool(np.isclose(a, b, rtol=SPACING_RTOL, atol=SPACING_ATOL))
+    return bool(np.isclose(value_1, value_2, rtol=SPACING_RTOL, atol=SPACING_ATOL))
 
 
-def stable_array_equal(*, a: NDArray[np.float64], b: NDArray[np.float64]) -> bool:
+def stable_array_equal(*, value_1: NDArray[np.float64], value_2: NDArray[np.float64]) -> bool:
     """Consistent array closeness check using shared spacing tolerances."""
-    return a.shape == b.shape and np.allclose(a, b, rtol=SPACING_RTOL, atol=SPACING_ATOL)
+    return value_1.shape == value_2.shape and np.allclose(
+        value_1, value_2, rtol=SPACING_RTOL, atol=SPACING_ATOL
+    )
 
 
 def exp_moment_terms(
@@ -239,39 +264,13 @@ def compute_truncation(
         return trimmed_prob_arr.copy(), p_min, p_max, inner_min, inner_max
 
     if bound_type == BoundType.DOMINATES:
-        extended_prob = np.concatenate([[p_min], trimmed_prob_arr])
-        original_mass = math.fsum(map(float, extended_prob))
-        # Truncate left tail and add its mass to the next finite bin
-        extended_prob = _zero_mass(
-            values=extended_prob, mass=tail_truncation, from_left=True, exact=False
+        prob_arr_out, p_min_out, p_max_out = _truncate_dominating_edges(
+            trimmed_prob_arr, p_min, p_max, tail_truncation
         )
-        shifted_mass = original_mass - math.fsum(map(float, extended_prob))
-        extended_prob[np.nonzero(extended_prob)[0][0]] += shifted_mass
-        p_min_out = extended_prob[0]
-        # Truncate right tail and add its mass to to p_max
-        extended_prob = _zero_mass(
-            values=extended_prob, mass=tail_truncation, from_left=False, exact=False
-        )
-        shifted_mass = original_mass - math.fsum(map(float, extended_prob))
-        p_max_out = p_max + shifted_mass
-        prob_arr_out = extended_prob[1:]
     elif bound_type == BoundType.IS_DOMINATED:
-        extended_prob = np.concatenate((trimmed_prob_arr, [p_max]))
-        original_mass = math.fsum(map(float, extended_prob))
-        # Truncate right tail and add its mass to the next finite bin
-        extended_prob = _zero_mass(
-            values=extended_prob, mass=tail_truncation, from_left=False, exact=False
+        prob_arr_out, p_min_out, p_max_out = _truncate_dominated_edges(
+            trimmed_prob_arr, p_min, p_max, tail_truncation
         )
-        shifted_mass = original_mass - math.fsum(map(float, extended_prob))
-        extended_prob[np.nonzero(extended_prob)[0][-1]] += shifted_mass
-        p_max_out = extended_prob[-1]
-        # Truncate left tail and add its mass to to p_min
-        extended_prob = _zero_mass(
-            values=extended_prob, mass=tail_truncation, from_left=True, exact=False
-        )
-        shifted_mass = original_mass - math.fsum(map(float, extended_prob))
-        p_min_out = p_min + shifted_mass
-        prob_arr_out = extended_prob[:-1]
     else:
         raise ValueError(f"Unknown BoundType: {bound_type}")
 
@@ -286,6 +285,58 @@ def compute_truncation(
         min_ind_new,
         max_ind_new,
     )
+
+
+def _truncate_dominating_edges(
+    prob_arr: NDArray[np.float64],
+    p_min: float,
+    p_max: float,
+    tail_truncation: float,
+) -> tuple[NDArray[np.float64], float, float]:
+    """Truncate both edges of a dominating distribution.
+
+    Fold removed left-tail mass into the first retained value and route removed
+    right-tail mass to ``p_max``.
+    """
+    extended_prob = np.concatenate([[p_min], prob_arr])
+    original_mass = math.fsum(map(float, extended_prob))
+    extended_prob = _zero_mass(
+        values=extended_prob, mass=tail_truncation, from_left=True, exact=False
+    )
+    shifted_mass = original_mass - math.fsum(map(float, extended_prob))
+    extended_prob[np.nonzero(extended_prob)[0][0]] += shifted_mass
+    p_min_out = extended_prob[0]
+    extended_prob = _zero_mass(
+        values=extended_prob, mass=tail_truncation, from_left=False, exact=False
+    )
+    shifted_mass = original_mass - math.fsum(map(float, extended_prob))
+    return extended_prob[1:], p_min_out, p_max + shifted_mass
+
+
+def _truncate_dominated_edges(
+    prob_arr: NDArray[np.float64],
+    p_min: float,
+    p_max: float,
+    tail_truncation: float,
+) -> tuple[NDArray[np.float64], float, float]:
+    """Truncate both edges of a dominated distribution.
+
+    Fold removed right-tail mass into the last retained value and route removed
+    left-tail mass to ``p_min``.
+    """
+    extended_prob = np.concatenate((prob_arr, [p_max]))
+    original_mass = math.fsum(map(float, extended_prob))
+    extended_prob = _zero_mass(
+        values=extended_prob, mass=tail_truncation, from_left=False, exact=False
+    )
+    shifted_mass = original_mass - math.fsum(map(float, extended_prob))
+    extended_prob[np.nonzero(extended_prob)[0][-1]] += shifted_mass
+    p_max_out = extended_prob[-1]
+    extended_prob = _zero_mass(
+        values=extended_prob, mass=tail_truncation, from_left=True, exact=False
+    )
+    shifted_mass = original_mass - math.fsum(map(float, extended_prob))
+    return extended_prob[:-1], p_min + shifted_mass, p_max_out
 
 
 def _strip_zero_edges(prob_arr: NDArray[np.float64]) -> tuple[int, int]:

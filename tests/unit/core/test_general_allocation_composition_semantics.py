@@ -10,6 +10,7 @@ import pytest
 import PLD_accounting.random_allocation_accounting as random_allocation_accounting_module
 import PLD_accounting.random_allocation_api as random_allocation_api_module
 import PLD_accounting.random_allocation_gaussian as random_allocation_gaussian_module
+import PLD_accounting.random_allocation_realization as random_allocation_realization_module
 from PLD_accounting.discrete_dist import DenseDiscreteDist, PLDRealization
 from PLD_accounting.random_allocation_accounting import (
     _allocation_directional_pld_core as allocation_directional_pld_core,
@@ -24,6 +25,7 @@ from PLD_accounting.types import (
     ConvolutionMethod,
     Direction,
     PrivacyParams,
+    SpacingType,
 )
 from tests.test_tolerances import TestTolerances as TOL
 
@@ -61,29 +63,8 @@ class TestGeneralAllocationWiring:
         calls: list[dict[str, Any]] = []
         sentinel_pld = object()
 
-        def fake_allocation_directional_pld(
-            *,
-            compute_base_pld,
-            base_loss_discretization_count,
-            num_steps: int,
-            num_selected: int,
-            num_epochs: int,
-            loss_discretization: float,
-            tail_truncation: float,
-            bound_type: BoundType,
-        ) -> DenseDiscreteDist:
-            calls.append(
-                {
-                    "compute_base_pld": compute_base_pld,
-                    "base_loss_discretization_count": base_loss_discretization_count,
-                    "num_steps": num_steps,
-                    "num_selected": num_selected,
-                    "num_epochs": num_epochs,
-                    "loss_discretization": loss_discretization,
-                    "tail_truncation": tail_truncation,
-                    "bound_type": bound_type,
-                }
-            )
+        def fake_allocation_directional_pld(**kwargs: Any) -> DenseDiscreteDist:
+            calls.append(kwargs)
             return _stub_linear_dist()
 
         def fake_compose_full_pld(*, remove_dist, add_dist, bound_type):
@@ -137,8 +118,14 @@ class TestGeneralAllocationWiring:
         assert (
             add_base_creation.func is random_allocation_api_module.realization_add_base_distribution
         )
-        assert remove_base_creation.keywords == {"realization": remove_realization}
-        assert add_base_creation.keywords == {"realization": add_realization}
+        assert remove_base_creation.keywords == {
+            "realization": remove_realization,
+            "max_grid_mult": config.max_grid_mult,
+        }
+        assert add_base_creation.keywords == {
+            "realization": add_realization,
+            "max_grid_mult": config.max_grid_mult,
+        }
         assert (
             calls[0]["base_loss_discretization_count"]
             is random_allocation_api_module.remove_geometric_loss_discretization_count
@@ -147,6 +134,63 @@ class TestGeneralAllocationWiring:
             calls[1]["base_loss_discretization_count"]
             is random_allocation_api_module.add_geometric_loss_discretization_count
         )
+
+    @pytest.mark.parametrize(
+        "bound_type",
+        [BoundType.DOMINATES, BoundType.IS_DOMINATED],
+    )
+    def test_realization_geometric_factors_honor_max_grid_mult(self, bound_type: BoundType):
+        """Realization REMOVE and ADD factors use the shared geometric grid cap."""
+        max_grid_mult = 100
+        realization = PLDRealization(
+            x_0=0.0,
+            step=1e-3,
+            prob_arr=np.full(1_001, 1.0 / 1_001),
+        )
+
+        remove_base, remove_dual = (
+            random_allocation_realization_module.realization_remove_base_distributions(
+                realization=realization,
+                loss_discretization=1e-4,
+                tail_truncation=1e-10,
+                bound_type=bound_type,
+                max_grid_mult=max_grid_mult,
+            )
+        )
+        add_base = random_allocation_realization_module.realization_add_base_distribution(
+            realization=realization,
+            loss_discretization=1e-4,
+            tail_truncation=1e-10,
+            bound_type=bound_type,
+            max_grid_mult=max_grid_mult,
+        )
+
+        assert remove_base.prob_arr.size <= max_grid_mult
+        assert remove_dual.prob_arr.size <= max_grid_mult
+        assert add_base.prob_arr.size <= max_grid_mult
+
+    @pytest.mark.parametrize(
+        "builder",
+        [
+            random_allocation_realization_module.realization_remove_base_distributions,
+            random_allocation_realization_module.realization_add_base_distribution,
+        ],
+    )
+    def test_realization_geometric_factors_require_two_grid_points(self, builder):
+        """Realization factor builders reject a grid with no finite interval."""
+        realization = PLDRealization(
+            x_0=0.0,
+            step=0.1,
+            prob_arr=np.array([1.0]),
+        )
+
+        with pytest.raises(ValueError, match="at least two finite grid points"):
+            builder(
+                realization=realization,
+                loss_discretization=0.1,
+                tail_truncation=1e-10,
+                bound_type=BoundType.DOMINATES,
+            )
 
     def test_general_allocation_rejects_num_steps_less_than_num_selected(self):
         """General allocation rejects num steps less than num selected."""
@@ -168,29 +212,8 @@ def test_gaussian_allocation_wires_directional_plds(
     calls: list[dict[str, Any]] = []
     sentinel_pld = object()
 
-    def fake_allocation_directional_pld(
-        *,
-        compute_base_pld,
-        base_loss_discretization_count,
-        num_steps: int,
-        num_selected: int,
-        num_epochs: int,
-        loss_discretization: float,
-        tail_truncation: float,
-        bound_type: BoundType,
-    ) -> DenseDiscreteDist:
-        calls.append(
-            {
-                "compute_base_pld": compute_base_pld,
-                "base_loss_discretization_count": base_loss_discretization_count,
-                "num_steps": num_steps,
-                "num_selected": num_selected,
-                "num_epochs": num_epochs,
-                "loss_discretization": loss_discretization,
-                "tail_truncation": tail_truncation,
-                "bound_type": bound_type,
-            }
-        )
+    def fake_allocation_directional_pld(**kwargs: Any) -> DenseDiscreteDist:
+        calls.append(kwargs)
         return _stub_linear_dist()
 
     def fake_compose_full_pld(*, remove_dist, add_dist, bound_type):
@@ -243,17 +266,8 @@ def test_gaussian_allocation_best_of_two_combines_full_pipelines(
     """BEST_OF_TWO runs full GEOM and FFT directional pipelines and combines at the end."""
     calls: list[dict[str, Any]] = []
 
-    def fake_allocation_directional_pld(
-        *,
-        compute_base_pld,
-        base_loss_discretization_count,
-        num_steps: int,
-        num_selected: int,
-        num_epochs: int,
-        loss_discretization: float,
-        tail_truncation: float,
-        bound_type: BoundType,
-    ) -> DenseDiscreteDist:
+    def fake_allocation_directional_pld(**kwargs: Any) -> DenseDiscreteDist:
+        compute_base_pld = kwargs["compute_base_pld"]
         method = (
             ConvolutionMethod.GEOM
             if compute_base_pld.func is random_allocation_gaussian_module._gaussian_allocation_geom
@@ -263,13 +277,13 @@ def test_gaussian_allocation_best_of_two_combines_full_pipelines(
             {
                 "method": method,
                 "direction": compute_base_pld.keywords["direction"],
-                "count_fn": base_loss_discretization_count,
-                "num_steps": num_steps,
-                "num_selected": num_selected,
-                "num_epochs": num_epochs,
-                "loss_discretization": loss_discretization,
-                "tail_truncation": tail_truncation,
-                "bound_type": bound_type,
+                "count_fn": kwargs["base_loss_discretization_count"],
+                "num_steps": kwargs["num_steps"],
+                "num_selected": kwargs["num_selected"],
+                "num_epochs": kwargs["num_epochs"],
+                "loss_discretization": kwargs["loss_discretization"],
+                "tail_truncation": kwargs["tail_truncation"],
+                "bound_type": kwargs["bound_type"],
             }
         )
         # GEOM pipelines emit a finer grid than FFT ones.
@@ -336,14 +350,14 @@ def test_allocation_directional_pld_core_truncates_without_regridding(
     def fake_fft_self_convolve(
         *,
         dist: DenseDiscreteDist,
-        T: int,
+        num_convolutions: int,
         tail_truncation: float,
         bound_type: BoundType,
         use_direct: bool,
     ) -> DenseDiscreteDist:
         del tail_truncation, bound_type, use_direct
         captured["base_gap_at_compose"] = dist.step
-        captured["num_epochs"] = float(T)
+        captured["num_epochs"] = float(num_convolutions)
         return dist
 
     def fake_compute_base_pld(
@@ -409,18 +423,11 @@ def test_allocation_directional_pld_warns_when_fallback_regrids(
             prob_arr=np.array([0.5, 0.5]),
         )
 
-    def fake_rediscretize_dist(
-        *,
-        dist: DenseDiscreteDist,
-        tail_truncation: float,
-        loss_discretization: float,
-        spacing_type,
-        bound_type: BoundType,
-    ) -> DenseDiscreteDist:
-        del tail_truncation, spacing_type, bound_type
+    def fake_rediscretize_dist(**kwargs: Any) -> DenseDiscreteDist:
+        dist = kwargs["dist"]
         return DenseDiscreteDist(
             x_0=dist.x_0,
-            step=loss_discretization,
+            step=kwargs["loss_discretization"],
             prob_arr=dist.prob_arr,
         )
 
@@ -442,7 +449,7 @@ def test_allocation_directional_pld_warns_when_fallback_regrids(
     )
     monkeypatch.setattr(
         random_allocation_accounting_module,
-        "rediscretize_dist",
+        "rediscretize_dist_by_bound",
         fake_rediscretize_dist,
     )
     monkeypatch.setattr(
@@ -551,7 +558,7 @@ def test_geom_is_dominated_path_handles_tiny_nonpositive_exp_tail():
 def test_gaussian_remove_geom_dominates_discretizes_only_primary(monkeypatch):
     """Gaussian upper REMOVE derives its transformed dual after one discretization."""
     calls = []
-    actual_discretize = random_allocation_gaussian_module.discretize_continuous_distribution
+    actual_discretize = random_allocation_gaussian_module.discretize_continuous_ctd
 
     def recording_discretize(**kwargs):
         calls.append(kwargs)
@@ -559,7 +566,7 @@ def test_gaussian_remove_geom_dominates_discretizes_only_primary(monkeypatch):
 
     monkeypatch.setattr(
         random_allocation_gaussian_module,
-        "discretize_continuous_distribution",
+        "discretize_continuous_ctd",
         recording_discretize,
     )
 
@@ -579,12 +586,35 @@ def test_gaussian_remove_geom_dominates_discretizes_only_primary(monkeypatch):
     )
 
     assert len(calls) == 1
+    assert "dual_dist" in calls[0]
     assert isinstance(base, PLDRealization)
     assert np.isclose(base.step, neg_dual.step, atol=TOL.SPACING_ATOL)
     np.testing.assert_array_equal(neg_dual.x_array, expected.x_array)
     np.testing.assert_array_equal(neg_dual.prob_arr, expected.prob_arr)
     assert neg_dual.p_min == expected.p_min
     assert neg_dual.p_max == expected.p_max
+
+
+@pytest.mark.parametrize("sigma", [0.05, 0.15])
+def test_gaussian_remove_geom_warns_when_negative_dual_mean_lacks_grid_margin(sigma: float):
+    """Gaussian REMOVE requires one standard deviation around its negative-dual mean."""
+    config = AllocationSchemeConfig()
+
+    with pytest.warns(
+        RuntimeWarning,
+        match="negative-dual mean is not at least one standard deviation inside",
+    ):
+        base, _ = random_allocation_gaussian_module._gaussian_remove_geom_loss_factors(
+            loss_discretization=config.loss_discretization,
+            tail_truncation=config.tail_truncation,
+            bound_type=BoundType.DOMINATES,
+            sigma=sigma,
+            config=config,
+        )
+
+    negative_dual_mean = -0.5 / sigma**2
+    negative_dual_std = 1.0 / sigma
+    assert negative_dual_mean < base.x_array[0] + negative_dual_std
 
 
 def test_gaussian_remove_geom_dominates_honors_max_grid_mult():
@@ -614,7 +644,7 @@ def test_gaussian_remove_geom_dominates_honors_max_grid_mult():
 def test_gaussian_remove_geom_is_dominated_keeps_two_discretizations(monkeypatch):
     """Gaussian lower REMOVE retains the continuous dual-first construction."""
     calls = 0
-    actual_discretize = random_allocation_gaussian_module.discretize_continuous_dist
+    actual_discretize = random_allocation_gaussian_module.discretize_continuous_stoch_dom
 
     def recording_discretize(**kwargs):
         nonlocal calls
@@ -623,7 +653,7 @@ def test_gaussian_remove_geom_is_dominated_keeps_two_discretizations(monkeypatch
 
     monkeypatch.setattr(
         random_allocation_gaussian_module,
-        "discretize_continuous_dist",
+        "discretize_continuous_stoch_dom",
         recording_discretize,
     )
 
@@ -640,6 +670,69 @@ def test_gaussian_remove_geom_is_dominated_keeps_two_discretizations(monkeypatch
     )
 
     assert calls == 2
+
+
+@pytest.mark.parametrize(
+    ("bound_type", "function_name"),
+    [
+        (BoundType.DOMINATES, "discretize_continuous_ctd"),
+        (BoundType.IS_DOMINATED, "discretize_continuous_stoch_dom"),
+    ],
+)
+def test_gaussian_add_geom_discretizes_in_linear_loss_space(
+    monkeypatch, bound_type: BoundType, function_name: str
+):
+    """Gaussian ADD chooses its fixed engine from the requested bound."""
+    calls = []
+    actual_discretize = getattr(random_allocation_gaussian_module, function_name)
+
+    def recording_discretize(**kwargs):
+        calls.append(kwargs)
+        return actual_discretize(**kwargs)
+
+    monkeypatch.setattr(
+        random_allocation_gaussian_module,
+        function_name,
+        recording_discretize,
+    )
+    result = random_allocation_gaussian_module._gaussian_add_geom_loss_factor(
+        loss_discretization=0.1,
+        tail_truncation=1e-6,
+        bound_type=bound_type,
+        sigma=2.0,
+        config=AllocationSchemeConfig(
+            loss_discretization=0.1,
+            tail_truncation=1e-6,
+            convolution_method=ConvolutionMethod.GEOM,
+        ),
+    )
+
+    assert len(calls) == 1
+    assert ("dual_dist" in calls[0]) == (bound_type == BoundType.DOMINATES)
+    assert result.spacing_type == SpacingType.LINEAR
+
+
+@pytest.mark.parametrize("bound_type", [BoundType.DOMINATES, BoundType.IS_DOMINATED])
+def test_gaussian_geom_ctd_handles_upper_and_lower_paths(bound_type: BoundType):
+    """GEOM uses CtD for upper factors and stochastic projection for lower factors."""
+    params = PrivacyParams(
+        sigma=2.0,
+        num_steps=5,
+        num_selected=3,
+        num_epochs=1,
+        delta=1e-3,
+    )
+    config = AllocationSchemeConfig(
+        loss_discretization=0.1,
+        tail_truncation=1e-4,
+        convolution_method=ConvolutionMethod.GEOM,
+    )
+
+    pld = gaussian_allocation_pld(params=params, config=config, bound_type=bound_type)
+    epsilon = float(pld.get_epsilon_for_delta(params.delta))
+
+    assert np.isfinite(epsilon)
+    assert epsilon > 0.0
 
 
 class TestGeometricBaseTailScaling:

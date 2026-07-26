@@ -21,12 +21,12 @@ except ImportError:
     )
 
 
-def optional_njit():
+def optional_njit() -> Callable[[Callable], Callable]:
     """Return numba's njit(cache=True) if available, else the identity decorator."""
     if _HAS_NUMBA:
         return _NJIT(cache=True)
 
-    def identity_decorator(function: Callable):
+    def identity_decorator(function: Callable) -> Callable:
         return function
 
     return identity_decorator
@@ -78,6 +78,8 @@ class Direction(Enum):
 # tail budget is a modeling choice).
 DEFAULT_LOSS_DISCRETIZATION = 1e-2
 DEFAULT_TAIL_TRUNCATION = 1e-12
+# Point cap for FFT grids; the multiplicative route is uncapped by default.
+DEFAULT_MAX_GRID_FFT = 1_000_000
 
 
 @dataclass(frozen=True)
@@ -98,9 +100,6 @@ class AllocationSchemeConfig:
 
     loss_discretization: float = DEFAULT_LOSS_DISCRETIZATION
     tail_truncation: float = DEFAULT_TAIL_TRUNCATION
-    max_grid_fft: int = 1_000_000
-    max_grid_mult: int = -1  # -1 means no upper limit on grid size
+    max_grid_fft: int = DEFAULT_MAX_GRID_FFT
+    max_grid_mult: int = -1  # any value <= 0 means no upper limit on grid size
     convolution_method: ConvolutionMethod = ConvolutionMethod.GEOM
-    # CF (characteristic-function) allocation path; currently experimental.
-    cf_max_grid: int = 50_000_000
-    cf_refine_factor: int = 10

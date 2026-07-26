@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import replace
 from functools import partial
 from typing import Any, Callable
@@ -14,13 +15,12 @@ from PLD_accounting.discrete_dist import (
     DenseDiscreteDist,
     Domain,
     GridSpec,
-    PLDRealization,
 )
 from PLD_accounting.distribution_discretization import (
-    aligned_grid_params,
-    discretize_continuous_dist,
-    discretize_continuous_distribution,
-    rediscretize_dist,
+    discretize_continuous_ctd,
+    discretize_continuous_stoch_dom,
+    discretize_continuous_stoch_dom_on_grid,
+    rediscretize_dist_stoch_dom,
 )
 from PLD_accounting.distribution_utils import (
     MIN_GRID_SIZE,
@@ -123,10 +123,10 @@ def _gaussian_allocation_geom(
     sigma: float,
     config: AllocationSchemeConfig,
 ) -> DenseDiscreteDist:
-    """GEOM path intentionally mirrors realization path after base creation.
+    """GEOM path intentionally mirrors the realization path after base creation.
 
-    Both call geometric_allocation_PLD_base_* with identical wiring.
-
+    Both call ``geometric_allocation_pld_base_add`` / ``_remove`` with identical
+    wiring; only the one-step factor construction differs.
     """
     if direction == Direction.ADD:
         return geometric_allocation_pld_base_add(
@@ -165,112 +165,62 @@ def _gaussian_remove_geom_loss_factors(
 ) -> tuple[DenseDiscreteDist, DenseDiscreteDist]:
     """Build REMOVE GEOM one-step PLD factors as ``(base, dual_base)``."""
     sigma_inv = 1.0 / sigma
+    base_mean = sigma_inv**2 / 2
+    base_loss_dist = stats.norm(loc=base_mean, scale=sigma_inv)
+    factor_tail_truncation = (
+        tail_truncation if bound_type == BoundType.DOMINATES else tail_truncation / 2
+    )
+    shared_step = _loss_discretization_for_grid_cap(
+        dist=base_loss_dist,
+        tail_truncation=factor_tail_truncation,
+        loss_discretization=loss_discretization,
+        max_grid_points=config.max_grid_mult,
+    )
 
     if bound_type == BoundType.DOMINATES:
-        loss_dist = stats.norm(loc=sigma_inv**2 / 2, scale=sigma_inv)
-        effective_step = float(loss_discretization)
-        if config.max_grid_mult > 0:
-            effective_step, _, _ = _coarsen_discretization_for_tail_quantile_range(
-                dist=loss_dist,
-                tail_truncation=tail_truncation,
-                target_discretization=effective_step,
-                max_points=config.max_grid_mult,
-                spacing_type=SpacingType.LINEAR,
-                align_to_multiples=True,
-            )
-        base_dist = discretize_continuous_distribution(
-            dist=loss_dist,
+        base_realization = discretize_continuous_ctd(
+            dist=base_loss_dist,
+            dual_dist=base_loss_dist,
             tail_truncation=tail_truncation,
-            bound_type=bound_type,
-            spacing_type=SpacingType.LINEAR,
-            step=effective_step,
+            step=shared_step,
             align_to_multiples=True,
         )
-        base_realization = PLDRealization.from_linear_dist(base_dist)
+
+        grid_min = float(base_realization.x_array[0])
+        grid_max = float(base_realization.x_array[-1])
+        if not grid_min + sigma_inv <= -base_mean <= grid_max - sigma_inv:
+            warnings.warn(
+                "Gaussian REMOVE negative-dual mean is not at least one standard "
+                "deviation inside the finite grid inherited from the discretized base: "
+                f"negative_dual_mean={-base_mean:.6e}, "
+                f"negative_dual_std={sigma_inv:.6e}, "
+                f"grid=[{grid_min:.6e}, {grid_max:.6e}]. "
+                "Deriving the negative dual from this grid can move most of its "
+                "probability to a boundary atom.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
         dual_realization = calc_pld_dual(base_realization)
-        return base_realization, negate_reverse_linear_distribution(dual_realization)
+        neg_dual_realization = negate_reverse_linear_distribution(dual_realization)
+        return base_realization, neg_dual_realization
 
     # Lower-bound truncation can create negative-infinity mass, so preserve the
     # dual-first path and discretize the two continuous factors separately.
-    factor_tail_truncation = tail_truncation / 2
-    n_grid_geom = _geom_grid_size(
-        sigma_inv=sigma_inv,
-        loss_discretization=loss_discretization,
-        tail_probability=factor_tail_truncation / 2,
-        config=config,
-    )
-
-    dual_norm_mean = -(sigma_inv**2) / 2
-    base_norm_mean = sigma_inv**2 / 2
-    exp_dual = stats.lognorm(s=sigma_inv, scale=np.exp(dual_norm_mean))
-    exp_base = stats.lognorm(s=sigma_inv, scale=np.exp(base_norm_mean))
-    dual_step, dual_x_min, dual_x_max = _coarsen_discretization_for_tail_quantile_range(
-        dist=exp_dual,
+    dual_loss_dist = stats.norm(loc=-(sigma_inv**2) / 2, scale=sigma_inv)
+    dual_loss_factor = discretize_continuous_stoch_dom(
+        dist=dual_loss_dist,
         tail_truncation=factor_tail_truncation,
-        target_discretization=float(loss_discretization),
-        max_points=n_grid_geom,
-        spacing_type=SpacingType.GEOMETRIC,
+        bound_type=bound_type,
+        step=shared_step,
         align_to_multiples=True,
     )
-    base_step, base_x_min, base_x_max = _coarsen_discretization_for_tail_quantile_range(
-        dist=exp_base,
+    base_loss_factor = discretize_continuous_stoch_dom(
+        dist=base_loss_dist,
         tail_truncation=factor_tail_truncation,
-        target_discretization=float(loss_discretization),
-        max_points=n_grid_geom,
-        spacing_type=SpacingType.GEOMETRIC,
-        align_to_multiples=True,
-    )
-    shared_log_step = max(dual_step, base_step)
-    dual_grid = aligned_grid_params(
-        x_min=dual_x_min,
-        x_max=dual_x_max,
-        spacing_type=SpacingType.GEOMETRIC,
-        align_to_multiples=True,
-        discretization=shared_log_step,
-    )
-    base_grid = aligned_grid_params(
-        x_min=base_x_min,
-        x_max=base_x_max,
-        spacing_type=SpacingType.GEOMETRIC,
-        align_to_multiples=True,
-        discretization=shared_log_step,
-    )
-
-    dual_factor_dist = discretize_continuous_dist(
-        dist=exp_dual,
-        grid=dual_grid,
         bound_type=bound_type,
-        pmf_min_increment=factor_tail_truncation,
+        step=shared_step,
+        align_to_multiples=True,
     )
-    if not (
-        isinstance(dual_factor_dist, DenseDiscreteDist)
-        and dual_factor_dist.spacing_type == SpacingType.GEOMETRIC
-    ):
-        _st = getattr(dual_factor_dist, "spacing_type", "?")
-        raise TypeError(
-            "Expected DenseDiscreteDist with GEOMETRIC spacing, "
-            f"got {type(dual_factor_dist).__name__} with spacing {_st}"
-        )
-
-    base_factor_dist = discretize_continuous_dist(
-        dist=exp_base,
-        grid=base_grid,
-        bound_type=bound_type,
-        pmf_min_increment=factor_tail_truncation,
-    )
-    if not (
-        isinstance(base_factor_dist, DenseDiscreteDist)
-        and base_factor_dist.spacing_type == SpacingType.GEOMETRIC
-    ):
-        _st = getattr(base_factor_dist, "spacing_type", "?")
-        raise TypeError(
-            "Expected DenseDiscreteDist with GEOMETRIC spacing, "
-            f"got {type(base_factor_dist).__name__} with spacing {_st}"
-        )
-
-    dual_loss_factor = log_geometric_to_linear(dual_factor_dist)
-    base_loss_factor = log_geometric_to_linear(base_factor_dist)
-    # geometric_allocation_pld_base_remove expects (base, dual_base).
     return base_loss_factor, dual_loss_factor
 
 
@@ -284,39 +234,28 @@ def _gaussian_add_geom_loss_factor(
 ) -> DenseDiscreteDist:
     """Build ADD GEOM one-step linear PLD factor."""
     sigma_inv = 1.0 / sigma
-    n_grid_geom = _geom_grid_size(
-        sigma_inv=sigma_inv,
-        loss_discretization=loss_discretization,
-        tail_probability=tail_truncation,
-        config=config,
-    )
-
-    base_lognorm = stats.lognorm(s=sigma_inv, scale=np.exp(+(sigma_inv**2) / 2))
-    eff_log_step, _, _ = _coarsen_discretization_for_tail_quantile_range(
-        dist=base_lognorm,
+    loss_dist = stats.norm(loc=sigma_inv**2 / 2, scale=sigma_inv)
+    effective_step = _loss_discretization_for_grid_cap(
+        dist=loss_dist,
         tail_truncation=tail_truncation,
-        target_discretization=float(loss_discretization),
-        max_points=n_grid_geom,
-        spacing_type=SpacingType.GEOMETRIC,
-        align_to_multiples=True,
+        loss_discretization=loss_discretization,
+        max_grid_points=config.max_grid_mult,
     )
-
-    base_dist = discretize_continuous_distribution(
-        dist=base_lognorm,
+    if bound_type == BoundType.DOMINATES:
+        return discretize_continuous_ctd(
+            dist=loss_dist,
+            dual_dist=loss_dist,
+            tail_truncation=tail_truncation,
+            step=effective_step,
+            align_to_multiples=True,
+        )
+    return discretize_continuous_stoch_dom(
+        dist=loss_dist,
         tail_truncation=tail_truncation,
         bound_type=bound_type,
-        spacing_type=SpacingType.GEOMETRIC,
-        step=float(np.exp(eff_log_step)),
+        step=effective_step,
         align_to_multiples=True,
     )
-    if not (
-        isinstance(base_dist, DenseDiscreteDist) and base_dist.spacing_type == SpacingType.GEOMETRIC
-    ):
-        raise TypeError(
-            f"Expected DenseDiscreteDist with GEOMETRIC spacing, "
-            f"got {type(base_dist).__name__} with spacing {getattr(base_dist, 'spacing_type', '?')}"
-        )
-    return log_geometric_to_linear(base_dist)
 
 
 # =============================================================================
@@ -377,19 +316,16 @@ def _gaussian_allocation_fft_add(
     """Build ADD-direction FFT component and convert back to linear loss space."""
     exp_bound_type = _flip_bound_type(bound_type)
     fft_base = stats.lognorm(s=sigma_inv, scale=np.exp(-(sigma_inv**2) / 2 - np.log(num_steps)))
-    linear_step, _, _ = _coarsen_discretization_for_tail_quantile_range(
+    linear_step = _loss_discretization_for_grid_cap(
         dist=fft_base,
         tail_truncation=single_step_tail_truncation,
-        target_discretization=float(loss_discretization),
-        max_points=single_step_n_grid,
-        spacing_type=SpacingType.LINEAR,
-        align_to_multiples=False,
+        loss_discretization=loss_discretization,
+        max_grid_points=single_step_n_grid,
     )
-    base_dist = discretize_continuous_distribution(
+    base_dist = discretize_continuous_stoch_dom(
         dist=fft_base,
         tail_truncation=single_step_tail_truncation,
         bound_type=exp_bound_type,
-        spacing_type=SpacingType.LINEAR,
         step=linear_step,
         align_to_multiples=False,
         domain=Domain.POSITIVES,
@@ -415,12 +351,12 @@ def _gaussian_allocation_fft_add(
 
     conv_dist = fft_self_convolve(
         dist=base_dist,
-        T=num_steps,
+        num_convolutions=num_steps,
         tail_truncation=tail_truncation,
         bound_type=exp_bound_type,
         use_direct=True,
     )
-    exp_geom = rediscretize_dist(
+    exp_geom = rediscretize_dist_stoch_dom(
         dist=conv_dist,
         tail_truncation=0.0,
         loss_discretization=loss_discretization,
@@ -465,19 +401,16 @@ def _gaussian_allocation_fft_remove(
     base_shift = np.exp(base_norm_mean + sigma_inv**2 / 2)
 
     dual_lognorm = stats.lognorm(s=sigma_inv, scale=np.exp(dual_norm_mean))
-    dual_linear_step, _, _ = _coarsen_discretization_for_tail_quantile_range(
+    dual_linear_step = _loss_discretization_for_grid_cap(
         dist=dual_lognorm,
         tail_truncation=factor_tail,
-        target_discretization=float(loss_discretization),
-        max_points=single_step_n_grid,
-        spacing_type=SpacingType.LINEAR,
-        align_to_multiples=False,
+        loss_discretization=loss_discretization,
+        max_grid_points=single_step_n_grid,
     )
-    dual_dist = discretize_continuous_distribution(
+    dual_dist = discretize_continuous_stoch_dom(
         dist=dual_lognorm,
         tail_truncation=factor_tail,
         bound_type=bound_type,
-        spacing_type=SpacingType.LINEAR,
         step=dual_linear_step,
         align_to_multiples=False,
         domain=Domain.POSITIVES,
@@ -503,7 +436,7 @@ def _gaussian_allocation_fft_remove(
 
     dual_convolved_dist = fft_self_convolve(
         dist=dual_dist,
-        T=num_steps - 1,
+        num_convolutions=num_steps - 1,
         tail_truncation=core_tail,
         bound_type=bound_type,
         use_direct=True,
@@ -523,7 +456,7 @@ def _gaussian_allocation_fft_remove(
         factor_tail_truncation=factor_tail,
         tail_truncation=tail_truncation,
     )
-    base_dist = discretize_continuous_dist(
+    base_dist = discretize_continuous_stoch_dom_on_grid(
         dist=exp_base,
         grid=base_grid,
         bound_type=bound_type,
@@ -560,7 +493,7 @@ def _gaussian_allocation_fft_remove(
         p_max=conv_dist_raw.p_max,
         domain=conv_dist_raw.domain,
     )
-    exp_geom = rediscretize_dist(
+    exp_geom = rediscretize_dist_stoch_dom(
         dist=conv_dist_raw,
         tail_truncation=0.0,
         loss_discretization=loss_discretization,
@@ -610,85 +543,32 @@ def _extend_base_grid_for_fft_remove(
 # =============================================================================
 
 
-def _geom_grid_size(
-    *,
-    sigma_inv: float,
-    loss_discretization: float,
-    tail_probability: float,
-    config: AllocationSchemeConfig,
-) -> int:
-    """Compute GEOM grid size from tail probability and log-loss span."""
-    if tail_probability <= 0.0:
-        grid_size = MIN_GRID_SIZE
-    else:
-        log_range = -stats.norm.ppf(tail_probability) * sigma_inv
-        if np.isfinite(log_range) and log_range > 0.0:
-            # An aligned grid needs up to 3 points beyond the span/step interval count
-            # (see _coarsen_discretization_for_tail_quantile_range); without them an
-            # uncapped grid would be coarsened slightly past loss_discretization.
-            grid_size = max(
-                int(np.ceil(2 * log_range / loss_discretization)) + 3,
-                MIN_GRID_SIZE,
-            )
-        else:
-            grid_size = MIN_GRID_SIZE
-
-    if config.max_grid_mult > 0:
-        grid_size = min(grid_size, config.max_grid_mult)
-    return grid_size
-
-
-def _coarsen_discretization_for_tail_quantile_range(
+def _loss_discretization_for_grid_cap(
     *,
     dist: stats.rv_continuous | rv_frozen[Any, Any],
     tail_truncation: float,
-    target_discretization: float,
-    max_points: int,
-    spacing_type: SpacingType,
-    align_to_multiples: bool,
-) -> tuple[float, float, float]:
-    """Return ``max(target_discretization, d_induced)`` with tail quantile bounds.
+    loss_discretization: float,
+    max_grid_points: int,
+) -> float:
+    """Coarsen a quantile-range grid to fit within the configured point cap."""
+    if loss_discretization <= 0.0:
+        raise ValueError(f"loss_discretization must be positive, got {loss_discretization}")
+    if max_grid_points <= 0:
+        return float(loss_discretization)
+    if max_grid_points < 2:
+        raise ValueError(f"max_grid_points must be >= 2, got {max_grid_points}")
 
-    ``d_induced`` is the coarsest step keeping an aligned grid within ``max_points``
-    points: the quantile span (``x_max - x_min`` linear, ``log(x_max / x_min)``
-    geometric) divided by ``max_points - 3`` (clamped to >= 1).  The 3 reserved
-    points cover the fencepost (N points span N-1 steps) plus the up to 2 points
-    ``discretize_aligned_range`` adds when rounding both edges outward to whole
-    step multiples.  Quantile bounds are ``dist.ppf/isf(tail_truncation)``.
-    """
-    if spacing_type not in (SpacingType.LINEAR, SpacingType.GEOMETRIC):
-        raise ValueError(f"Unsupported spacing_type: {spacing_type}")
-    if max_points < 2:
-        raise ValueError(f"max_points must be >= 2, got {max_points}")
     x_min = float(dist.ppf(tail_truncation))
     x_max = float(dist.isf(tail_truncation))
-    if not np.isfinite(x_min) or not np.isfinite(x_max):
-        raise ValueError(
-            f"Quantiles not finite for tail_truncation={tail_truncation}: "
-            f"x_min={x_min}, x_max={x_max}"
-        )
-    if x_max <= x_min:
+    if not np.isfinite(x_min) or not np.isfinite(x_max) or x_max < x_min:
         raise ValueError(
             f"Invalid quantile range for tail_truncation={tail_truncation}: "
             f"x_min={x_min}, x_max={x_max}"
         )
-    d = float(target_discretization)
-    if d <= 0.0:
-        raise ValueError(f"target_discretization must be positive, got {target_discretization}")
 
-    n_nominal = max(max_points - 2, 2)
-    denom = max(n_nominal - 1, 1)
-    if spacing_type == SpacingType.LINEAR:
-        d_induced = float(x_max - x_min) / denom
-    elif spacing_type == SpacingType.GEOMETRIC and align_to_multiples:
-        d_induced = float(np.log(x_max / x_min)) / denom
-    else:
-        raise ValueError(
-            "Coarsening is only implemented for LINEAR "
-            f"or GEOMETRIC/align_to_multiples=True, got {spacing_type}, {align_to_multiples}"
-        )
-
-    return float(max(d, d_induced)), x_min, x_max
+    # Reserve one fencepost plus up to two bins for outward grid alignment.
+    usable_intervals = max(max_grid_points - 3, 1)
+    return float(max(loss_discretization, (x_max - x_min) / usable_intervals))
 
 
 def _flip_bound_type(bound_type: BoundType) -> BoundType:

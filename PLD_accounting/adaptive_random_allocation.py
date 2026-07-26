@@ -31,6 +31,13 @@ MAX_DISCRETIZATION = 1e-1
 MIN_TAIL_TRUNCATION = 1e-20
 MAX_TAIL_TRUNCATION = 1e-4
 
+# Per-iteration refinement schedule. The discretization halves (bound error is
+# roughly linear in the step, so halving buys a predictable factor per pass)
+# while the tail budget drops by a decade, which shrinks the truncation-induced
+# term faster than the quantization term it is paired against.
+DISCRETIZATION_REFINEMENT_FACTOR = 2.0
+TAIL_TRUNCATION_REFINEMENT_FACTOR = 10.0
+
 
 @dataclass
 class AdaptiveResult:
@@ -94,7 +101,7 @@ def optimize_allocation_epsilon_range(
         estimated_value=estimated_epsilon if estimated_epsilon is not None else target_accuracy,
     )
     if initial_discretization is None:
-        initial_discretization = target_accuracy / 2
+        initial_discretization = target_accuracy / DISCRETIZATION_REFINEMENT_FACTOR
     if initial_tail_truncation is None:
         initial_tail_truncation = DEFAULT_RELATIVE_ACCURACY * delta
 
@@ -227,8 +234,15 @@ def _apply_refinement_step(
     discretization: float,
     tail_truncation: float,
 ) -> tuple[float, float, bool]:
-    next_discretization = _clip_discretization(discretization / 2)
-    next_tail_truncation = _clip_tail_truncation(tail_truncation / 10)
+    """Tighten both budgets one notch, reporting whether either actually moved.
+
+    The ``changed`` flag lets the caller stop early once both values have hit
+    their clamps, instead of burning the remaining iterations on identical work.
+    """
+    next_discretization = _clip_discretization(discretization / DISCRETIZATION_REFINEMENT_FACTOR)
+    next_tail_truncation = _clip_tail_truncation(
+        tail_truncation / TAIL_TRUNCATION_REFINEMENT_FACTOR
+    )
     changed = next_discretization != discretization or next_tail_truncation != tail_truncation
     return next_discretization, next_tail_truncation, changed
 
@@ -238,6 +252,7 @@ def _auto_target_accuracy(
     target_accuracy: float,
     estimated_value: float,
 ) -> tuple[float, bool]:
+    """Resolve a negative target accuracy into a relative one, or validate a fixed one."""
     if target_accuracy >= 0.0:
         if not math.isfinite(target_accuracy):
             raise RuntimeError(

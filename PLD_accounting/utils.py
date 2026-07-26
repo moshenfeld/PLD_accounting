@@ -17,13 +17,15 @@ from PLD_accounting.discrete_dist import (
 )
 from PLD_accounting.distribution_discretization import (
     fold_absorbable_boundary_atom,
-    project_dist_onto_grid,
+    project_dist_onto_grid_ctd,
+    project_dist_onto_grid_stoch_dom,
 )
 from PLD_accounting.distribution_utils import (
     enforce_mass_conservation,
+    kahan_reverse_exclusive_cumsum,
     stable_array_equal,
 )
-from PLD_accounting.types import BoundType, SpacingType, optional_njit
+from PLD_accounting.types import BoundType, SpacingType
 
 # =============================================================================
 # Boundary-Mass Convolution Utilities
@@ -89,7 +91,7 @@ def self_convolve_boundary_masses(
 def binary_self_convolve(
     *,
     dist: DenseDiscreteDist,
-    T: int,
+    num_convolutions: int,
     tail_truncation: float,
     bound_type: BoundType,
     convolve: Callable[..., DenseDiscreteDist],
@@ -103,9 +105,9 @@ def binary_self_convolve(
     If ``lattice_anchor`` is provided, it is carried alongside each intermediate
     distribution and their sum is supplied to ``convolve`` as ``target_anchor``.
     """
-    if T < 1:
-        raise ValueError(f"T must be >= 1, got {T}")
-    if T == 1:
+    if num_convolutions < 1:
+        raise ValueError(f"num_convolutions must be >= 1, got {num_convolutions}")
+    if num_convolutions == 1:
         return dist
 
     def convolve_with_anchor(
@@ -139,9 +141,15 @@ def binary_self_convolve(
     base_anchor = lattice_anchor
     acc_dist = None
     acc_anchor = lattice_anchor
+    # Tail budget. Every convolve below is charged tail_truncation / num_convolutions
+    # using the *current* counter, which halves each pass, so the per-call charge
+    # doubles each pass and peaks at tail_truncation on the final pass. A doubling
+    # series sums to under twice its last term, so the squaring calls together spend
+    # under 2 * tail_truncation, and the accumulating calls likewise. Pre-dividing by
+    # those two families' combined factor of 4 keeps the total within the caller's budget.
     tail_truncation /= 4
-    while T > 0:
-        if T & 1:
+    while num_convolutions > 0:
+        if num_convolutions & 1:
             if acc_dist is None:
                 acc_dist = base_dist
                 acc_anchor = base_anchor
@@ -151,18 +159,18 @@ def binary_self_convolve(
                     acc_anchor,
                     base_dist,
                     base_anchor,
-                    tail_truncation / T,
+                    tail_truncation / num_convolutions,
                 )
-        T >>= 1
-        if T > 0:
+        num_convolutions >>= 1
+        if num_convolutions > 0:
             base_dist, base_anchor = convolve_with_anchor(
                 base_dist,
                 base_anchor,
                 base_dist,
                 base_anchor,
-                tail_truncation / T,
+                tail_truncation / num_convolutions,
             )
-    # If T is a power of two, acc_dist is never set; return the final squared base_dist.
+    # For a power-of-two count acc_dist is never set; return the final squared base_dist.
     return acc_dist if acc_dist is not None else base_dist
 
 
@@ -192,7 +200,7 @@ def combine_distributions(
     else:
         raise ValueError(f"Unknown BoundType: {bound_type}")
 
-    if not stable_array_equal(a=dist_1.x_array, b=dist_2.x_array):
+    if not stable_array_equal(value_1=dist_1.x_array, value_2=dist_2.x_array):
         raise ValueError(
             "combine_distributions requires identical support grids, got sizes "
             f"{dist_1.x_array.size} and {dist_2.x_array.size} with ranges "
@@ -250,16 +258,14 @@ def combine_best_of_two_plds(
     On equal steps ``dist_1`` is the anchor.
     """
     if not (isinstance(dist_1, DenseDiscreteDist) and dist_1.spacing_type == SpacingType.LINEAR):
-        _st = getattr(dist_1, "spacing_type", "?")
         raise TypeError(
             "dist_1: expected DenseDiscreteDist with LINEAR spacing, "
-            f"got {type(dist_1).__name__} with spacing {_st}"
+            f"got {type(dist_1).__name__} with spacing {getattr(dist_1, 'spacing_type', '?')}"
         )
     if not (isinstance(dist_2, DenseDiscreteDist) and dist_2.spacing_type == SpacingType.LINEAR):
-        _st = getattr(dist_2, "spacing_type", "?")
         raise TypeError(
             "dist_2: expected DenseDiscreteDist with LINEAR spacing, "
-            f"got {type(dist_2).__name__} with spacing {_st}"
+            f"got {type(dist_2).__name__} with spacing {getattr(dist_2, 'spacing_type', '?')}"
         )
 
     if dist_1.step <= dist_2.step:
@@ -287,28 +293,32 @@ def combine_best_of_two_plds(
         spacing_type=SpacingType.LINEAR,
         bound_type=bound_type,
     )
-    other_on_grid = project_dist_onto_grid(
-        dist=other_working,
-        grid=out_grid,
-        expected_p_min=other_working.p_min,
-        expected_p_max=other_working.p_max,
-        bound_type=bound_type,
-    )
+    other_on_grid: DenseDiscreteDist
+    if bound_type == BoundType.DOMINATES:
+        other_on_grid = project_dist_onto_grid_ctd(
+            dist=other_working,
+            grid=out_grid,
+        )
+    else:
+        other_on_grid = project_dist_onto_grid_stoch_dom(
+            dist=other_working,
+            grid=out_grid,
+            expected_p_min=other_working.p_min,
+            expected_p_max=other_working.p_max,
+            bound_type=bound_type,
+        )
 
     # Embed the anchor candidate exactly (zero padding only; no rounding).
     anchor_prob_out = np.zeros(out_grid.n, dtype=np.float64)
-    anchor_end = n_left + anchor_dist.prob_arr.size
-    anchor_prob_out[n_left:anchor_end] = anchor_dist.prob_arr
-    anchor_on_grid = DenseDiscreteDist(
-        x_0=out_grid.x_0,
-        step=out_grid.step,
-        prob_arr=anchor_prob_out,
-        p_min=anchor_dist.p_min,
-        p_max=anchor_dist.p_max,
-    )
-
+    anchor_prob_out[slice(n_left, n_left + anchor_dist.prob_arr.size)] = anchor_dist.prob_arr
     return combine_distributions(
-        dist_1=anchor_on_grid,
+        dist_1=DenseDiscreteDist(
+            x_0=out_grid.x_0,
+            step=out_grid.step,
+            prob_arr=anchor_prob_out,
+            p_min=anchor_dist.p_min,
+            p_max=anchor_dist.p_max,
+        ),
         dist_2=other_on_grid,
         bound_type=bound_type,
     )
@@ -430,35 +440,4 @@ def _ccdf_from_pmf(dist: DiscreteDistBase) -> NDArray[np.float64]:
     Includes both boundary atoms (p_min at the left, p_max at the right).
     """
     padded_probs = np.concatenate(([dist.p_min], dist.prob_arr, [dist.p_max]))
-    return _kahan_reverse_exclusive_cumsum(
-        padded_probs=padded_probs,
-    )
-
-
-@optional_njit()
-def _kahan_reverse_exclusive_cumsum(
-    padded_probs: NDArray[np.float64],
-) -> NDArray[np.float64]:
-    """Compute exclusive CCDF using Kahan summation for numerical stability.
-
-    Computes exclusive reverse cumulative sum: CCDF[i] = sum(padded_probs[i+1:]).
-    Uses Kahan compensated summation to minimize floating-point rounding errors.
-    """
-    n = len(padded_probs)
-    ccdf = np.zeros(n, dtype=np.float64)
-
-    # Start from the right (highest index) and accumulate backwards
-    running_sum = 0.0
-    compensation = 0.0
-
-    for i in range(n - 1, -1, -1):
-        # Store the running sum BEFORE adding current element (exclusive)
-        ccdf[i] = running_sum
-
-        # Kahan summation: compensated addition of current element
-        y = padded_probs[i] - compensation
-        t = running_sum + y
-        compensation = (t - running_sum) - y
-        running_sum = t
-
-    return ccdf
+    return kahan_reverse_exclusive_cumsum(values=padded_probs)

@@ -13,7 +13,10 @@ from PLD_accounting.discrete_dist import (
     PLDRealization,
     SparseDiscreteDist,
 )
-from PLD_accounting.distribution_discretization import rediscretize_dist
+from PLD_accounting.distribution_discretization import (
+    rediscretize_dist_by_bound,
+    rediscretize_dist_stoch_dom,
+)
 from PLD_accounting.distribution_utils import MAX_SAFE_EXP_ARG, exp_moment_terms
 from PLD_accounting.dp_accounting_support import (
     dp_accounting_pmf_to_pld_realization,
@@ -28,8 +31,8 @@ from PLD_accounting.utils import calc_pld_dual, negate_reverse_linear_distributi
 from tests.test_tolerances import TestTolerances as TOL
 
 
-def test_realization_remove_dominates_discretizes_once_at_requested_spacing(monkeypatch):
-    """The upper REMOVE path discretizes only the primary, at the requested spacing."""
+def test_realization_remove_dominates_discretizes_once_at_effective_spacing(monkeypatch):
+    """The upper REMOVE path discretizes only the primary, without refining its grid."""
     remove_realization = PLDRealization(
         x_0=0.0,
         step=0.5,
@@ -37,14 +40,14 @@ def test_realization_remove_dominates_discretizes_once_at_requested_spacing(monk
     )
     requested_spacing = 0.25
     calls = []
-    actual_rediscretize = rediscretize_dist
+    actual_rediscretize = rediscretize_dist_by_bound
 
     def recording_rediscretize(**kwargs):
         calls.append(kwargs)
         return actual_rediscretize(**kwargs)
 
     monkeypatch.setattr(
-        "PLD_accounting.random_allocation_realization.rediscretize_dist",
+        "PLD_accounting.random_allocation_realization.rediscretize_dist_by_bound",
         recording_rediscretize,
     )
 
@@ -55,12 +58,14 @@ def test_realization_remove_dominates_discretizes_once_at_requested_spacing(monk
         bound_type=BoundType.DOMINATES,
     )
     expected_neg_dual = negate_reverse_linear_distribution(calc_pld_dual(base_dist))
+    effective_spacing = remove_realization.step
 
     assert len(calls) == 1
     assert calls[0]["dist"] is remove_realization
-    assert calls[0]["loss_discretization"] == requested_spacing
-    assert base_dist.step == requested_spacing
-    assert neg_dual_dist.step == requested_spacing
+    assert calls[0]["loss_discretization"] == effective_spacing
+    assert calls[0]["bound_type"] == BoundType.DOMINATES
+    assert base_dist.step == effective_spacing
+    assert neg_dual_dist.step == effective_spacing
     assert isinstance(base_dist, PLDRealization)
     np.testing.assert_array_equal(neg_dual_dist.x_array, expected_neg_dual.x_array)
     np.testing.assert_array_equal(neg_dual_dist.prob_arr, expected_neg_dual.prob_arr)
@@ -71,7 +76,7 @@ def test_realization_remove_dominates_discretizes_once_at_requested_spacing(monk
 def test_dp_accounting_roundtrip_preserves_mass_and_grid_shape():
     """Dp accounting roundtrip preserves mass and grid shape."""
     original = _make_realization()
-    pmf = linear_dist_to_dp_accounting_pmf(dist=original, pessimistic_estimate=True)
+    pmf = linear_dist_to_dp_accounting_pmf(dist=original, bound_type=BoundType.DOMINATES)
     restored = dp_accounting_pmf_to_pld_realization(pmf)
 
     assert restored.x_array.shape == original.x_array.shape
@@ -88,34 +93,9 @@ def test_linear_dist_to_dp_accounting_handles_zero_finite_mass():
         prob_arr=np.array([0.0, 0.0], dtype=np.float64),
         p_max=1.0,
     )
-    pmf = linear_dist_to_dp_accounting_pmf(dist=realization, pessimistic_estimate=True)
+    pmf = linear_dist_to_dp_accounting_pmf(dist=realization, bound_type=BoundType.DOMINATES)
     assert pmf._infinity_mass == 1.0
     assert np.allclose(pmf._probs, np.array([0.0, 0.0]))
-
-
-@pytest.mark.parametrize(
-    ("x_0", "pessimistic", "expected_lower"),
-    [
-        # Nearest-lattice rounding would send both 0.49 cases to 0 and both
-        # -0.49 cases to 0, moving losses the wrong way for one bound each time.
-        (0.49, True, 1),
-        (0.49, False, 0),
-        (-0.49, True, 0),
-        (-0.49, False, -1),
-    ],
-)
-def test_linear_adapter_shifts_off_grid_origin_in_bound_direction(
-    x_0: float, pessimistic: bool, expected_lower: int
-):
-    """Off-lattice origins shift up for a dominating PLD and down for a dominated one."""
-    dist = DenseDiscreteDist(x_0=x_0, step=1.0, prob_arr=np.array([1.0]))
-
-    pmf = linear_dist_to_dp_accounting_pmf(
-        dist=dist,
-        pessimistic_estimate=pessimistic,
-    )
-
-    assert pmf._lower_loss == expected_lower
 
 
 @pytest.mark.parametrize("pessimistic", [True, False])
@@ -132,12 +112,13 @@ def test_linear_adapter_snaps_an_origin_that_is_aligned_up_to_ulp_noise(
     """
     dist = DenseDiscreteDist(x_0=x_0, step=1.0, prob_arr=np.array([1.0]))
 
-    pmf = linear_dist_to_dp_accounting_pmf(dist=dist, pessimistic_estimate=pessimistic)
+    bound_type = BoundType.DOMINATES if pessimistic else BoundType.IS_DOMINATED
+    pmf = linear_dist_to_dp_accounting_pmf(dist=dist, bound_type=bound_type)
 
     assert pmf._lower_loss == 0
 
 
-@pytest.mark.parametrize("x_0", [-0.351, -0.349, -0.375, 0.126])
+@pytest.mark.parametrize("x_0", [0.126, 0.151, 0.175])
 @pytest.mark.parametrize("pessimistic", [True, False])
 def test_linear_adapter_preserves_the_bound_between_lattice_knots(x_0: float, pessimistic: bool):
     """The converted PMF bounds the source hockey-stick curve at every epsilon.
@@ -166,7 +147,8 @@ def test_linear_adapter_preserves_the_bound_between_lattice_knots(x_0: float, pe
         ]
     )
 
-    pmf = linear_dist_to_dp_accounting_pmf(dist=dist, pessimistic_estimate=pessimistic)
+    bound_type = BoundType.DOMINATES if pessimistic else BoundType.IS_DOMINATED
+    pmf = linear_dist_to_dp_accounting_pmf(dist=dist, bound_type=bound_type)
     deltas = np.asarray(pmf.get_delta_for_epsilon(list(epsilons)), dtype=np.float64)
 
     if pessimistic:
@@ -267,14 +249,14 @@ def test_realization_remove_base_distributions_handles_is_dominated_coarsening()
         bound_type=BoundType.IS_DOMINATED,
     )
     exact_neg_dual = negate_reverse_linear_distribution(calc_pld_dual(remove_realization))
-    expected_base = rediscretize_dist(
+    expected_base = rediscretize_dist_stoch_dom(
         dist=remove_realization,
         tail_truncation=tail_truncation,
         loss_discretization=loss_discretization,
         spacing_type=SpacingType.LINEAR,
         bound_type=BoundType.IS_DOMINATED,
     )
-    expected_neg_dual = rediscretize_dist(
+    expected_neg_dual = rediscretize_dist_stoch_dom(
         dist=exact_neg_dual,
         tail_truncation=tail_truncation,
         loss_discretization=loss_discretization,
@@ -347,7 +329,7 @@ def test_realization_remove_base_distributions_is_dominated_clamps_when_refining
     # Effective discretization is clamped to realization.step, not the finer target.
     effective_disc = max(remove_realization.step, loss_discretization)
     exact_neg_dual = negate_reverse_linear_distribution(calc_pld_dual(remove_realization))
-    expected_base = rediscretize_dist(
+    expected_base = rediscretize_dist_stoch_dom(
         dist=DenseDiscreteDist(
             x_0=remove_realization.x_0,
             step=remove_realization.step,
@@ -360,7 +342,7 @@ def test_realization_remove_base_distributions_is_dominated_clamps_when_refining
         spacing_type=SpacingType.LINEAR,
         bound_type=BoundType.IS_DOMINATED,
     )
-    expected_neg_dual = rediscretize_dist(
+    expected_neg_dual = rediscretize_dist_stoch_dom(
         dist=exact_neg_dual,
         tail_truncation=tail_truncation,
         loss_discretization=effective_disc,
@@ -389,7 +371,7 @@ class TestRealizationAdapter:
             prob_arr=np.array([0.2, 0.3, 0.4, 0.1]),
         )
 
-        pmf = linear_dist_to_dp_accounting_pmf(dist=realization, pessimistic_estimate=True)
+        pmf = linear_dist_to_dp_accounting_pmf(dist=realization, bound_type=BoundType.DOMINATES)
         assert isinstance(pmf, DensePLDPmf)
         assert pmf._discretization == 0.5
         assert np.allclose(pmf._probs, realization.prob_arr)
@@ -402,7 +384,7 @@ class TestRealizationAdapter:
             prob_arr=np.array([0.3, 0.4, 0.3]),
         )
 
-        pmf = linear_dist_to_dp_accounting_pmf(dist=realization, pessimistic_estimate=True)
+        pmf = linear_dist_to_dp_accounting_pmf(dist=realization, bound_type=BoundType.DOMINATES)
         assert isinstance(pmf, DensePLDPmf)
         assert pmf._discretization == 0.5
         assert pmf._lower_loss == 2  # 1.0 / 0.5 = 2
@@ -416,7 +398,7 @@ class TestRealizationAdapter:
             p_max=0.1,
         )
 
-        pmf = linear_dist_to_dp_accounting_pmf(dist=realization, pessimistic_estimate=True)
+        pmf = linear_dist_to_dp_accounting_pmf(dist=realization, bound_type=BoundType.DOMINATES)
         assert isinstance(pmf, DensePLDPmf)
         assert pmf._infinity_mass == 0.1
 
@@ -428,7 +410,7 @@ class TestRealizationAdapter:
             prob_arr=np.array([0.2, 0.3, 0.4, 0.1]),
         )
 
-        pmf = linear_dist_to_dp_accounting_pmf(dist=realization, pessimistic_estimate=True)
+        pmf = linear_dist_to_dp_accounting_pmf(dist=realization, bound_type=BoundType.DOMINATES)
         restored = dp_accounting_pmf_to_pld_realization(pmf)
 
         # Check values match
@@ -437,6 +419,53 @@ class TestRealizationAdapter:
         assert np.allclose(realization.prob_arr, restored.prob_arr)
         assert np.isclose(realization.p_max, restored.p_max)
 
+    def test_dominating_off_grid_origin_rounds_toward_higher_losses(self):
+        """Dominating conversion moves the grid origin up to preserve the bound."""
+        realization = PLDRealization(
+            x_0=0.3,
+            step=1.0,
+            prob_arr=np.array([1.0]),
+        )
+
+        pmf = linear_dist_to_dp_accounting_pmf(dist=realization, bound_type=BoundType.DOMINATES)
+
+        assert pmf._lower_loss == 1
+        np.testing.assert_array_equal(pmf._probs, realization.prob_arr)
+        assert pmf._pessimistic_estimate is True
+
+        epsilon = 0.1
+        source_delta = 1.0 - math.exp(epsilon - realization.x_0)
+        upward_rounding_delta = 1.0 - math.exp(epsilon - 1.0)
+        assert pmf.get_delta_for_epsilon(epsilon) == pytest.approx(upward_rounding_delta)
+        assert upward_rounding_delta >= source_delta
+
+    def test_dominated_off_grid_origin_rounds_toward_lower_losses(self):
+        """Dominated conversion moves the grid origin down, regardless of proximity."""
+        realization = PLDRealization(
+            x_0=0.8,
+            step=1.0,
+            prob_arr=np.array([1.0]),
+        )
+
+        pmf = linear_dist_to_dp_accounting_pmf(dist=realization, bound_type=BoundType.IS_DOMINATED)
+
+        assert pmf._lower_loss == 0
+        np.testing.assert_array_equal(pmf._probs, realization.prob_arr)
+        assert pmf._pessimistic_estimate is False
+        assert pmf.get_delta_for_epsilon(0.1) <= 1.0 - math.exp(0.1 - realization.x_0)
+
+    def test_dominating_conversion_rejects_negative_infinity_mass(self):
+        """A dominating dp_accounting PMF cannot represent source mass at -infinity."""
+        dist = DenseDiscreteDist(
+            x_0=0.3,
+            step=1.0,
+            prob_arr=np.array([0.9]),
+            p_min=0.1,
+        )
+
+        with pytest.raises(ValueError, match="requires p_min = 0"):
+            linear_dist_to_dp_accounting_pmf(dist=dist, bound_type=BoundType.DOMINATES)
+
     def test_linear_dist_to_dp_accounting_rejects_non_linear_dist(self):
         """Linear dist to dp accounting rejects non linear dist."""
         dist = SparseDiscreteDist(
@@ -444,7 +473,7 @@ class TestRealizationAdapter:
             prob_arr=np.array([0.5, 0.5]),
         )
         with pytest.raises(TypeError, match="expected DenseDiscreteDist with LINEAR spacing"):
-            linear_dist_to_dp_accounting_pmf(dist=dist, pessimistic_estimate=True)
+            linear_dist_to_dp_accounting_pmf(dist=dist, bound_type=BoundType.DOMINATES)
 
 
 def _make_realization() -> PLDRealization:

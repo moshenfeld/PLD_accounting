@@ -63,7 +63,7 @@ class TestTolerances:
     - Very small beta (1e-12)
     - Fine discretization (1e-4)
 
-    Works even for T=16 convolutions.
+    Works even for 16 convolutions.
     """
 
     # ========================================================================

@@ -411,6 +411,7 @@ def general_allocation_pld(
         base_distributions_creation=partial(
             realization_remove_base_distributions,
             realization=remove_realization,
+            max_grid_mult=config.max_grid_mult,
         ),
     )
     remove_dist = allocation_directional_pld(
@@ -429,6 +430,7 @@ def general_allocation_pld(
         base_distributions_creation=partial(
             realization_add_base_distribution,
             realization=add_realization,
+            max_grid_mult=config.max_grid_mult,
         ),
     )
     add_dist = allocation_directional_pld(

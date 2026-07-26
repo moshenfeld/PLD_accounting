@@ -104,6 +104,17 @@ def test_subsample_pld_realization_returns_valid_pld_realization_add():
     result._validate_pld_realization()
 
 
+def test_remove_ctd_mixes_non_pld_dual_branch_before_projecting():
+    """Algorithm 8 validates the mixture, not its transformed -D(L) branch."""
+    base = _simple_remove_dist()
+    result = subsample_pld_realization(
+        base_pld=base,
+        sampling_prob=0.3,
+        direction=Direction.REMOVE,
+    )
+    result._validate_pld_realization()
+
+
 def test_subsample_pld_realization_add_places_positive_infinity_mass_at_max_add_loss():
     # Regression case: add-direction +inf mass must map to -log(1-q), not to the
     # rightmost transformed finite bin when that bin is below the cap.
@@ -134,19 +145,19 @@ def test_calc_subsampled_grid_rejects_invalid_bucket_count():
             min_loss=0.0,
             discretization=0.1,
             num_buckets=1,
-            grid_size=0.5,
+            sampling_prob=0.5,
             direction=Direction.REMOVE,
         )
 
 
-def test_calc_subsampled_grid_rejects_invalid_grid_size():
-    """Calc subsampled grid rejects invalid grid size."""
-    with pytest.raises(ValueError, match="grid_size must be in"):
+def test_calc_subsampled_grid_rejects_invalid_sampling_prob():
+    """Calc subsampled grid rejects invalid sampling probability."""
+    with pytest.raises(ValueError, match="sampling_prob must be in"):
         _calc_subsampled_grid(
             min_loss=0.0,
             discretization=0.1,
             num_buckets=10,
-            grid_size=0.0,
+            sampling_prob=0.0,
             direction=Direction.REMOVE,
         )
 

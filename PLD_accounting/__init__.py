@@ -1,7 +1,9 @@
 """Public entry points for random-allocation privacy accounting."""
 
-from PLD_accounting.discrete_dist import PLDRealization
+from PLD_accounting.discrete_dist import DenseDiscreteDist, PLDRealization
+from PLD_accounting.distribution_discretization import rediscretize_dist_by_bound
 from PLD_accounting.mechanisms import (
+    discrete_distribution,
     gaussian_distribution,
     laplace_distribution,
 )
@@ -33,6 +35,7 @@ from PLD_accounting.types import (
 )
 
 __all__ = [
+    "DenseDiscreteDist",
     "PLDRealization",
     "AllocationSchemeConfig",
     "BoundType",
@@ -44,6 +47,7 @@ __all__ = [
     "SpacingType",
     "has_numba",
     "compose_full_pld",
+    "discrete_distribution",
     "gaussian_allocation_directional_pld",
     "gaussian_allocation_pld",
     "gaussian_allocation_delta_configurable",
@@ -54,6 +58,7 @@ __all__ = [
     "general_allocation_delta",
     "general_allocation_epsilon",
     "laplace_distribution",
+    "rediscretize_dist_by_bound",
     "subsample_pld",
     "subsample_pld_realization",
 ]

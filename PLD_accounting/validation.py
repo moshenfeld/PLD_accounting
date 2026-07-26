@@ -245,21 +245,10 @@ def validate_allocation_scheme_config(config: AllocationSchemeConfig) -> None:
     for value, name in (
         (config.max_grid_fft, "max_grid_fft"),
         (config.max_grid_mult, "max_grid_mult"),
-        (config.cf_max_grid, "cf_max_grid"),
-        (config.cf_refine_factor, "cf_refine_factor"),
     ):
         validate_integer(value, name)
     if config.max_grid_fft <= 0:
         raise ValueError(f"max_grid_fft must be positive, got {config.max_grid_fft}")
-    if config.max_grid_mult != -1 and config.max_grid_mult <= 0:
-        raise ValueError(
-            f"max_grid_mult must be -1 (no limit) or a positive integer, "
-            f"got {config.max_grid_mult}"
-        )
-    if config.cf_max_grid <= 0:
-        raise ValueError(f"cf_max_grid must be positive, got {config.cf_max_grid}")
-    if config.cf_refine_factor <= 0:
-        raise ValueError(f"cf_refine_factor must be positive, got {config.cf_refine_factor}")
 
 
 def validate_optional_discretization_params(

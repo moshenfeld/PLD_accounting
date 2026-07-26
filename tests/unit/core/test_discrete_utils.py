@@ -13,6 +13,7 @@ from scipy import stats
 from PLD_accounting.discrete_dist import (
     DenseDiscreteDist,
     Domain,
+    GridSpec,
     PLDRealization,
     SparseDiscreteDist,
 )
@@ -20,9 +21,12 @@ from PLD_accounting.distribution_discretization import (
     _compute_discrete_prob as compute_discrete_PMF,
 )
 from PLD_accounting.distribution_discretization import (
-    discretize_aligned_range,
-    discretize_continuous_distribution,
-    rediscretize_dist,
+    aligned_grid_params,
+    discretize_continuous_ctd,
+    discretize_continuous_stoch_dom,
+    project_dist_onto_grid_ctd,
+    rediscretize_dist_ctd,
+    rediscretize_dist_stoch_dom,
 )
 from PLD_accounting.distribution_discretization import (
     rediscretize_prob as pmf_remap_to_grid_kernel,
@@ -36,23 +40,23 @@ from PLD_accounting.distribution_utils import (
     enforce_mass_conservation,
 )
 from PLD_accounting.types import BoundType, SpacingType
-from PLD_accounting.utils import _ccdf_from_pmf
+from PLD_accounting.utils import _ccdf_from_pmf, exp_linear_to_geometric
 from tests.test_tolerances import TestTolerances as TOL
 
 
 class TestDiscretizeRange:
-    """Test discretize_aligned_range function."""
+    """Test aligned grid generation."""
 
     def test_linear_spacing(self):
         """Test linear spacing generation."""
         n_grid = 100
-        x = discretize_aligned_range(
+        x = aligned_grid_params(
             x_min=0.0,
             x_max=10.0,
             spacing_type=SpacingType.LINEAR,
             align_to_multiples=True,
             discretization=(10.0 - 0.0) / (n_grid - 1),
-        )
+        ).materialize()
         assert len(x) >= n_grid
         # Range should cover requested bounds (may extend due to alignment)
         assert x[0] <= 0.0
@@ -64,13 +68,13 @@ class TestDiscretizeRange:
     def test_geometric_spacing(self):
         """Test geometric spacing generation."""
         n_grid = 100
-        x = discretize_aligned_range(
+        x = aligned_grid_params(
             x_min=1.0,
             x_max=100.0,
             spacing_type=SpacingType.GEOMETRIC,
             align_to_multiples=True,
             discretization=np.log(100.0 / 1.0) / (n_grid - 1),
-        )
+        ).materialize()
         assert len(x) >= n_grid
         # Range should cover requested bounds (may extend due to alignment)
         assert x[0] <= 1.0
@@ -82,7 +86,7 @@ class TestDiscretizeRange:
     def test_nonpositive_discretization_rejected(self):
         """Discretization must be positive."""
         with pytest.raises(ValueError, match="discretization must be positive"):
-            discretize_aligned_range(
+            aligned_grid_params(
                 x_min=0.0,
                 x_max=10.0,
                 spacing_type=SpacingType.LINEAR,
@@ -93,13 +97,13 @@ class TestDiscretizeRange:
     def test_two_points_linear(self):
         """Test linear grid."""
         n_grid = 100
-        x = discretize_aligned_range(
+        x = aligned_grid_params(
             x_min=1.0,
             x_max=3.0,
             spacing_type=SpacingType.LINEAR,
             align_to_multiples=True,
             discretization=(3.0 - 1.0) / (n_grid - 1),
-        )
+        ).materialize()
         assert len(x) >= n_grid
         # Range should cover requested bounds (may extend due to alignment)
         assert x[0] <= 1.0
@@ -114,13 +118,13 @@ class TestDiscretizeRange:
         x_max = 1.4160541697856062
         discretization = 0.041648652052517825
 
-        x = discretize_aligned_range(
+        x = aligned_grid_params(
             x_min=x_min,
             x_max=x_max,
             spacing_type=SpacingType.LINEAR,
             align_to_multiples=True,
             discretization=discretization,
-        )
+        ).materialize()
 
         assert x[0] <= x_min
         assert x[-1] >= x_max
@@ -130,42 +134,68 @@ class TestDiscretizeRange:
     def test_linear_aligned_spacing_matches_requested_step(self):
         """Aligned linear grids use the requested discretization as bin width."""
         discretization = 0.25
-        x = discretize_aligned_range(
+        x = aligned_grid_params(
             x_min=-1.12,
             x_max=2.18,
             spacing_type=SpacingType.LINEAR,
             align_to_multiples=True,
             discretization=discretization,
-        )
+        ).materialize()
 
         assert np.isclose(compute_bin_width(x), discretization)
         assert np.allclose(x / discretization, np.round(x / discretization))
 
     def test_continuous_discretization_uses_requested_linear_step(self):
         """Continuous discretization should preserve the requested linear step."""
-        result = discretize_continuous_distribution(
+        result = discretize_continuous_stoch_dom(
             dist=stats.norm(loc=0.0, scale=1.0),
             tail_truncation=1e-3,
             bound_type=BoundType.DOMINATES,
-            spacing_type=SpacingType.LINEAR,
             step=0.1,
             align_to_multiples=True,
         )
 
         assert np.isclose(compute_bin_width(result.x_array), 0.1)
 
-    def test_continuous_discretization_uses_requested_geometric_ratio(self):
-        """Continuous discretization should preserve the requested geometric ratio."""
-        result = discretize_continuous_distribution(
-            dist=stats.lognorm(s=0.5, scale=1.0),
+    def test_exponentiating_continuous_discretization_uses_requested_geometric_ratio(self):
+        """Exponentiating a linear discretization produces the requested ratio."""
+        linear_dist = discretize_continuous_stoch_dom(
+            dist=stats.norm(loc=0.0, scale=0.5),
             tail_truncation=1e-3,
             bound_type=BoundType.DOMINATES,
-            spacing_type=SpacingType.GEOMETRIC,
-            step=1.05,
+            step=np.log(1.05),
+            align_to_multiples=True,
+        )
+        result = exp_linear_to_geometric(linear_dist)
+
+        assert np.isclose(compute_bin_ratio(result.x_array), 1.05)
+
+    def test_continuous_ctd_requires_pld_dual(self):
+        """CtD needs both laws in the closed-form privacy-profile identity."""
+        with pytest.raises(TypeError, match="dual_dist"):
+            discretize_continuous_ctd(  # pylint: disable=missing-kwoa
+                dist=stats.logistic(),
+                tail_truncation=1e-5,
+                step=0.2,
+                align_to_multiples=True,
+            )
+
+    def test_continuous_ctd_accepts_general_pld_and_dual(self):
+        """CtD is not restricted to named Gaussian and Laplace families."""
+        log_two = math.log(2.0)
+        pld = stats.expon(loc=-log_two, scale=1.0)
+        dual_pld = stats.weibull_max(c=1.0, loc=log_two, scale=0.5)
+
+        result = discretize_continuous_ctd(
+            dist=pld,
+            dual_dist=dual_pld,
+            tail_truncation=1e-5,
+            step=0.2,
             align_to_multiples=True,
         )
 
-        assert np.isclose(compute_bin_ratio(result.x_array), 1.05)
+        assert isinstance(result, PLDRealization)
+        assert result.p_min == 0.0
 
 
 class TestComputeBinWidth:
@@ -492,6 +522,21 @@ def test_raises_when_mass_is_at_least_total():
 class TestRediscretizeBoundaryFolding:
     """Test rediscretization of soft boundary masses into edge bins."""
 
+    def test_ctd_rejects_single_point_range(self):
+        """CtD rediscretization requires distinct truncated support bounds."""
+        dist = PLDRealization(
+            x_0=0.0,
+            step=1.0,
+            prob_arr=np.array([1.0], dtype=np.float64),
+        )
+
+        with pytest.raises(ValueError, match="at least two distinct finite support points"):
+            rediscretize_dist_ctd(
+                dist=dist,
+                tail_truncation=0.0,
+                loss_discretization=0.1,
+            )
+
     def test_rediscretize_near_point_mass_distribution(self):
         # prob_arr has two nonzero bins so a valid grid range exists after truncation.
         # Both bins have mass >> tail_truncation so neither is consumed.
@@ -502,7 +547,7 @@ class TestRediscretizeBoundaryFolding:
             prob_arr=np.array([1.0 - 1e-6, 1e-6], dtype=np.float64),
         )
 
-        result = rediscretize_dist(
+        result = rediscretize_dist_stoch_dom(
             dist=dist,
             tail_truncation=1e-8,
             loss_discretization=1e-2,
@@ -524,7 +569,7 @@ class TestRediscretizeBoundaryFolding:
             p_max=0.1,
         )
 
-        result = rediscretize_dist(
+        result = rediscretize_dist_stoch_dom(
             dist=dist,
             tail_truncation=0.0,
             loss_discretization=1.0,
@@ -547,7 +592,7 @@ class TestRediscretizeBoundaryFolding:
             p_max=0.1,
         )
 
-        result = rediscretize_dist(
+        result = rediscretize_dist_stoch_dom(
             dist=dist,
             tail_truncation=0.0,
             loss_discretization=0.1,
@@ -568,7 +613,7 @@ class TestRediscretizeBoundaryFolding:
             p_min=0.1,
         )
 
-        result = rediscretize_dist(
+        result = rediscretize_dist_stoch_dom(
             dist=dist,
             tail_truncation=0.0,
             loss_discretization=1.0,
@@ -592,7 +637,7 @@ class TestRediscretizeBoundaryFolding:
             domain=Domain.POSITIVES,
         )
 
-        result = rediscretize_dist(
+        result = rediscretize_dist_stoch_dom(
             dist=dist,
             tail_truncation=0.0,
             loss_discretization=np.log(2.0),
@@ -604,3 +649,56 @@ class TestRediscretizeBoundaryFolding:
         assert np.isclose(
             math.fsum([*map(float, result.prob_arr), result.p_min, result.p_max]), 1.0
         )
+
+    def test_ctd_real_linear_rediscretization_preserves_mass(self):
+        """CtD rejects a real-domain distribution that is not a PLD realization."""
+        dist = DenseDiscreteDist(
+            x_0=-1.0,
+            step=0.5,
+            prob_arr=np.array([0.15, 0.2, 0.25, 0.4], dtype=np.float64),
+        )
+
+        with pytest.raises(ValueError, match="reciprocal-moment"):
+            rediscretize_dist_ctd(
+                dist=dist,
+                tail_truncation=0.0,
+                loss_discretization=1.0,
+            )
+
+    def test_ctd_positive_geometric_rediscretization_preserves_zero_atom(self):
+        """CtD rejects positive/geometric grids rather than silently rounding."""
+        dist = DenseDiscreteDist(
+            x_0=1.0,
+            step=2.0,
+            prob_arr=np.array([0.2, 0.3, 0.4], dtype=np.float64),
+            p_min=0.1,
+            spacing_type=SpacingType.GEOMETRIC,
+            domain=Domain.POSITIVES,
+        )
+
+        with pytest.raises(ValueError, match="fixed-gap linear grid"):
+            project_dist_onto_grid_ctd(
+                dist=dist,
+                grid=GridSpec(
+                    x_0=1.0,
+                    step=2.0,
+                    n=3,
+                    spacing_type=SpacingType.GEOMETRIC,
+                ),
+            )
+
+    def test_ctd_rejects_positive_domain_linear_rediscretization(self):
+        """CtD must not reinterpret positive values as real privacy losses."""
+        dist = DenseDiscreteDist(
+            x_0=1.0,
+            step=1.0,
+            prob_arr=np.array([0.4, 0.6], dtype=np.float64),
+            domain=Domain.POSITIVES,
+        )
+
+        with pytest.raises(ValueError, match="real-domain"):
+            rediscretize_dist_ctd(
+                dist=dist,
+                tail_truncation=0.0,
+                loss_discretization=0.5,
+            )
