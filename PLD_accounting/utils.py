@@ -16,7 +16,6 @@ from PLD_accounting.discrete_dist import (
     PLDRealization,
 )
 from PLD_accounting.distribution_discretization import (
-    fold_absorbable_boundary_atom,
     project_dist_onto_grid_ctd,
     project_dist_onto_grid_stoch_dom,
 )
@@ -222,6 +221,7 @@ def combine_distributions(
     else:
         expected_p_min = min(dist_1.p_min, dist_2.p_min)
         expected_p_max = max(dist_1.p_max, dist_2.p_max)
+    # Repair numerical drift after the CCDF operation fixes both boundary atoms.
     prob_arr, p_min, p_max = enforce_mass_conservation(
         prob_arr=prob_arr,
         expected_p_min=expected_p_min,
@@ -268,6 +268,23 @@ def combine_best_of_two_plds(
             f"got {type(dist_2).__name__} with spacing {getattr(dist_2, 'spacing_type', '?')}"
         )
 
+    if bound_type == BoundType.DOMINATES:
+        if dist_1.p_min != 0.0 or dist_2.p_min != 0.0:
+            raise ValueError(
+                "combine_best_of_two_plds requires canonical dominating inputs "
+                "with p_min = 0 exactly; "
+                f"dist_1.p_min={dist_1.p_min:.2e}, dist_2.p_min={dist_2.p_min:.2e}"
+            )
+    elif bound_type == BoundType.IS_DOMINATED:
+        for name, dist in (("dist_1", dist_1), ("dist_2", dist_2)):
+            if dist.p_max != 0.0:
+                raise ValueError(
+                    "combine_best_of_two_plds requires canonical dominated "
+                    f"inputs with p_max = 0 exactly; {name}.p_max={dist.p_max:.2e}"
+                )
+    else:
+        raise ValueError(f"Unknown BoundType: {bound_type}")
+
     if dist_1.step <= dist_2.step:
         anchor_dist, other_dist = dist_1, dist_2
     else:
@@ -287,24 +304,18 @@ def combine_best_of_two_plds(
     )
 
     # Project the coarser candidate onto the shared lattice with
-    # domination-aware rounding.
-    other_working = fold_absorbable_boundary_atom(
-        dist=other_dist,
-        spacing_type=SpacingType.LINEAR,
-        bound_type=bound_type,
-    )
+    # domination-aware rounding. Boundary atoms are already canonical and are
+    # owned by the projection functions.
     other_on_grid: DenseDiscreteDist
     if bound_type == BoundType.DOMINATES:
         other_on_grid = project_dist_onto_grid_ctd(
-            dist=other_working,
+            dist=other_dist,
             grid=out_grid,
         )
     else:
         other_on_grid = project_dist_onto_grid_stoch_dom(
-            dist=other_working,
+            dist=other_dist,
             grid=out_grid,
-            expected_p_min=other_working.p_min,
-            expected_p_max=other_working.p_max,
             bound_type=bound_type,
         )
 

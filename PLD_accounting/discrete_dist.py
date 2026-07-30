@@ -492,7 +492,7 @@ class PLDRealization(DenseDiscreteDist):
         2. E[e^(-X)] <= 1.
         """
         # PLD realizations must have zero mass at negative-infinity loss.
-        if self.p_min > PMF_MASS_TOL:
+        if self.p_min != 0.0:
             raise ValueError(f"PLD realization requires p_min = 0, got {self.p_min:.2e}")
 
         exp_moment_val = exp_moment_terms(prob_arr=self.prob_arr, x_vals=self.x_array)

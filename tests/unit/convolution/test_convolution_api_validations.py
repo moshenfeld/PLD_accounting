@@ -4,7 +4,11 @@ import numpy as np
 import pytest
 
 from PLD_accounting.discrete_dist import DenseDiscreteDist, Domain
-from PLD_accounting.fft_convolution import fft_convolve, fft_self_convolve
+from PLD_accounting.fft_convolution import (
+    _fft_self_convolve_direct,
+    fft_convolve,
+    fft_self_convolve,
+)
 from PLD_accounting.types import BoundType, SpacingType
 
 
@@ -25,6 +29,27 @@ def _geometric_dist() -> DenseDiscreteDist:
         p_max=0.0,
         spacing_type=SpacingType.GEOMETRIC,
         domain=Domain.POSITIVES,
+    )
+
+
+def _linear_positive_dist(*, p_min: float = 0.0) -> DenseDiscreteDist:
+    return DenseDiscreteDist(
+        x_0=1.0,
+        step=1.0,
+        prob_arr=np.array([0.4, 0.6 - p_min], dtype=np.float64),
+        p_min=p_min,
+        domain=Domain.POSITIVES,
+    )
+
+
+def _linear_real_boundary_dist(*, p_min: float = 0.0, p_max: float = 0.0) -> DenseDiscreteDist:
+    return DenseDiscreteDist(
+        x_0=0.0,
+        step=1.0,
+        prob_arr=np.array([1.0 - p_min - p_max], dtype=np.float64),
+        p_min=p_min,
+        p_max=p_max,
+        domain=Domain.REALS,
     )
 
 
@@ -63,4 +88,66 @@ def test_fft_accepts_different_origins_and_support_lengths():
 
     assert result.x_0 == -0.75
     assert result.step == 0.5
+    assert result.domain == Domain.REALS
     np.testing.assert_allclose(result.prob_arr, np.convolve(dist_1.prob_arr, dist_2.prob_arr))
+
+
+@pytest.mark.parametrize("positive_operand", [0, 1])
+@pytest.mark.parametrize("p_min", [0.0, 0.2])
+def test_fft_pair_requires_real_domain(positive_operand: int, p_min: float) -> None:
+    """Pairwise FFT rejects positive-domain inputs regardless of boundary mass."""
+    dists = [_linear_positive_dist(), _linear_positive_dist()]
+    dists[1 - positive_operand] = _linear_dist()
+    dists[positive_operand] = _linear_positive_dist(p_min=p_min)
+
+    with pytest.raises(ValueError, match=r"requires Domain\.REALS inputs"):
+        fft_convolve(
+            dist_1=dists[0],
+            dist_2=dists[1],
+            tail_truncation=0.0,
+            bound_type=BoundType.DOMINATES,
+        )
+
+
+@pytest.mark.parametrize("use_direct", [False, True])
+@pytest.mark.parametrize("p_min", [0.0, 0.2])
+def test_fft_self_requires_real_domain(use_direct: bool, p_min: float) -> None:
+    """FFT self-convolution receives REALS intermediates from both allocation paths."""
+    with pytest.raises(ValueError, match=r"requires Domain\.REALS input"):
+        fft_self_convolve(
+            dist=_linear_positive_dist(p_min=p_min),
+            num_convolutions=2,
+            tail_truncation=0.0,
+            bound_type=BoundType.DOMINATES,
+            use_direct=use_direct,
+        )
+
+
+def test_fft_direct_implementation_requires_real_domain() -> None:
+    """The internal direct entry point enforces the same REALS-only contract."""
+    with pytest.raises(ValueError, match=r"requires Domain\.REALS input"):
+        _fft_self_convolve_direct(
+            dist=_linear_positive_dist(p_min=0.2),
+            num_convolutions=2,
+            tail_truncation=0.0,
+            bound_type=BoundType.DOMINATES,
+        )
+
+
+@pytest.mark.parametrize("reverse_inputs", [False, True])
+def test_fft_pair_rejects_opposing_real_boundary_atoms(reverse_inputs: bool) -> None:
+    """The sum -inf + +inf has no distribution-independent interpretation."""
+    dists = [
+        _linear_real_boundary_dist(p_min=0.2),
+        _linear_real_boundary_dist(p_max=0.3),
+    ]
+    if reverse_inputs:
+        dists.reverse()
+
+    with pytest.raises(ValueError, match=r"undefined.*-inf.*\+inf"):
+        fft_convolve(
+            dist_1=dists[0],
+            dist_2=dists[1],
+            tail_truncation=0.0,
+            bound_type=BoundType.DOMINATES,
+        )

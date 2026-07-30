@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 from PLD_accounting.discrete_dist import DenseDiscreteDist, Domain
+from PLD_accounting.distribution_utils import PMF_MASS_TOL
 from PLD_accounting.fft_convolution import fft_convolve, fft_self_convolve
 from PLD_accounting.geometric_convolution import (
     _compute_geometric_convolution,
@@ -134,6 +135,107 @@ def test_geometric_self_convolve_keeps_anchored_lattice():
     lower_index = math.log(result.x_0 / final_anchor) / math.log(result.step)
 
     assert lower_index == pytest.approx(round(lower_index), abs=TOL.SPACING_ATOL)
+
+
+@pytest.mark.parametrize("use_numba", [True, False])
+def test_zero_tail_geometric_self_convolution_does_not_create_infinity_mass(
+    monkeypatch: pytest.MonkeyPatch,
+    use_numba: bool,
+) -> None:
+    """Upper-bound roundoff never becomes an absorbing infinity atom."""
+    monkeypatch.setattr(
+        "PLD_accounting.geometric_convolution.has_numba",
+        lambda: use_numba,
+    )
+    dist = DenseDiscreteDist(
+        x_0=0.1,
+        step=1.01,
+        prob_arr=np.ones(3, dtype=np.float64) / 3.0,
+        p_min=0.0,
+        p_max=0.0,
+        spacing_type=SpacingType.GEOMETRIC,
+        domain=Domain.POSITIVES,
+    )
+
+    result = geometric_self_convolve(
+        dist=dist,
+        num_convolutions=100_000,
+        tail_truncation=0.0,
+        bound_type=BoundType.DOMINATES,
+        lattice_anchor=0.1,
+    )
+
+    assert result.p_max == 0.0
+    assert math.fsum([*map(float, result.prob_arr), result.p_min, result.p_max]) == pytest.approx(
+        1.0,
+        abs=TOL.MASS_CONSERVATION,
+    )
+
+
+def test_dominated_geometric_convolution_preserves_tiny_zero_cross_underflow() -> None:
+    """Semantic zero-plus-finite underflow is explicitly retained at p_min."""
+    underflow_mass = PMF_MASS_TOL / 2
+    dist_with_zero = DenseDiscreteDist(
+        x_0=1.0,
+        step=2.0,
+        prob_arr=np.array([1.0 - underflow_mass]),
+        p_min=underflow_mass,
+        spacing_type=SpacingType.GEOMETRIC,
+        domain=Domain.POSITIVES,
+    )
+    finite_dist = DenseDiscreteDist(
+        x_0=0.5,
+        step=2.0,
+        prob_arr=np.array([1.0]),
+        spacing_type=SpacingType.GEOMETRIC,
+        domain=Domain.POSITIVES,
+    )
+
+    result = geometric_convolve(
+        dist_1=dist_with_zero,
+        dist_2=finite_dist,
+        target_anchor=None,
+        tail_truncation=0.0,
+        bound_type=BoundType.IS_DOMINATED,
+    )
+
+    assert result.p_min == pytest.approx(underflow_mass)
+    assert result.p_max == 0.0
+    np.testing.assert_allclose(result.x_array, np.array([1.5]))
+    np.testing.assert_allclose(result.prob_arr, np.array([1.0 - underflow_mass]))
+
+
+def test_dominating_geometric_convolution_rounds_zero_cross_underflow_up() -> None:
+    """A dominating bound moves a below-grid zero cross-term to its first cell."""
+    underflow_mass = 0.1
+    dist_with_zero = DenseDiscreteDist(
+        x_0=1.0,
+        step=2.0,
+        prob_arr=np.array([1.0 - underflow_mass]),
+        p_min=underflow_mass,
+        spacing_type=SpacingType.GEOMETRIC,
+        domain=Domain.POSITIVES,
+    )
+    finite_dist = DenseDiscreteDist(
+        x_0=0.5,
+        step=2.0,
+        prob_arr=np.array([1.0]),
+        spacing_type=SpacingType.GEOMETRIC,
+        domain=Domain.POSITIVES,
+    )
+
+    result = geometric_convolve(
+        dist_1=dist_with_zero,
+        dist_2=finite_dist,
+        target_anchor=None,
+        tail_truncation=0.0,
+        bound_type=BoundType.DOMINATES,
+    )
+
+    assert result.p_min == 0.0
+    assert result.p_max == 0.0
+    np.testing.assert_allclose(result.x_array, np.array([1.5]))
+    np.testing.assert_allclose(result.prob_arr, np.array([1.0]))
 
 
 @pytest.mark.parametrize(

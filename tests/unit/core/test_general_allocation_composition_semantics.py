@@ -1,5 +1,7 @@
 """Unit tests for random-allocation composition wiring."""
 
+# pylint: disable=too-many-lines
+
 from __future__ import annotations
 
 from typing import Any
@@ -11,7 +13,7 @@ import PLD_accounting.random_allocation_accounting as random_allocation_accounti
 import PLD_accounting.random_allocation_api as random_allocation_api_module
 import PLD_accounting.random_allocation_gaussian as random_allocation_gaussian_module
 import PLD_accounting.random_allocation_realization as random_allocation_realization_module
-from PLD_accounting.discrete_dist import DenseDiscreteDist, PLDRealization
+from PLD_accounting.discrete_dist import DenseDiscreteDist, Domain, PLDRealization
 from PLD_accounting.random_allocation_accounting import (
     _allocation_directional_pld_core as allocation_directional_pld_core,
 )
@@ -339,6 +341,223 @@ def test_gaussian_allocation_best_of_two_combines_full_pipelines(
             assert call["count_fn"](7) == 1
     # The real end-level combine + compose path runs and yields a dp_accounting PLD.
     assert result.get_delta_for_epsilon(1.0) >= 0.0
+
+
+def test_gaussian_fft_add_folds_zero_atom_before_actual_self_convolution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """ADD includes zero-plus-finite cross terms in the FFT array convolution."""
+    source = DenseDiscreteDist(
+        x_0=1.0,
+        step=1.0,
+        prob_arr=np.array([0.5, 0.3]),
+        p_min=0.2,
+        domain=Domain.POSITIVES,
+    )
+    captured: dict[str, DenseDiscreteDist] = {}
+
+    def fake_discretize(**kwargs: Any) -> DenseDiscreteDist:
+        assert kwargs["bound_type"] == BoundType.IS_DOMINATED
+        assert kwargs["align_to_multiples"] is False
+        assert kwargs["domain"] == Domain.POSITIVES
+        return source
+
+    def capture_rediscretize(**kwargs: Any) -> DenseDiscreteDist:
+        conv_dist = kwargs["dist"]
+        captured["conv_dist"] = conv_dist
+        return DenseDiscreteDist(
+            x_0=1.0,
+            step=np.e,
+            prob_arr=conv_dist.prob_arr,
+            p_min=conv_dist.p_min,
+            p_max=conv_dist.p_max,
+            spacing_type=SpacingType.GEOMETRIC,
+            domain=Domain.POSITIVES,
+        )
+
+    monkeypatch.setattr(
+        random_allocation_gaussian_module,
+        "discretize_continuous_stoch_dom",
+        fake_discretize,
+    )
+    monkeypatch.setattr(
+        random_allocation_gaussian_module,
+        "rediscretize_dist_stoch_dom",
+        capture_rediscretize,
+    )
+
+    random_allocation_gaussian_module._gaussian_allocation_fft_add(
+        num_steps=2,
+        loss_discretization=0.1,
+        tail_truncation=0.0,
+        bound_type=BoundType.DOMINATES,
+        sigma_inv=0.5,
+        single_step_tail_truncation=1e-6,
+        single_step_n_grid=128,
+    )
+
+    conv_dist = captured["conv_dist"]
+    assert conv_dist.domain == Domain.POSITIVES
+    assert conv_dist.x_0 == 1.0
+    assert conv_dist.p_min == pytest.approx(0.04)
+    np.testing.assert_allclose(conv_dist.prob_arr, np.array([0.20, 0.37, 0.30, 0.09]))
+
+
+def test_gaussian_fft_add_embeds_boundary_at_nonpositive_cell_for_wide_offset() -> None:
+    """The prepended-cell count puts the zero atom at or below zero."""
+    source = DenseDiscreteDist(
+        x_0=2.5,
+        step=1.0,
+        prob_arr=np.array([0.7]),
+        p_min=0.3,
+        domain=Domain.POSITIVES,
+    )
+
+    result = random_allocation_gaussian_module._embed_positive_boundary_on_nonpositive_real_cell(
+        source
+    )
+
+    assert result.domain == Domain.REALS
+    assert result.x_0 == -0.5
+    assert result.p_min == 0.0
+    np.testing.assert_array_equal(result.prob_arr, np.array([0.3, 0.0, 0.0, 0.7]))
+
+
+def test_gaussian_fft_add_embed_falls_back_when_x_0_is_swallowed_by_step() -> None:
+    """A cancellation-prone offset folds in place instead of corrupting the lattice."""
+    p_min = 1e-13
+    prob_arr = np.array([0.999999, 7.0e-07, 3.0e-07])
+    prob_arr *= (1.0 - p_min) / prob_arr.sum()
+    source = DenseDiscreteDist(
+        x_0=1.2644809843750233e-14,
+        step=11820.764697407296,
+        prob_arr=prob_arr,
+        p_min=p_min,
+        domain=Domain.POSITIVES,
+    )
+
+    result = random_allocation_gaussian_module._embed_positive_boundary_on_nonpositive_real_cell(
+        source
+    )
+
+    # No cell is prepended: x_0 - step would round to exactly -step, so every
+    # subsequent cell's recovered position would silently collapse to 0.
+    assert result.domain == Domain.REALS
+    assert result.x_0 == source.x_0
+    assert result.p_min == 0.0
+    expected = prob_arr.copy()
+    expected[0] += source.p_min
+    np.testing.assert_allclose(result.prob_arr, expected)
+
+
+def test_gaussian_fft_add_folds_all_nonpositive_cells_to_zero_boundary() -> None:
+    """Post-processing preserves mass while tightening nonpositive artifacts to zero."""
+    source = DenseDiscreteDist(
+        x_0=-1.0,
+        step=1.0,
+        prob_arr=np.array([0.1, 0.2, 0.3, 0.35]),
+        p_min=0.05,
+        domain=Domain.REALS,
+    )
+
+    result = random_allocation_gaussian_module._fold_nonpositive_real_mass_to_positive_boundary(
+        source
+    )
+
+    assert result.domain == Domain.POSITIVES
+    assert result.x_0 == 1.0
+    assert result.p_min == pytest.approx(0.35)
+    np.testing.assert_array_equal(result.prob_arr, np.array([0.3, 0.35]))
+
+
+def test_gaussian_fft_add_unaligned_positive_grid_respects_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The unaligned positive ADD grid stays within its configured cap."""
+    captured: dict[str, DenseDiscreteDist] = {}
+
+    def fake_fft_self_convolve(**kwargs: Any) -> DenseDiscreteDist:
+        captured["dist"] = kwargs["dist"]
+        return kwargs["dist"]
+
+    monkeypatch.setattr(
+        random_allocation_gaussian_module,
+        "fft_self_convolve",
+        fake_fft_self_convolve,
+    )
+
+    random_allocation_gaussian_module._gaussian_allocation_fft_add(
+        num_steps=5,
+        loss_discretization=1e-3,
+        tail_truncation=0.0,
+        bound_type=BoundType.DOMINATES,
+        sigma_inv=0.5,
+        single_step_tail_truncation=1e-8,
+        single_step_n_grid=128,
+    )
+
+    fft_input = captured["dist"]
+    assert fft_input.domain == Domain.REALS
+    assert fft_input.x_0 <= 0.0
+    assert fft_input.p_min == 0.0
+    assert fft_input.prob_arr[0] == pytest.approx(1e-8)
+    assert fft_input.prob_arr.size <= 129
+
+
+def test_gaussian_fft_add_real_convolution_keeps_zero_boundary_within_budget() -> None:
+    """The restored positive zero boundary remains within the tail budget."""
+    tail_truncation = 2.2222222222222222e-14
+    result = random_allocation_gaussian_module._gaussian_allocation_fft_add(
+        num_steps=2,
+        loss_discretization=0.004,
+        tail_truncation=tail_truncation,
+        bound_type=BoundType.DOMINATES,
+        sigma_inv=1.0,
+        single_step_tail_truncation=tail_truncation / 2,
+        single_step_n_grid=25_000,
+    )
+
+    # The single-step lower tail participates in FFT composition on a real cell.
+    assert result.p_max < 1e-12
+
+
+def test_gaussian_fft_remove_uses_aligned_real_factors(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """REMOVE convolves base and exp(negative dual) on one real-domain lattice."""
+    actual_discretize = random_allocation_gaussian_module.discretize_continuous_stoch_dom
+    calls: list[tuple[dict[str, Any], DenseDiscreteDist]] = []
+
+    def recording_discretize(**kwargs: Any) -> DenseDiscreteDist:
+        result = actual_discretize(**kwargs)
+        calls.append((kwargs, result))
+        return result
+
+    monkeypatch.setattr(
+        random_allocation_gaussian_module,
+        "discretize_continuous_stoch_dom",
+        recording_discretize,
+    )
+
+    random_allocation_gaussian_module._gaussian_allocation_fft_remove(
+        num_steps=5,
+        loss_discretization=1e-3,
+        tail_truncation=1e-6,
+        bound_type=BoundType.DOMINATES,
+        sigma_inv=0.5,
+        single_step_tail_truncation=1e-7,
+        single_step_n_grid=128,
+    )
+
+    assert len(calls) == 2
+    steps = {kwargs["step"] for kwargs, _ in calls}
+    assert len(steps) == 1
+    for kwargs, dist in calls:
+        assert kwargs["align_to_multiples"] is True
+        assert kwargs["domain"] == Domain.REALS
+        assert dist.domain == Domain.REALS
+        assert dist.x_0 >= 0.0
+        assert dist.x_0 / dist.step == pytest.approx(round(dist.x_0 / dist.step))
 
 
 def test_allocation_directional_pld_core_truncates_without_regridding(

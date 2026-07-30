@@ -1,6 +1,7 @@
 """Tests for optional-numba fallback paths."""
 
 import numpy as np
+import pytest
 
 from PLD_accounting import types
 from PLD_accounting.distribution_discretization import (
@@ -116,7 +117,7 @@ def test_zero_atom_cross_term_vectorized_rounding():
     x_arr = np.array([0.5, 1.0, 2.0, 4.0])
     prob_arr = np.array([0.1, 0.2, 0.3, 0.4])
 
-    dominates = _add_single_zero_atom_cross_term(
+    dominates, dominates_below, dominates_above = _add_single_zero_atom_cross_term(
         pmf_conv=pmf.copy(),
         x_arr=x_arr,
         prob_arr=prob_arr,
@@ -125,9 +126,11 @@ def test_zero_atom_cross_term_vectorized_rounding():
         ratio=2.0,
         bound_type=BoundType.DOMINATES,
     )
-    np.testing.assert_allclose(dominates, np.array([0.15, 0.15, 0.2]))
+    np.testing.assert_allclose(dominates, np.array([0.1, 0.15, 0.2]))
+    assert dominates_below == pytest.approx(0.05)
+    assert dominates_above == 0.0
 
-    is_dominated = _add_single_zero_atom_cross_term(
+    is_dominated, is_dominated_below, is_dominated_above = _add_single_zero_atom_cross_term(
         pmf_conv=pmf.copy(),
         x_arr=x_arr,
         prob_arr=prob_arr,
@@ -137,3 +140,36 @@ def test_zero_atom_cross_term_vectorized_rounding():
         bound_type=BoundType.IS_DOMINATED,
     )
     np.testing.assert_allclose(is_dominated, np.array([0.1, 0.15, 0.2]))
+    assert is_dominated_below == pytest.approx(0.05)
+    assert is_dominated_above == 0.0
+
+
+def test_zero_atom_cross_term_returns_below_and_above_mass_separately():
+    """Out-of-grid zero cross-terms retain their direction."""
+    pmf, omitted_below, omitted_above = _add_single_zero_atom_cross_term(
+        pmf_conv=np.zeros(3),
+        x_arr=np.array([0.5, 1.0, 8.0]),
+        prob_arr=np.array([0.4, 0.0, 0.6]),
+        zero_prob=0.5,
+        x_out_0=1.0,
+        ratio=2.0,
+        bound_type=BoundType.DOMINATES,
+    )
+
+    np.testing.assert_array_equal(pmf, np.zeros(3))
+    assert omitted_below == pytest.approx(0.2)
+    assert omitted_above == pytest.approx(0.3)
+
+
+def test_zero_atom_cross_term_rejects_nonpositive_support():
+    """Geometric zero cross-terms require strictly positive finite support."""
+    with pytest.raises(ValueError, match="strictly positive"):
+        _add_single_zero_atom_cross_term(
+            pmf_conv=np.zeros(3),
+            x_arr=np.array([0.0, 1.0]),
+            prob_arr=np.array([0.5, 0.5]),
+            zero_prob=0.5,
+            x_out_0=1.0,
+            ratio=2.0,
+            bound_type=BoundType.IS_DOMINATED,
+        )

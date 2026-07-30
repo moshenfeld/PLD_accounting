@@ -7,7 +7,7 @@ import pytest
 
 from PLD_accounting.discrete_dist import DenseDiscreteDist
 from PLD_accounting.types import BoundType
-from PLD_accounting.utils import combine_distributions
+from PLD_accounting.utils import combine_best_of_two_plds, combine_distributions
 from tests.test_tolerances import TestTolerances as TOL
 
 
@@ -72,6 +72,43 @@ def test_combine_distributions_is_dominated_takes_exact_min_p_min():
     assert np.isclose(combined.p_min, 0.05)
     total = math.fsum([combined.p_min, *map(float, combined.prob_arr), combined.p_max])
     assert np.isclose(total, 1.0)
+
+
+@pytest.mark.parametrize("invalid_input", [0, 1])
+@pytest.mark.parametrize(
+    ("bound_type", "invalid_boundary", "message"),
+    [
+        (BoundType.DOMINATES, "p_min", "canonical dominating inputs"),
+        (BoundType.IS_DOMINATED, "p_max", "canonical dominated inputs"),
+    ],
+)
+def test_combine_best_rejects_noncanonical_boundary_on_either_input(
+    invalid_input: int,
+    bound_type: BoundType,
+    invalid_boundary: str,
+    message: str,
+) -> None:
+    """Grid-anchor selection cannot decide whether an invalid atom is folded."""
+    canonical_boundary = "p_max" if bound_type == BoundType.DOMINATES else "p_min"
+    boundaries = [
+        {"p_min": 0.0, "p_max": 0.0},
+        {"p_min": 0.0, "p_max": 0.0},
+    ]
+    for values in boundaries:
+        values[canonical_boundary] = 0.1
+    boundaries[invalid_input][canonical_boundary] = 0.0
+    boundaries[invalid_input][invalid_boundary] = 0.1
+    dists = [
+        _make_dist([0.0, 1.0], [0.45, 0.45], **boundaries[0]),
+        _make_dist([0.0, 0.5, 1.0], [0.3, 0.3, 0.3], **boundaries[1]),
+    ]
+
+    with pytest.raises(ValueError, match=message):
+        combine_best_of_two_plds(
+            dist_1=dists[0],
+            dist_2=dists[1],
+            bound_type=bound_type,
+        )
 
 
 def _make_dist(x_values, probs, p_max=0.0, p_min=0.0):

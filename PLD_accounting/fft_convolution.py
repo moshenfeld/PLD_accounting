@@ -10,7 +10,7 @@ import numpy as np
 from dp_accounting.pld.common import compute_self_convolve_bounds
 from scipy.fft import irfft, next_fast_len, rfft
 
-from PLD_accounting.discrete_dist import DenseDiscreteDist
+from PLD_accounting.discrete_dist import DenseDiscreteDist, Domain
 from PLD_accounting.distribution_utils import enforce_mass_conservation, stable_isclose
 from PLD_accounting.types import BoundType, SpacingType
 from PLD_accounting.utils import (
@@ -30,7 +30,7 @@ def fft_convolve(
     tail_truncation: float,
     bound_type: BoundType,
 ) -> DenseDiscreteDist:
-    """Convolve two linear-grid distributions via FFT."""
+    """Convolve two real-domain linear-grid distributions via FFT."""
     if not (
         isinstance(dist_1, DenseDiscreteDist) and dist_1.spacing_type == SpacingType.LINEAR
     ) or not (isinstance(dist_2, DenseDiscreteDist) and dist_2.spacing_type == SpacingType.LINEAR):
@@ -39,8 +39,16 @@ def fft_convolve(
             f"got dist_1={type(dist_1).__name__} (spacing={dist_1.spacing_type}), "
             f"dist_2={type(dist_2).__name__} (spacing={dist_2.spacing_type})"
         )
-    if dist_1.domain != dist_2.domain:
-        raise ValueError(f"Input domains must be identical, got {dist_1.domain} vs {dist_2.domain}")
+    if dist_1.domain != Domain.REALS or dist_2.domain != Domain.REALS:
+        raise ValueError(
+            "fft_convolve requires Domain.REALS inputs; "
+            f"got dist_1.domain={dist_1.domain}, dist_2.domain={dist_2.domain}"
+        )
+    if (dist_1.p_min > 0.0 and dist_2.p_max > 0.0) or (dist_1.p_max > 0.0 and dist_2.p_min > 0.0):
+        raise ValueError(
+            "FFT convolution is undefined when one real-domain input has -inf mass "
+            "and the other has +inf mass"
+        )
     if not np.any(dist_1.prob_arr) or not np.any(dist_2.prob_arr):
         raise ValueError("FFT convolution requires nonzero finite mass in both inputs")
     if not stable_isclose(value_1=dist_1.step, value_2=dist_2.step):
@@ -85,12 +93,12 @@ def fft_convolve(
     if math.fsum(map(float, conv_pmf)) <= 0.0:
         raise ValueError("FFT convolution produced zero finite mass")
 
+    # Account exactly for boundary-by-boundary convolution mass.
     expected_p_min, expected_p_max = convolve_boundary_masses(
-        dist_1.p_min, dist_1.p_max, dist_2.p_min, dist_2.p_max, dist_1.domain
+        dist_1.p_min, dist_1.p_max, dist_2.p_min, dist_2.p_max, Domain.REALS
     )
-    # Repair FFT/clipping drift directionally. A deficit goes to the enforced
-    # conservative boundary; an excess is removed from the opposite tail.
-    # Uniform scaling would move every loss atom and need not preserve a bound.
+    # Repair FFT/clipping drift directionally. Numerical deficits move to the
+    # conservative finite edge; excess is removed from the opposite tail.
     conv_pmf, p_min, p_max = enforce_mass_conservation(
         prob_arr=conv_pmf,
         expected_p_min=expected_p_min,
@@ -104,7 +112,7 @@ def fft_convolve(
         prob_arr=conv_pmf,
         p_min=p_min,
         p_max=p_max,
-        domain=dist_1.domain,
+        domain=Domain.REALS,
     ).truncate_edges(tail_truncation, bound_type)
 
 
@@ -116,7 +124,7 @@ def fft_self_convolve(
     bound_type: BoundType,
     use_direct: bool,
 ) -> DenseDiscreteDist:
-    """Self-convolve ``num_convolutions`` times via FFT, optionally by direct exponentiation."""
+    """Self-convolve a real-domain distribution via FFT."""
     if not (isinstance(dist, DenseDiscreteDist) and dist.spacing_type == SpacingType.LINEAR):
         spacing = getattr(dist, "spacing_type", "?")
         raise TypeError(
@@ -124,6 +132,8 @@ def fft_self_convolve(
             "expected DenseDiscreteDist with LINEAR spacing, "
             f"got {type(dist).__name__} with spacing {spacing}"
         )
+    if dist.domain != Domain.REALS:
+        raise ValueError(f"fft_self_convolve requires Domain.REALS input, got {dist.domain}")
 
     if use_direct:
         try:
@@ -165,6 +175,11 @@ def _fft_self_convolve_direct(
     safety limit, which the caller treats as a signal to fall back to binary
     self-convolution.
     """
+    if dist.domain != Domain.REALS:
+        raise ValueError(
+            f"_fft_self_convolve_direct requires Domain.REALS input, got {dist.domain}"
+        )
+
     # Budget split: the input tail_truncation is divided into three equal thirds.
     #   _calc_fft_window_size: Chernoff-based window determines the one-sided tail
     #          cutoff (right-tail for DOMINATES, folded-back mass bound for IS_DOMINATED).
@@ -202,6 +217,7 @@ def _fft_self_convolve_direct(
     # that window to index 0 so truncation logic can work in-place.
     rolled_conv = np.roll(raw_conv, -shift_left)
 
+    # Account exactly for boundary mass after repeated composition.
     conv_p_min, conv_p_max = self_convolve_boundary_masses(dist, num_convolutions=num_convolutions)
     if bound_type == BoundType.DOMINATES:
         # For an upper bound, any dropped left-tail mass is pushed to +inf.
@@ -231,6 +247,7 @@ def _fft_self_convolve_direct(
 
     x_min = dist.x_0 * num_convolutions + shift_left * dist.step
     pmf_conv = rolled_conv[:window_size]
+    # Repair only numerical drift after retained and discarded mass is explicit.
     pmf_conv, p_min_final, p_max_final = enforce_mass_conservation(
         prob_arr=pmf_conv,
         expected_p_min=conv_p_min,

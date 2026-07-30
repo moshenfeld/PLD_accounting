@@ -78,7 +78,7 @@ def geometric_convolve(
     if target_anchor is not None and target_anchor <= 0:
         raise ValueError(f"target_anchor must be positive, got {target_anchor}")
 
-    # Core Numeric Convolution
+    # Convolve all finite-by-finite mass.
     output_origin, pmf_conv = _compute_geometric_convolution(
         origin_1=dist_1.x_0,
         pmf_1=dist_1.prob_arr,
@@ -89,8 +89,8 @@ def geometric_convolve(
         target_anchor=target_anchor,
     )
 
-    # Add cross-terms from the 0 atom
-    pmf_conv = _add_single_zero_atom_cross_term(
+    # Add each 0-by-finite cross-term and retain out-of-grid mass by side.
+    pmf_conv, omitted_below_1, omitted_above_1 = _add_single_zero_atom_cross_term(
         pmf_conv=pmf_conv,
         x_arr=dist_2.x_array,
         prob_arr=dist_2.prob_arr,
@@ -99,7 +99,7 @@ def geometric_convolve(
         ratio=ratio,
         bound_type=bound_type,
     )
-    pmf_conv = _add_single_zero_atom_cross_term(
+    pmf_conv, omitted_below_2, omitted_above_2 = _add_single_zero_atom_cross_term(
         pmf_conv=pmf_conv,
         x_arr=dist_1.x_array,
         prob_arr=dist_1.prob_arr,
@@ -109,10 +109,24 @@ def geometric_convolve(
         bound_type=bound_type,
     )
 
+    # Account exactly for boundary-by-boundary convolution mass.
     expected_p_min, expected_p_max = convolve_boundary_masses(
         dist_1.p_min, dist_1.p_max, dist_2.p_min, dist_2.p_max, dist_1.domain
     )
+    omitted_below = omitted_below_1 + omitted_below_2
+    omitted_above = omitted_above_1 + omitted_above_2
+    if bound_type == BoundType.DOMINATES:
+        # Round lower underflow up to the first finite cell; upper overflow
+        # becomes upper-boundary mass.
+        pmf_conv[0] += omitted_below
+        expected_p_max += omitted_above
+    else:
+        # Lower underflow becomes lower-boundary mass; round upper overflow
+        # down to the last finite cell.
+        expected_p_min += omitted_below
+        pmf_conv[-1] += omitted_above
 
+    # Repair only numerical drift after all omitted mass is explicit.
     pmf_conv, p_min, p_max = enforce_mass_conservation(
         prob_arr=pmf_conv,
         expected_p_min=expected_p_min,
@@ -402,26 +416,28 @@ def _add_single_zero_atom_cross_term(
     x_out_0: float,
     ratio: float,
     bound_type: BoundType,
-) -> NDArray[np.float64]:
-    """Map one family of 0+finite cross-terms onto the fixed output grid."""
+) -> tuple[NDArray[np.float64], float, float]:
+    """Map 0+finite cross-terms and return omitted mass below and above the grid."""
+    if np.any(x_arr <= 0.0):
+        raise ValueError("0+finite cross-term support values must be strictly positive")
     if zero_prob == 0.0:
-        return pmf_conv
+        return pmf_conv, 0.0, 0.0
 
-    x_vals = np.asarray(x_arr, dtype=np.float64)
-    masses = np.asarray(prob_arr, dtype=np.float64) * float(zero_prob)
-    valid = (masses > 0.0) & (x_vals > 0.0)
-    if not np.any(valid):
-        return pmf_conv
-
-    frac_k = np.log(x_vals[valid] / float(x_out_0)) / float(math.log(ratio))
+    # Each cross-term has probability zero_prob times its finite-atom mass.
+    masses = prob_arr * zero_prob
+    frac_k = np.log(x_arr / x_out_0) / math.log(ratio)
     if bound_type == BoundType.DOMINATES:
         k = np.ceil(frac_k - _BIN_SNAP_TOL).astype(np.int64)
-        k = np.maximum(k, 0)
     elif bound_type == BoundType.IS_DOMINATED:
         k = np.floor(frac_k + _BIN_SNAP_TOL).astype(np.int64)
     else:
         raise ValueError(f"Unknown BoundType: {bound_type}")
 
-    in_range = (0 <= k) & (k < pmf_conv.size)
-    np.add.at(pmf_conv, k[in_range], masses[valid][in_range])
-    return pmf_conv
+    below = k < 0
+    above = k >= pmf_conv.size
+    in_range = ~(below | above)
+    # Accumulate representable cross-terms into their rounded finite bins.
+    np.add.at(pmf_conv, k[in_range], masses[in_range])
+    omitted_below = math.fsum(map(float, masses[below]))
+    omitted_above = math.fsum(map(float, masses[above]))
+    return pmf_conv, omitted_below, omitted_above

@@ -79,7 +79,7 @@ This applies to both `Direction.ADD` and `Direction.REMOVE`. Use
 `ConvolutionMethod.GEOM` whenever you need a lower bound.
 
 Dominating fixed-gap real-loss construction always uses connect-the-dots
-(CtD). Lower bounds, FFT positive/exp-space factors, and geometric-grid
+(CtD). Lower bounds, FFT exp-space factors, and geometric-grid
 regridding use the internal stochastic-domination engine required by those
 representations. This routing is fixed by the operation; there is no public
 discretization-method option.

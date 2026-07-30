@@ -76,7 +76,7 @@ Boundary semantics depend on `Domain`:
 
 CtD is the fixed engine for dominating fixed-gap real-loss construction. It
 reconstructs a PLD from its hockey-stick profile; there is no public method
-selector. Lower bounds, FFT positive/exp-space factors, and geometric-grid
+selector. Lower bounds, FFT exp-space factors, and geometric-grid
 regridding use separate stochastic-domination functions because CtD is not
 defined for those representations. A CtD target grid must be linear and
 fixed-gap. A discrete source may be dense or sparse, but must use
@@ -270,9 +270,16 @@ Key functions:
     and combines same-direction results at the very end via
     `combine_best_of_two_plds(...)` (in `utils.py`).
 - Internal builders:
-  - `_gaussian_allocation_fft_remove(...)`
+  - `_gaussian_allocation_fft_remove(...)`: the final `log(sum)` is increasing,
+    so FFT's final dominating bound uses dominating bounds for both the base
+    and exponentiated negative-dual factors. Their lower tails are folded into
+    finite mass (`p_min = 0`) before REALS-domain pairwise convolution.
   - `_gaussian_remove_geom_loss_factors(...)`
-  - `_gaussian_allocation_fft_add(...)`
+  - `_gaussian_allocation_fft_add(...)`: the final `-log(sum)` reverses order,
+    so FFT's final dominating bound uses a dominated POSITIVES-domain
+    exp-space sum. Its zero atom is temporarily embedded at a nonpositive point
+    on a REALS lattice so FFT captures every cross-term; after convolution,
+    all nonpositive mass is folded back to the POSITIVES zero boundary.
   - `_gaussian_add_geom_loss_factor(...)`
 
 ## Adaptive Refinement

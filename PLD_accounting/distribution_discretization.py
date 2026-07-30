@@ -198,12 +198,11 @@ def rediscretize_dist_ctd(
     loss_discretization: float,
 ) -> PLDRealization:
     """Rediscretize a real-loss PLD onto a fixed-gap grid with CtD."""
-    working_dist = fold_absorbable_boundary_atom(
-        dist=dist,
-        spacing_type=SpacingType.LINEAR,
-        bound_type=BoundType.DOMINATES,
-    )
-    trunc_dist = working_dist.truncate_edges(
+    # Validate before truncation so a small, invalid -inf atom cannot be
+    # consumed by the tail budget and thereby hidden from CtD validation.
+    _validate_ctd_source(dist)
+    # Account for truncated tails according to upper-bound semantics.
+    trunc_dist = dist.truncate_edges(
         tail_truncation=tail_truncation / 2,
         bound_type=BoundType.DOMINATES,
     )
@@ -241,27 +240,42 @@ def rediscretize_dist_stoch_dom(
     Algorithm 6 (`disc-dist`), in Appendix C
     of https://arxiv.org/abs/2602.17284.
     """
-    # A lower-bound discretization is not an exact PLD realization.  Convert
-    # explicitly before any mass-moving operation so every subsequent rebuild
-    # preserves the correct (weaker) representation type.
-    if isinstance(dist, PLDRealization) and bound_type == BoundType.IS_DOMINATED:
-        dist = DenseDiscreteDist(
-            x_0=dist.x_0,
-            step=dist.step,
-            prob_arr=dist.prob_arr,
-            p_min=dist.p_min,
-            p_max=dist.p_max,
-            spacing_type=dist.spacing_type,
-            domain=dist.domain,
-        )
+    # On the real line, absorb the boundary that can be moved conservatively
+    # onto the finite grid for the requested stochastic bound.
+    working_dist = dist
+    if bound_type == BoundType.DOMINATES:
+        if dist.domain == Domain.REALS and dist.p_min > 0.0:
+            prob_arr = dist.prob_arr.copy()
+            prob_arr[0] += dist.p_min
+            working_dist = dist.with_probabilities(
+                prob_arr=prob_arr,
+                p_min=0.0,
+                p_max=dist.p_max,
+            )
+    elif bound_type == BoundType.IS_DOMINATED:
+        # A lower-bound discretization is no longer an exact realization.
+        if isinstance(dist, PLDRealization):
+            working_dist = DenseDiscreteDist(
+                x_0=dist.x_0,
+                step=dist.step,
+                prob_arr=dist.prob_arr,
+                p_min=dist.p_min,
+                p_max=dist.p_max,
+                spacing_type=dist.spacing_type,
+                domain=dist.domain,
+            )
+        if working_dist.domain == Domain.REALS and working_dist.p_max > 0.0:
+            prob_arr = working_dist.prob_arr.copy()
+            prob_arr[-1] += working_dist.p_max
+            working_dist = working_dist.with_probabilities(
+                prob_arr=prob_arr,
+                p_min=working_dist.p_min,
+                p_max=0.0,
+            )
+    else:
+        raise ValueError(f"Unknown BoundType: {bound_type}")
 
-    working_dist = fold_absorbable_boundary_atom(
-        dist=dist,
-        spacing_type=spacing_type,
-        bound_type=bound_type,
-    )
-
-    # Quantile-truncation
+    # Move truncated tail mass according to the requested bound.
     trunc_dist = working_dist.truncate_edges(
         tail_truncation=tail_truncation / 2, bound_type=bound_type
     )
@@ -278,39 +292,7 @@ def rediscretize_dist_stoch_dom(
     return project_dist_onto_grid_stoch_dom(
         dist=trunc_dist,
         grid=grid_out,
-        expected_p_min=working_dist.p_min,
-        expected_p_max=working_dist.p_max,
         bound_type=bound_type,
-    )
-
-
-def fold_absorbable_boundary_atom(
-    *,
-    dist: DiscreteDistBase,
-    spacing_type: SpacingType,
-    bound_type: BoundType,
-) -> DiscreteDistBase:
-    """Fold the boundary atom that domination-aware rounding can absorb.
-
-    Supports rediscretizing a dominating distribution into a dominated one and
-    vice versa: IS_DOMINATED rounds mass down, so the ``+inf`` atom folds into
-    the top bin; DOMINATES rounds mass up, so the ``-inf`` atom folds into the
-    bottom bin (linear output only -- geometric output keeps ``p_min`` as the
-    mass at 0).  Returns a copy; the input is unchanged.
-    """
-    prob_arr = dist.prob_arr.copy()
-    p_min = dist.p_min
-    p_max = dist.p_max
-    if bound_type == BoundType.IS_DOMINATED and p_max > 0.0:
-        prob_arr[-1] += p_max
-        p_max = 0.0
-    elif bound_type == BoundType.DOMINATES and spacing_type == SpacingType.LINEAR and p_min > 0.0:
-        prob_arr[0] += p_min
-        p_min = 0.0
-    return dist.with_probabilities(
-        prob_arr=prob_arr,
-        p_min=p_min,
-        p_max=p_max,
     )
 
 
@@ -344,12 +326,18 @@ def project_dist_onto_grid_stoch_dom(
     *,
     dist: DiscreteDistBase,
     grid: GridSpec,
-    expected_p_min: float,
-    expected_p_max: float,
     bound_type: BoundType,
 ) -> DenseDiscreteDist:
-    """Project a distribution onto ``grid`` with directional rounding."""
+    """Project ``dist`` onto ``grid`` while preserving its boundary atoms.
+
+    Finite atoms are rounded in the requested direction. Directional overflow
+    that cannot be represented on ``grid`` is added to the corresponding
+    conservative boundary.
+    """
     x_array_out = grid.materialize()
+    expected_p_min = dist.p_min
+    expected_p_max = dist.p_max
+    # Round in-range atoms conservatively; the kernel omits directional overflow.
     prob_arr_out = rediscretize_prob(
         x_array=dist.x_array,
         prob_arr=dist.prob_arr,
@@ -357,6 +345,16 @@ def project_dist_onto_grid_stoch_dom(
         dominates=(bound_type == BoundType.DOMINATES),
     )
 
+    if bound_type == BoundType.DOMINATES:
+        # Right overflow becomes semantic upper-boundary mass.
+        omitted = dist.prob_arr[dist.x_array > x_array_out[-1]]
+        expected_p_max += math.fsum(map(float, omitted))
+    else:
+        # Left underflow becomes semantic lower-boundary mass.
+        omitted = dist.prob_arr[dist.x_array < x_array_out[0]]
+        expected_p_min += math.fsum(map(float, omitted))
+
+    # Repair only numerical mass drift after semantic overflow is accounted for.
     prob_arr_out, p_min, p_max = enforce_mass_conservation(
         prob_arr=prob_arr_out,
         expected_p_min=expected_p_min,
@@ -481,7 +479,7 @@ def _numba_rediscretize_prob(
                 j += 1
 
             if j >= n_out:
-                # overflow to the right: discard mass (goes to p_max via enforce_mass_conservation)
+                # Overflow is omitted here and accounted explicitly by the caller.
                 continue
             # include values below x_array_out[0] in the first bin (ceil behavior)
             y = mass - compensations[j]
@@ -504,7 +502,7 @@ def _numba_rediscretize_prob(
 
             idx = j - 1
             if idx < 0:
-                # underflow to the left: discard mass (goes to p_min via enforce_mass_conservation)
+                # Underflow is omitted here and accounted explicitly by the caller.
                 continue
             # include values above x_array_out[-1] in the last bin (floor behavior)
             y = mass - compensations[idx]
@@ -627,7 +625,9 @@ def _pld_from_privacy_profile_ctd(
     # space (numerator scale) rather than on the amplified probabilities.
     if np.min(prob) < -PMF_MASS_TOL / denominator:
         raise ValueError("privacy profile is not convex enough for fixed-gap CtD inversion")
+    # Remove negative inversion noise before restoring total numerical mass.
     prob = np.maximum(prob, 0.0)
+    # delta[-1] is the CtD profile's semantic +inf atom.
     prob, p_min, p_max = enforce_mass_conservation(
         prob_arr=prob,
         expected_p_min=0.0,

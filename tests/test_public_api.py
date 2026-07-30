@@ -162,6 +162,17 @@ class TestPLDRealizationType:
         with pytest.raises(ValueError):
             PLDRealization(x_0=0.1, step=0.1, prob_arr=np.array([0.5]), p_min=0.5)
 
+    def test_rejects_sub_tolerance_nonzero_p_min(self):
+        """The semantic p_min invariant is exact, not a floating-point estimate."""
+        p_min = np.finfo(float).eps
+        with pytest.raises(ValueError, match="requires p_min = 0"):
+            PLDRealization(
+                x_0=0.1,
+                step=0.1,
+                prob_arr=np.array([1.0 - p_min]),
+                p_min=p_min,
+            )
+
     def test_deepcopy_is_independent(self):
         """``copy.deepcopy`` must detach arrays and preserve immutability."""
         r = gaussian_distribution(scale=1.0)

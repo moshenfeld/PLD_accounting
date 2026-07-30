@@ -38,7 +38,9 @@ def enforce_mass_conservation(
     - ``DOMINATES`` trims from the left over ``[p_min, *prob_arr]``.
     - ``IS_DOMINATED`` trims from the right over ``[*prob_arr, p_max]``.
 
-    Any remaining slack is assigned to the enforced boundary.
+    Callers must include genuine omitted support in ``expected_p_min`` or
+    ``expected_p_max``. Any remaining numerical slack is assigned to the
+    directionally conservative finite edge.
     """
     prob_arr = np.asarray(prob_arr, dtype=np.float64).copy()
     validate_discrete_pmf_and_boundaries(
@@ -52,8 +54,10 @@ def enforce_mass_conservation(
         raise ValueError("Cannot enforce mass conservation with zero total mass")
 
     if bound_type == BoundType.DOMINATES:
-        if expected_p_max > 1.0:
-            raise ValueError("Expected p_max cannot exceed 1")
+        if expected_p_max > 1.0 + PMF_MASS_TOL:
+            raise ValueError("Expected p_max cannot exceed 1 beyond numerical tolerance")
+        expected_p_max = min(expected_p_max, 1.0)
+        # Keep semantic upper-boundary mass fixed; the array holds all other mass.
         extended = np.concatenate(([expected_p_min], prob_arr))
         target_mass = 1.0 - expected_p_max
         current_mass = math.fsum(map(float, extended))
@@ -64,17 +68,23 @@ def enforce_mass_conservation(
                 # scaling avoids creating a directional artifact at one bin.
                 extended = extended * (target_mass / current_mass)
             else:
+                # Remove material excess from the low-loss side.
                 extended = _zero_mass(values=extended, mass=excess, from_left=True, exact=True)
         current_mass = math.fsum(map(float, extended))
+        deficit = max(0.0, target_mass - current_mass)
+        # Put numerical deficit in the largest finite-loss bin.
+        extended[-1] += deficit
         return (
             extended[1:].copy(),
             float(extended[0]),
-            expected_p_max + max(0.0, target_mass - current_mass),
+            expected_p_max,
         )
 
     if bound_type == BoundType.IS_DOMINATED:
-        if expected_p_min > 1.0:
-            raise ValueError("Expected p_min cannot exceed 1")
+        if expected_p_min > 1.0 + PMF_MASS_TOL:
+            raise ValueError("Expected p_min cannot exceed 1 beyond numerical tolerance")
+        expected_p_min = min(expected_p_min, 1.0)
+        # Keep semantic lower-boundary mass fixed; the array holds all other mass.
         extended = np.concatenate((prob_arr, [expected_p_max]))
         target_mass = 1.0 - expected_p_min
         current_mass = math.fsum(map(float, extended))
@@ -85,11 +95,15 @@ def enforce_mass_conservation(
                 # scaling avoids creating a directional artifact at one bin.
                 extended = extended * (target_mass / current_mass)
             else:
+                # Remove material excess from the high-loss side.
                 extended = _zero_mass(values=extended, mass=excess, from_left=False, exact=True)
         current_mass = math.fsum(map(float, extended))
+        deficit = max(0.0, target_mass - current_mass)
+        # Put numerical deficit in the smallest finite-loss bin.
+        extended[0] += deficit
         return (
             extended[:-1].copy(),
-            expected_p_min + max(0.0, target_mass - current_mass),
+            expected_p_min,
             float(extended[-1]),
         )
 
