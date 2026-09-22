@@ -10,17 +10,25 @@ import numpy as np
 from dp_accounting.pld.common import compute_self_convolve_bounds
 from scipy.fft import irfft, next_fast_len, rfft
 
-from PLD_accounting.discrete_dist import DenseDiscreteDist, Domain
-from PLD_accounting.distribution_utils import enforce_mass_conservation, stable_isclose
-from PLD_accounting.types import BoundType, SpacingType
+from PLD_accounting.discrete_dist import (
+    DenseDiscreteDist,
+    Domain,
+    require_linear_reals_dist,
+)
+from PLD_accounting.distribution_utils import enforce_mass_conservation, trim_mass_from_edge
+from PLD_accounting.types import BoundType, require_bound_type
 from PLD_accounting.utils import (
     binary_self_convolve,
     convolve_boundary_masses,
     self_convolve_boundary_masses,
 )
+from PLD_accounting.validation import require_nonnegative_real, require_positive_int
 
 # Maximum bytes for a single FFT allocation (default 8 GB, override via MAX_FFT_BYTES env var)
 MAX_FFT_BYTES = int(os.environ.get("MAX_FFT_BYTES", 8 * 1024**3))
+# Policy multipliers on the size-scaled FFT mass residual.
+_FFT_MASS_DRIFT_FACTOR = 16.0
+_FFT_MASS_REPAIR_FACTOR = 64.0
 
 
 def fft_convolve(
@@ -30,37 +38,32 @@ def fft_convolve(
     tail_truncation: float,
     bound_type: BoundType,
 ) -> DenseDiscreteDist:
-    """Convolve two real-domain linear-grid distributions via FFT."""
-    if not (
-        isinstance(dist_1, DenseDiscreteDist) and dist_1.spacing_type == SpacingType.LINEAR
-    ) or not (isinstance(dist_2, DenseDiscreteDist) and dist_2.spacing_type == SpacingType.LINEAR):
-        raise TypeError(
-            "fft_convolve requires linear DenseDiscreteDist inputs; "
-            f"got dist_1={type(dist_1).__name__} (spacing={dist_1.spacing_type}), "
-            f"dist_2={type(dist_2).__name__} (spacing={dist_2.spacing_type})"
-        )
-    if dist_1.domain != Domain.REALS or dist_2.domain != Domain.REALS:
-        raise ValueError(
-            "fft_convolve requires Domain.REALS inputs; "
-            f"got dist_1.domain={dist_1.domain}, dist_2.domain={dist_2.domain}"
-        )
+    """Convolve two real-domain linear-grid distributions via FFT.
+
+    Inputs must share the exact structural step; their output grid is the
+    lattice sum. Opposing infinite atoms are rejected because ``-inf + inf``
+    has no defined boundary placement.
+    """
+    require_linear_reals_dist(dist=dist_1, name="dist_1")
+    require_linear_reals_dist(dist=dist_2, name="dist_2")
+    require_nonnegative_real(value=tail_truncation, name="tail_truncation")
+    require_bound_type(value=bound_type)
     if (dist_1.p_min > 0.0 and dist_2.p_max > 0.0) or (dist_1.p_max > 0.0 and dist_2.p_min > 0.0):
         raise ValueError(
             "FFT convolution is undefined when one real-domain input has -inf mass "
             "and the other has +inf mass"
         )
-    if not np.any(dist_1.prob_arr) or not np.any(dist_2.prob_arr):
-        raise ValueError("FFT convolution requires nonzero finite mass in both inputs")
-    if not stable_isclose(value_1=dist_1.step, value_2=dist_2.step):
+    _require_positive_finite_support(dist=dist_1, context="FFT convolution")
+    _require_positive_finite_support(dist=dist_2, context="FFT convolution")
+    if dist_1.step != dist_2.step:
         raise ValueError(f"Grid spacing must match: w1={dist_1.step:.12g} vs w2={dist_2.step:.12g}")
 
-    width = dist_1.step
-    conv_x_min = dist_1.x_0 + dist_2.x_0
+    conv_grid = dist_1.grid.convolve(dist_2.grid)
 
     # --- Manual rfft/irfft with in-place multiply (saves one complex128 buffer) ---
     conv_full_len = dist_1.prob_arr.size + dist_2.prob_arr.size - 1
     fft_size = next_fast_len(conv_full_len)
-    _check_fft_memory(fft_size, label="fft_convolve")
+    _check_fft_memory(fft_size=fft_size, label="fft_convolve")
 
     # Capture reachable-support bounds before FFT buffers are allocated.
     nz1 = np.nonzero(dist_1.prob_arr)[0]
@@ -95,25 +98,30 @@ def fft_convolve(
 
     # Account exactly for boundary-by-boundary convolution mass.
     expected_p_min, expected_p_max = convolve_boundary_masses(
-        dist_1.p_min, dist_1.p_max, dist_2.p_min, dist_2.p_max, Domain.REALS
+        p_min_1=dist_1.p_min,
+        p_max_1=dist_1.p_max,
+        p_min_2=dist_2.p_min,
+        p_max_2=dist_2.p_max,
+        domain=Domain.REALS,
     )
-    # Repair FFT/clipping drift directionally. Numerical deficits move to the
-    # conservative finite edge; excess is removed from the opposite tail.
+    # Repair FFT/clipping drift; the uncompensated transform needs the FFT-sized bands.
+    drift_tol, repair_tol = _fft_mass_tolerances(num_bins=fft_size, num_convolutions=1)
     conv_pmf, p_min, p_max = enforce_mass_conservation(
         prob_arr=conv_pmf,
         expected_p_min=expected_p_min,
         expected_p_max=expected_p_max,
         bound_type=bound_type,
+        drift_tol=drift_tol,
+        repair_tol=repair_tol,
     )
 
     return DenseDiscreteDist(
-        x_0=conv_x_min,
-        step=width,
+        grid=conv_grid,
         prob_arr=conv_pmf,
         p_min=p_min,
         p_max=p_max,
         domain=Domain.REALS,
-    ).truncate_edges(tail_truncation, bound_type)
+    ).truncate_edges(tail_truncation=tail_truncation, bound_type=bound_type)
 
 
 def fft_self_convolve(
@@ -124,16 +132,17 @@ def fft_self_convolve(
     bound_type: BoundType,
     use_direct: bool,
 ) -> DenseDiscreteDist:
-    """Self-convolve a real-domain distribution via FFT."""
-    if not (isinstance(dist, DenseDiscreteDist) and dist.spacing_type == SpacingType.LINEAR):
-        spacing = getattr(dist, "spacing_type", "?")
-        raise TypeError(
-            "fft_self_convolve requires DenseDiscreteDist input: "
-            "expected DenseDiscreteDist with LINEAR spacing, "
-            f"got {type(dist).__name__} with spacing {spacing}"
-        )
-    if dist.domain != Domain.REALS:
-        raise ValueError(f"fft_self_convolve requires Domain.REALS input, got {dist.domain}")
+    """Self-convolve a real-domain distribution via FFT.
+
+    ``use_direct`` first tries one powered transform with a Chernoff-sized
+    window and falls back to binary composition if that transform exceeds the
+    configured memory limit.
+    """
+    require_linear_reals_dist(dist=dist, name="dist")
+    require_positive_int(value=num_convolutions, name="num_convolutions")
+    require_nonnegative_real(value=tail_truncation, name="tail_truncation")
+    require_bound_type(value=bound_type)
+    _require_positive_finite_support(dist=dist, context="FFT self-convolution")
 
     if use_direct:
         try:
@@ -160,6 +169,27 @@ def fft_self_convolve(
     )
 
 
+def _require_positive_finite_support(*, dist: DenseDiscreteDist, context: str) -> None:
+    """Reject a boundary-only input before FFT work or finite-mass normalization."""
+    if math.fsum(map(float, dist.prob_arr)) <= 0.0:
+        raise ValueError(
+            f"{context} requires strictly positive finite-support mass; "
+            "boundary-only inputs are not supported"
+        )
+
+
+def _fft_mass_tolerances(
+    *,
+    num_bins: int,
+    num_convolutions: int,
+) -> tuple[float, float]:
+    """Return ``(drift_tol, repair_tol)`` for an FFT-produced PMF."""
+    require_positive_int(value=[num_bins, num_convolutions], name=["num_bins", "num_convolutions"])
+    # Transform error grows logarithmically with size and linearly with the power.
+    scale = float(num_convolutions) * math.log2(max(num_bins, 2)) * float(np.finfo(float).eps)
+    return _FFT_MASS_DRIFT_FACTOR * scale, _FFT_MASS_REPAIR_FACTOR * scale
+
+
 def _fft_self_convolve_direct(
     *,
     dist: DenseDiscreteDist,
@@ -175,22 +205,22 @@ def _fft_self_convolve_direct(
     safety limit, which the caller treats as a signal to fall back to binary
     self-convolution.
     """
-    if dist.domain != Domain.REALS:
-        raise ValueError(
-            f"_fft_self_convolve_direct requires Domain.REALS input, got {dist.domain}"
-        )
+    require_linear_reals_dist(dist=dist, name="dist")
 
-    # Budget split: the input tail_truncation is divided into three equal thirds.
+    # Budget split: the input tail_truncation is divided into four equal quarters.
     #   _calc_fft_window_size: Chernoff-based window determines the one-sided tail
     #          cutoff (right-tail for DOMINATES, folded-back mass bound for IS_DOMINATED).
+    #   circular alias reserve: spent only when the true support outruns the FFT period,
+    #          where the same window allowance bounds a second, indistinguishable amount
+    #          of mass that may have folded into a wrong bin (see _declared_alias_shift).
     #   explicit opposite-side trim: left_tail_ind for DOMINATES (zeroes left bins,
     #          pushes mass to p_max) / right_tail_ind for IS_DOMINATED (zeroes right bins,
     #          pushes mass to p_min).
     #   final truncate_edges: trims actual near-zero edge bins the Chernoff window
     #          conservatively included on the remaining untrimmed side, reducing output
     #          bin count without sacrificing accuracy.
-    # Total: 3 * (tail_truncation / 3) = tail_truncation
-    tail_truncation /= 3
+    # Total: 4 * (tail_truncation / 4) = tail_truncation
+    tail_truncation /= 4
 
     finite_mass = math.fsum(map(float, dist.prob_arr))
     # The Chernoff window calculation expects a normalized finite PMF, so the
@@ -206,7 +236,8 @@ def _fft_self_convolve_direct(
 
     fft_size = next_fast_len(max(window_size, dist.prob_arr.size))
     _check_fft_memory(
-        fft_size, label=f"_fft_self_convolve_direct(num_convolutions={num_convolutions})"
+        fft_size=fft_size,
+        label=f"_fft_self_convolve_direct(num_convolutions={num_convolutions})",
     )
     fft_data = rfft(dist.prob_arr, n=fft_size)
     fft_data **= num_convolutions  # in-place power: avoids allocating a second complex buffer
@@ -217,8 +248,18 @@ def _fft_self_convolve_direct(
     # that window to index 0 so truncation logic can work in-place.
     rolled_conv = np.roll(raw_conv, -shift_left)
 
+    alias_shift = _declared_alias_shift(
+        input_size=dist.prob_arr.size,
+        num_convolutions=num_convolutions,
+        fft_size=fft_size,
+        finite_mass=finite_mass,
+        window_tail_truncation=tail_truncation_rescaled,
+    )
+
     # Account exactly for boundary mass after repeated composition.
-    conv_p_min, conv_p_max = self_convolve_boundary_masses(dist, num_convolutions=num_convolutions)
+    conv_p_min, conv_p_max = self_convolve_boundary_masses(
+        dist=dist, num_convolutions=num_convolutions
+    )
     if bound_type == BoundType.DOMINATES:
         # For an upper bound, any dropped left-tail mass is pushed to +inf.
         cumsum = np.cumsum(rolled_conv)
@@ -226,7 +267,7 @@ def _fft_self_convolve_direct(
         shifted_mass = math.fsum(map(float, rolled_conv[:left_tail_ind]))
         rolled_conv[:left_tail_ind] = 0.0
         right_tail_mass = math.fsum(map(float, rolled_conv[window_size:]))
-        conv_p_max += shifted_mass + right_tail_mass
+        conv_p_max += shifted_mass + right_tail_mass + alias_shift
     elif bound_type == BoundType.IS_DOMINATED:
         # For a lower bound, dropped right-tail mass moves to -inf, while any
         # overflow beyond the retained FFT window is folded onto the last kept
@@ -238,31 +279,75 @@ def _fft_self_convolve_direct(
         after_right_tail = right_tail_ind + 1
         shifted_mass = math.fsum(map(float, rolled_conv[after_right_tail:]))
         rolled_conv[after_right_tail:] = 0.0
-        conv_p_min += shifted_mass
+        conv_p_min += shifted_mass + alias_shift
 
         right_tail_mass = math.fsum(map(float, rolled_conv[window_size:]))
         rolled_conv[min(window_size, right_tail_ind) - 1] += right_tail_mass
     else:
         raise ValueError(f"Unknown BoundType: {bound_type}")
 
-    x_min = dist.x_0 * num_convolutions + shift_left * dist.step
+    # The retained window is an integer slice of the exact m-fold self-sum lattice.
+    out_grid = dist.grid.self_convolve(num_convolutions).slice(start=shift_left, n=window_size)
     pmf_conv = rolled_conv[:window_size]
-    # Repair only numerical drift after retained and discarded mass is explicit.
+    # ``alias_shift`` was banked at the conservative boundary above. Fund it here by
+    # taking the same mass off the giveable edge, so the declared allocation is a move
+    # and total mass is never off one. Those bins contribute least to the divergence,
+    # whereas spreading the cost over every bin would take most of it straight back out
+    # of the boundary. Mass conservation below then sees only genuine transform drift.
+    if alias_shift > 0.0:
+        pmf_conv = trim_mass_from_edge(
+            prob_arr=pmf_conv,
+            mass=alias_shift,
+            from_left=bound_type == BoundType.DOMINATES,
+        )
+    # Repair only numerical drift after retained and discarded mass is explicit. The
+    # in-place power above scales the residual with num_convolutions as well as n.
+    drift_tol, repair_tol = _fft_mass_tolerances(
+        num_bins=fft_size, num_convolutions=num_convolutions
+    )
     pmf_conv, p_min_final, p_max_final = enforce_mass_conservation(
         prob_arr=pmf_conv,
         expected_p_min=conv_p_min,
         expected_p_max=conv_p_max,
         bound_type=bound_type,
+        drift_tol=drift_tol,
+        repair_tol=repair_tol,
     )
 
     return DenseDiscreteDist(
-        x_0=x_min,
-        step=dist.step,
+        grid=out_grid,
         prob_arr=pmf_conv,
         p_min=p_min_final,
         p_max=p_max_final,
         domain=dist.domain,
-    ).truncate_edges(tail_truncation, bound_type)
+    ).truncate_edges(tail_truncation=tail_truncation, bound_type=bound_type)
+
+
+def _declared_alias_shift(
+    *,
+    input_size: int,
+    num_convolutions: int,
+    fft_size: int,
+    finite_mass: float,
+    window_tail_truncation: float,
+) -> float:
+    """Return the probability that circular aliasing may have placed in a wrong bin.
+
+    The transform has period ``fft_size``. When the exact ``num_convolutions``-fold
+    support is longer than that, output mass at index ``j >= fft_size`` folds onto
+    ``j mod fft_size``, and no sum over the circular array can say how much did: the fold
+    is mass-preserving. Two window indices cannot collide with each other, so everything
+    misplaced comes from outside the retained window, and the window was selected to leave
+    at most ``window_tail_truncation`` of the *normalized* m-fold mass out there. Scaling
+    by ``finite_mass ** num_convolutions`` restores that allowance to the output's own
+    mass units, which is what the caller's ledger is denominated in.
+
+    Returns 0.0 when the FFT period covers the true support, where the convolution is
+    exact and no allowance is owed.
+    """
+    if num_convolutions * (input_size - 1) + 1 <= fft_size:
+        return 0.0
+    return window_tail_truncation * finite_mass**num_convolutions
 
 
 def _calc_fft_window_size(
@@ -289,12 +374,9 @@ def _calc_fft_window_size(
     return int(lower_idx), int(window_size)
 
 
-def _check_fft_memory(fft_size: int, label: str = "FFT") -> None:
-    """Raise MemoryError if an FFT of this size would exceed the safety limit.
-
-    rfft produces complex128 output (~16 bytes per element) and the input is
-    float64 (~8 bytes), so peak usage is roughly 24 * fft_size bytes.
-    """
+def _check_fft_memory(*, fft_size: int, label: str) -> None:
+    """Raise ``MemoryError`` when an FFT exceeds the configured memory limit."""
+    # One complex128 output plus one float64 input is about 24 bytes per point.
     estimated_bytes = 24 * fft_size
     if estimated_bytes > MAX_FFT_BYTES:
         raise MemoryError(

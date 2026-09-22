@@ -2,12 +2,15 @@
 
 ## Basic suite (public / default `pytest`)
 
-The **basic** suite is **unit tests only** under `tests/unit/` inside the **`public/`** tree. That folder is mirrored to the public GitHub repository root.
+The default collection is all of `tests/` (`public/pytest.ini` sets
+`testpaths = tests`), including `tests/unit/`, `tests/test_public_api.py`, and
+`tests/test_tolerances.py`. That folder is mirrored to the public GitHub
+repository root.
 
 From the **private monorepo** root (adds `public/` to `PYTHONPATH`):
 
 ```bash
-pytest
+pytest public/tests
 ```
 
 From **`public/`** alone (same layout as after `git clone` of the public repo):
@@ -28,7 +31,7 @@ bash tests_extended/run_suites.sh medium
 bash tests_extended/run_suites.sh long
 ```
 
-These tiers are nested, and each one already begins by running the public/basic unit suite from `public/tests/unit/`. If you just ran one of the scripted tiers, rerunning root `pytest` is redundant unless you specifically want the public/basic suite output on its own.
+These tiers are nested, and each one already begins by running the full public suite from `public/tests/`. If you just ran one of the scripted tiers, rerunning root `pytest public/tests` is redundant unless you specifically want the public suite output on its own.
 
 Or run explicit paths, for example:
 

@@ -1,4 +1,4 @@
-"""Subsampling utilities for privacy loss distributions."""
+"""PLD-dual subsampling with stable loss transforms and CtD projection."""
 
 from __future__ import annotations
 
@@ -14,24 +14,29 @@ from PLD_accounting.discrete_dist import (
     GridSpec,
     PLDRealization,
     SparseDiscreteDist,
+    require_dense_dist,
 )
 from PLD_accounting.distribution_discretization import (
     aligned_grid_params,
     project_dist_onto_grid_ctd,
 )
-from PLD_accounting.distribution_utils import (
-    compute_bin_width,
-)
+from PLD_accounting.distribution_utils import compensated_segmented_sum
 from PLD_accounting.dp_accounting_support import (
     dp_accounting_pmf_to_pld_realization,
     linear_dist_to_dp_accounting_pmf,
+    require_importable_dp_accounting_pmf,
 )
 from PLD_accounting.types import (
     BoundType,
     Direction,
     SpacingType,
+    require_direction,
 )
 from PLD_accounting.utils import calc_pld_dual, negate_reverse_linear_distribution
+from PLD_accounting.validation import (
+    require_type,
+    require_unit_interval_left_open,
+)
 
 # =============================================================================
 # Public Subsampling API
@@ -39,25 +44,29 @@ from PLD_accounting.utils import calc_pld_dual, negate_reverse_linear_distributi
 
 
 def subsample_pld(
+    *,
     pld: PrivacyLossDistribution,
     sampling_probability: float,
 ) -> PrivacyLossDistribution:
     """Apply PLD-dual based subsampling to a dp_accounting PLD.
 
     Args:
-        pld: Privacy loss distribution to subsample
-        sampling_probability: Probability of sampling each element
-    Returns:
-        Subsampled privacy loss distribution
+        pld: Privacy loss distribution to subsample.
+        sampling_probability: Probability of sampling each element.
 
+    Returns:
+        Subsampled privacy loss distribution.
     """
-    if sampling_probability <= 0 or sampling_probability > 1:
-        raise ValueError("sampling_probability must be in (0, 1]")
+    require_type(value=pld, expected_type=PrivacyLossDistribution, name="pld")
+    require_unit_interval_left_open(value=sampling_probability, name="sampling_probability")
+    require_importable_dp_accounting_pmf(pld._pmf_remove)
+    if pld._pmf_add is not None:
+        require_importable_dp_accounting_pmf(pld._pmf_add)
     if sampling_probability == 1.0:
         return pld
 
-    # Convert REMOVE direction
-    remove_dist = dp_accounting_pmf_to_pld_realization(pld._pmf_remove)
+    # Convert and transform the mandatory REMOVE direction.
+    remove_dist = dp_accounting_pmf_to_pld_realization(pmf=pld._pmf_remove)
     subsampled_remove = subsample_pld_realization(
         base_pld=remove_dist,
         sampling_prob=sampling_probability,
@@ -68,11 +77,11 @@ def subsample_pld(
         bound_type=BoundType.DOMINATES,
     )
 
-    # Handle ADD direction if present
     if pld._pmf_add is None:
         return PrivacyLossDistribution(pmf_remove=subsampled_remove_pmf)
 
-    add_dist = dp_accounting_pmf_to_pld_realization(pld._pmf_add)
+    # Transform the optional ADD direction independently when it is present.
+    add_dist = dp_accounting_pmf_to_pld_realization(pmf=pld._pmf_add)
     subsampled_add = subsample_pld_realization(
         base_pld=add_dist,
         sampling_prob=sampling_probability,
@@ -87,6 +96,7 @@ def subsample_pld(
 
 
 def subsample_pld_realization(
+    *,
     base_pld: PLDRealization,
     sampling_prob: float,
     direction: Direction,
@@ -106,43 +116,39 @@ def subsample_pld_realization(
     Returns:
         Subsampled loss-space dominating (upper) bound as a ``PLDRealization``.
 
-    The transformed source is projected with hockey-stick-preserving CtD.
-
+    The transformed atomic source is projected with hockey-stick-preserving CtD.
     """
-    if not isinstance(base_pld, PLDRealization):
-        raise TypeError(f"subsample_pld_realization requires PLDRealization, got {type(base_pld)}")
-    if sampling_prob <= 0 or sampling_prob > 1:
-        raise ValueError("sampling_prob must be in (0, 1]")
+    require_type(value=base_pld, expected_type=PLDRealization, name="base_pld")
+    require_unit_interval_left_open(value=sampling_prob, name="sampling_prob")
+    require_direction(value=direction)
     if sampling_prob == 1.0:
         return base_pld
 
-    if direction not in (Direction.REMOVE, Direction.ADD):
-        raise ValueError("Direction BOTH is invalid for subsampling")
-
     if direction == Direction.REMOVE:
-        target_x_array = _calc_subsampled_grid(
-            min_loss=base_pld.x_array[0],
-            discretization=compute_bin_width(base_pld.x_array),
-            num_buckets=int(base_pld.x_array.size),
+        target_grid = _calc_subsampled_grid(
+            source_grid=base_pld.grid,
             sampling_prob=sampling_prob,
             direction=direction,
+            include_right=None,
         )
-        # Compute negative dual
+        # Algorithm 8 mixes transformed L with transformed -D(L), so derive the
+        # exact discrete dual before applying either subsampling transform.
         dual_pld = calc_pld_dual(base_pld)
         neg_dual_pld = negate_reverse_linear_distribution(dual_pld)
-        # Transform and re-discretize each distribution and mix.
+        # Transform both branches, combine their atomic masses, and CtD-project.
         out = _subsample_dist_mix(
             base_pld=base_pld,
             neg_dual_pld=neg_dual_pld,
             sampling_prob=sampling_prob,
             direction=direction,
-            target_x_array=target_x_array,
+            target_grid=target_grid,
         )
         return out
     out = _subsample_dist(
         base_pld=base_pld,
         sampling_prob=sampling_prob,
         direction=direction,
+        target_grid=None,
     )
     return out
 
@@ -158,33 +164,31 @@ def _subsample_dist_mix(
     neg_dual_pld: DiscreteDistBase,
     sampling_prob: float,
     direction: Direction,
-    target_x_array: NDArray[np.float64] | None = None,
+    target_grid: GridSpec | None,
 ) -> PLDRealization:
     """Subsample and mix base and negative-dual distributions on a shared linear grid.
 
     Paper mapping: Algorithm 8 (`PLDsubsam-remove`), in Appendix C of
     https://arxiv.org/abs/2602.17284, mixture line ``lambda * f_L +
-    (1-lambda) * f_D``. The implementation computes each transformed branch on
-    the same grid before applying that convex mixture.
+    (1-lambda) * f_D``. Fixed-grid CtD projection is linear in the atomic
+    masses, so the two transformed sources are mixed first and projected once.
     """
-    if target_x_array is None:
+    if target_grid is None:
         # Algorithm 8 support update for the base branch.
-        base_width = compute_bin_width(base_pld.x_array)
-        target_x_array = _calc_subsampled_grid(
-            min_loss=base_pld.x_array[0],
-            discretization=base_width,
-            num_buckets=int(base_pld.x_array.size),
+        target_grid = _calc_subsampled_grid(
+            source_grid=require_dense_dist(dist=base_pld, name="base_pld").grid,
             sampling_prob=sampling_prob,
             direction=direction,
+            include_right=None,
         )
-        # Ensure the -D(L) branch is covered by the same target lattice.
-        target_x_array = _extend_target_grid_for_reference(
-            target_x_array=target_x_array,
+        # Cover the transformed -D(L) branch on this same target lattice.
+        target_grid = _extend_target_grid_for_reference(
+            target_grid=target_grid,
             neg_dual_pld=neg_dual_pld,
             sampling_prob=sampling_prob,
             direction=direction,
         )
-    assert target_x_array is not None
+    assert target_grid is not None
 
     base_source = _subsample_transformed_source(
         base_pld=base_pld, sampling_prob=sampling_prob, direction=direction
@@ -192,8 +196,7 @@ def _subsample_dist_mix(
     dual_source = _subsample_transformed_source(
         base_pld=neg_dual_pld, sampling_prob=sampling_prob, direction=direction
     )
-    # Algorithm 8 projects each branch before mixing.  Projection onto a fixed
-    # grid is linear in the atomic masses, so mix first and project only once.
+    # Fixed-grid CtD projection is linear in atomic mass, so mix before projecting.
     mixed_source = _atomic_source(
         losses=np.concatenate((base_source.x_array, dual_source.x_array)),
         masses=np.concatenate(
@@ -205,16 +208,7 @@ def _subsample_dist_mix(
         p_min=(sampling_prob * base_source.p_min + (1.0 - sampling_prob) * dual_source.p_min),
         p_max=(sampling_prob * base_source.p_max + (1.0 - sampling_prob) * dual_source.p_max),
     )
-    grid = GridSpec(
-        x_0=float(target_x_array[0]),
-        step=compute_bin_width(target_x_array),
-        n=int(target_x_array.size),
-        spacing_type=SpacingType.LINEAR,
-    )
-    return project_dist_onto_grid_ctd(
-        dist=mixed_source,
-        grid=grid,
-    )
+    return project_dist_onto_grid_ctd(dist=mixed_source, grid=target_grid)
 
 
 def _subsample_dist(
@@ -222,7 +216,7 @@ def _subsample_dist(
     base_pld: DiscreteDistBase,
     sampling_prob: float,
     direction: Direction,
-    target_x_array: NDArray[np.float64] | None = None,
+    target_grid: GridSpec | None,
 ) -> PLDRealization:
     """Subsample a single distribution onto a linear target grid in DOMINATES mode.
 
@@ -230,26 +224,23 @@ def _subsample_dist(
     ``direction`` is ADD. The implementation keeps these same components while
     making the re-binning and infinite-mass placement explicit.
     """
-    if target_x_array is None:
+    if target_grid is None:
         # Algorithm 10 support update: build transformed target grid.
-        width = compute_bin_width(base_pld.x_array)
         include_right = None
         if direction == Direction.ADD and base_pld.p_max > 0.0:
             include_right = -math.log1p(-sampling_prob)
-        target_x_array = _calc_subsampled_grid(
-            min_loss=base_pld.x_array[0],
-            discretization=width,
-            num_buckets=base_pld.x_array.size,
+        target_grid = _calc_subsampled_grid(
+            source_grid=require_dense_dist(dist=base_pld, name="base_pld").grid,
             sampling_prob=sampling_prob,
             direction=direction,
             include_right=include_right,
         )
     elif direction == Direction.ADD and base_pld.p_max > 0.0:
         max_loss = -math.log1p(-sampling_prob)
-        if max_loss > target_x_array[-1]:
+        if max_loss > target_grid.last_point:
             raise ValueError(
-                "target_x_array must include add-direction max loss "
-                f"-log(1-q)={max_loss:.15g}, got right endpoint={target_x_array[-1]:.15g}"
+                "target_grid must include add-direction max loss "
+                f"-log(1-q)={max_loss:.15g}, got right endpoint={target_grid.last_point:.15g}"
             )
 
     source = _subsample_transformed_source(
@@ -257,33 +248,32 @@ def _subsample_dist(
         sampling_prob=sampling_prob,
         direction=direction,
     )
-    grid = GridSpec(
-        x_0=float(target_x_array[0]),
-        step=compute_bin_width(target_x_array),
-        n=int(target_x_array.size),
-        spacing_type=SpacingType.LINEAR,
-    )
-    return project_dist_onto_grid_ctd(
-        dist=source,
-        grid=grid,
-    )
+    return project_dist_onto_grid_ctd(dist=source, grid=target_grid)
 
 
 def _calc_subsampled_grid(
     *,
-    min_loss: float,
-    discretization: float,
-    num_buckets: int,
+    source_grid: GridSpec,
     sampling_prob: float,
     direction: Direction,
-    include_right: float | None = None,
-) -> NDArray[np.float64]:
-    """Compute the transformed linear target grid used by Algorithms 8-10."""
-    if sampling_prob <= 0 or sampling_prob > 1:
-        raise ValueError("sampling_prob must be in (0, 1]")
+    include_right: float | None,
+) -> GridSpec:
+    """Build the transformed target grid used by Algorithms 8-10.
+
+    Transforming the source interval generally changes its width, so the new
+    step preserves the source bucket count and outward alignment covers both
+    endpoints. ``include_right`` additionally covers the ADD image of ``+inf``
+    when that boundary atom becomes finite.
+
+    The source lattice is taken as given rather than re-inferred from a
+    materialized array: ``(x_max - x_min) / (n - 1)`` does not round-trip back
+    to ``step``, so inferring it here would perturb the transformed endpoints.
+    """
+    num_buckets = source_grid.n
     if num_buckets < 2:
         raise ValueError("num_buckets must be >= 2")
-    max_loss = min_loss + num_buckets * discretization
+    min_loss = source_grid.x_0
+    max_loss = min_loss + num_buckets * source_grid.step
 
     endpoints = np.array([min_loss, max_loss], dtype=np.float64)
     transformed_endpoints = _stable_subsampling_transformation(
@@ -308,41 +298,38 @@ def _calc_subsampled_grid(
         spacing_type=SpacingType.LINEAR,
         discretization=new_width,
         align_to_multiples=True,
-    ).materialize()
+    )
 
 
 def _extend_target_grid_for_reference(
     *,
-    target_x_array: NDArray[np.float64],
+    target_grid: GridSpec,
     neg_dual_pld: DiscreteDistBase,
     sampling_prob: float,
     direction: Direction,
-) -> NDArray[np.float64]:
+) -> GridSpec:
     """Extend the target grid so transformed ``-D(L)`` support is fully covered.
 
-    This is the implementation-level support completion used before the
-    Algorithm 8 convex mixture.
+    This is the implementation-level support completion used before the Algorithm 8
+    convex mixture. Extension is an integer index pad, so the knots already covered
+    keep their exact coordinates.
     """
     ref_endpoints = _stable_subsampling_transformation(
         x_array=np.array([neg_dual_pld.x_array[0], neg_dual_pld.x_array[-1]], dtype=np.float64),
         sampling_prob=sampling_prob,
         direction=direction,
     )
-    min_ref = np.min(ref_endpoints)
-    max_ref = np.max(ref_endpoints)
-    step = target_x_array[1] - target_x_array[0]
+    step = target_grid.step
 
-    if min_ref < target_x_array[0]:
-        extra_bins = int(np.ceil((target_x_array[0] - min_ref) / step)) + 1
-        extension = target_x_array[0] - step * np.arange(extra_bins, 0, -1, dtype=np.float64)
-        target_x_array = np.concatenate([extension, target_x_array])
-
-    if max_ref > target_x_array[-1]:
-        extra_bins = int(np.ceil((max_ref - target_x_array[-1]) / step)) + 1
-        extension = target_x_array[-1] + step * np.arange(1, extra_bins + 1, dtype=np.float64)
-        target_x_array = np.concatenate([target_x_array, extension])
-
-    return target_x_array
+    left = 0
+    min_ref = float(np.min(ref_endpoints))
+    if min_ref < target_grid.x_0:
+        left = int(np.ceil((target_grid.x_0 - min_ref) / step)) + 1
+    right = 0
+    max_ref = float(np.max(ref_endpoints))
+    if max_ref > target_grid.last_point:
+        right = int(np.ceil((max_ref - target_grid.last_point) / step)) + 1
+    return target_grid.pad(left=left, right=right)
 
 
 def _subsample_transformed_source(
@@ -351,7 +338,11 @@ def _subsample_transformed_source(
     sampling_prob: float,
     direction: Direction,
 ) -> SparseDiscreteDist:
-    """Transform one subsampling branch and fold finite boundary images."""
+    """Transform one branch, converting boundary atoms whose images are finite.
+
+    REMOVE maps ``-inf`` to ``log(1-q)``; ADD maps ``+inf`` to
+    ``-log(1-q)``. The opposite infinite atom remains at its boundary.
+    """
     losses = _stable_subsampling_transformation(
         x_array=base_pld.x_array, sampling_prob=sampling_prob, direction=direction
     )
@@ -386,8 +377,7 @@ def _stable_subsampling_transformation(
     positive losses we use a log-sum form to avoid overflow; for non-positive
     losses we use ``log1p(expm1(.))`` for cancellation stability.
     """
-    if sampling_prob <= 0 or sampling_prob > 1:
-        raise ValueError("sampling_prob must be in (0, 1]")
+    require_unit_interval_left_open(value=sampling_prob, name="sampling_prob")
     if sampling_prob == 1:
         return x_array
     if direction == Direction.ADD:
@@ -395,7 +385,7 @@ def _stable_subsampling_transformation(
 
     new_x_array = np.zeros_like(x_array)
     pos = x_array > 0
-    # Stable for large positive losses.
+    # This log-sum form remains finite for large positive losses.
     new_x_array[pos] = x_array[pos] + np.log(
         sampling_prob + (1.0 - sampling_prob) * np.exp(-x_array[pos])
     )
@@ -411,12 +401,18 @@ def _atomic_source(
     p_min: float,
     p_max: float,
 ) -> SparseDiscreteDist:
-    """Coalesce repeated atoms to satisfy the strictly increasing sparse support."""
+    """Coalesce repeated atoms with compensated per-loss accumulation.
+
+    The transform can map distinct boundary/support inputs to the same loss;
+    grouping is therefore semantic, not merely a sparse-storage optimization.
+    """
     losses = np.asarray(losses, dtype=np.float64)
     masses = np.asarray(masses, dtype=np.float64)
     unique_losses, inverse = np.unique(losses, return_inverse=True)
-    unique_masses = np.asarray(
-        np.bincount(inverse, weights=masses, minlength=unique_losses.size), dtype=np.float64
+    unique_masses = compensated_segmented_sum(
+        bin_index=inverse,
+        weights=masses,
+        num_bins=unique_losses.size,
     )
     return SparseDiscreteDist(
         x_array=unique_losses,

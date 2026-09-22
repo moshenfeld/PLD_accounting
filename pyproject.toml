@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "PLD_accounting"
-version = "1.0"
+version = "2.0"
 description = "Numerical privacy accounting for random allocation and subsampling using PLDs."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -49,11 +49,13 @@ test = [
   "pytest>=8.0",
   "pytest-cov>=4.0",
   "mypy>=1.10",
+  "mpmath>=1.3",
 ]
 dev = [
   "pytest>=8.0",
   "pytest-cov>=4.0",
   "mypy>=1.10",
+  "mpmath>=1.3",
   "build>=1.2.0",
   "pylint>=4.0",
   "pylint-per-file-ignores>=3.0",

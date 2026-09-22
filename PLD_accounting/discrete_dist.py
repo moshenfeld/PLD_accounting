@@ -1,16 +1,9 @@
-"""Discrete distribution classes and structured grid data types.
+"""Discrete distributions with explicit boundary masses and structural grids.
 
-Class hierarchy:
-- DiscreteDistBase: abstract base for all discrete distributions
-- SparseDiscreteDist: arbitrary explicit support (explicit x_array)
-- DenseDiscreteDist: regular-grid distribution
-  - spacing_type=LINEAR:    x[i] = x_0 + i * step
-  - spacing_type=GEOMETRIC: x[i] = x_0 * step^i
-- PLDRealization: DenseDiscreteDist specialised for privacy loss (LINEAR + REALS)
-
-Domain semantics:
-- REALS:     p_min = mass at −∞,  p_max = mass at +∞
-- POSITIVES: p_min = mass at 0,   p_max = mass at +∞
+Boundary mass is never folded into the support; ``Domain`` fixes what the two
+boundaries mean. Constructors copy their arrays and mark them read-only. A dense
+support is described by a ``GridSpec``, from which ``x_0``, ``step`` and
+``x_array`` are derived.
 """
 
 from __future__ import annotations
@@ -18,7 +11,7 @@ from __future__ import annotations
 import copy
 import math
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 
 import numpy as np
@@ -26,20 +19,27 @@ from numpy.typing import NDArray
 from typing_extensions import Self
 
 from PLD_accounting.distribution_utils import (
-    PMF_MASS_TOL,
-    compute_bin_ratio,
-    compute_bin_width,
+    PMF_TOLERATED_MASS_TOL,
     compute_truncation,
     exp_moment_terms,
+    signed_unit_residual,
 )
 from PLD_accounting.types import BoundType, SpacingType
 from PLD_accounting.validation import (
-    validate_discrete_pmf_and_boundaries,
-    validate_finite_array,
-    validate_finite_real,
+    require_finite_array,
+    require_finite_real,
+    require_integer,
+    require_nonnegative_int,
+    require_nonnegative_masses,
+    require_positive_int,
+    require_positive_real,
 )
 
-REALIZATION_MOMENT_TOL = 1e-12
+# Noise floor of ``1 - E[exp(-L)]``. A one-ulp shift in a loss moves its term by ``|x| eps``,
+# so the residual moves by about ``eps * E_dual[|L|]``.
+REALIZATION_MOMENT_TOL = float(16 * np.finfo(np.float64).eps)
+_INT64_MIN = int(np.iinfo(np.int64).min)
+_INT64_MAX = int(np.iinfo(np.int64).max)
 
 
 class Domain(Enum):
@@ -49,36 +49,200 @@ class Domain(Enum):
     POSITIVES = "positives"  # p_min = mass at 0,  p_max = mass at +∞
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class GridSpec:
-    """Exact parameters of a regular grid -- the single source of truth for a lattice.
+    """Immutable regular lattice, described by its parameters rather than its points.
 
-    ``x[i] = x_0 + i * step``     for ``spacing_type == LINEAR``    (i in range(n))
-    ``x[i] = x_0 * step ** i``    for ``spacing_type == GEOMETRIC``
+    Point ``i`` of ``n`` is ``anchor + k * step`` on a linear lattice and
+    ``anchor * exp(k * step)`` on a geometric one, where ``k = index_0 + i`` is the
+    lattice index of that point and ``i`` is its position in the materialized array.
 
-    Threaded through the discretization pipeline so the resulting spacing is the
-    exact one requested, never re-derived from a materialized array. The object
-    is immutable so a validated distribution's support cannot later change.
+    Equality is structural, so lattice operations are integer-index arithmetic and
+    retained coordinates never drift.
+
+    Attributes:
+        step: Positive spacing. Additive bin width when linear; the **log** ratio when
+            geometric, so both families share one index formula. For ratio-shaped
+            geometric lattices, use ``GridSpec.geometric``.
+        n: Number of points, at least one.
+        spacing_type: Selects which point formula applies.
+        anchor: Point at lattice index zero. Additive when linear, multiplicative and
+            strictly positive when geometric.
+        index_0: Lattice index of the first point; may be negative. Slicing changes
+            this, not ``anchor``.
     """
 
-    x_0: float
     step: float
     n: int
     spacing_type: SpacingType = SpacingType.LINEAR
+    anchor: float = 0.0
+    index_0: int = 0
+
+    def __post_init__(self) -> None:
+        """Reject a parameter set that does not describe a usable lattice.
+
+        Both formulas are monotone in ``k``, so only the first and last cells can
+        collapse and only those are checked.
+        """
+        require_integer(value=[self.n, self.index_0], name=["GridSpec n", "GridSpec index_0"])
+        require_positive_int(value=self.n, name="GridSpec n")
+        require_positive_real(value=self.step, name="GridSpec step")
+        if self.spacing_type == SpacingType.GEOMETRIC:
+            require_positive_real(value=self.anchor, name="GridSpec anchor")
+        else:
+            require_finite_real(value=self.anchor, name="GridSpec anchor")
+        last_index = int(self.index_0) + int(self.n) - 1
+        if not _INT64_MIN <= int(self.index_0) <= _INT64_MAX or not (
+            _INT64_MIN <= last_index <= _INT64_MAX
+        ):
+            raise ValueError(f"GridSpec index range [{self.index_0}, {last_index}] leaves int64")
+        if self.spacing_type not in (SpacingType.LINEAR, SpacingType.GEOMETRIC):
+            raise ValueError(f"Unknown SpacingType: {self.spacing_type}")
+        if self.n == 1:
+            # A singleton has no cell, so ``point(1)`` is off the declared grid; evaluating
+            # it can overflow on a lattice whose one point is perfectly representable.
+            require_finite_real(value=self.point(0), name="GridSpec point")
+            return
+        check_indices = (0,) if self.n == 2 else (0, self.n - 2)
+        for i in check_indices:
+            low, high = self.point(i), self.point(i + 1)
+            require_finite_real(value=[low, high], name=["GridSpec point", "GridSpec point"])
+            if not low < high:
+                raise ValueError(
+                    f"GridSpec must be strictly increasing, got {low!r} then {high!r} "
+                    f"at index {i}"
+                )
+
+    @classmethod
+    def geometric(cls, *, ratio: float, n: int, anchor: float, index_0: int = 0) -> GridSpec:
+        """Build a geometric lattice ``anchor * ratio ** (index_0 + i)``.
+
+        Takes the multiplicative ratio and stores its log, so a caller thinking in
+        ratios cannot silently build a lattice whose spacing is off by an ``exp``.
+        """
+        if ratio <= 1.0:
+            raise ValueError(f"geometric ratio must be > 1, got {ratio}")
+        return cls(
+            step=math.log(ratio),
+            n=n,
+            spacing_type=SpacingType.GEOMETRIC,
+            anchor=anchor,
+            index_0=index_0,
+        )
+
+    # -- Materialization ---------------------------------------------------
+
+    def point(self, i: int) -> float:
+        """Return point ``i`` alone, through the formula ``materialize`` uses.
+
+        Agrees bitwise with ``materialize()[i]``; the two must not drift apart.
+        """
+        offset = float(self.index_0 + i) * self.step
+        if self.spacing_type == SpacingType.LINEAR:
+            return self.anchor + offset
+        return self.anchor * math.exp(offset)
+
+    @property
+    def x_0(self) -> float:
+        """First grid point."""
+        return self.point(0)
+
+    @property
+    def last_point(self) -> float:
+        """Return the last point through the same formula as ``materialize``.
+
+        Keeping the scalar and array paths identical prevents endpoint decisions from
+        disagreeing by one ULP.
+        """
+        return self.point(self.n - 1)
 
     def materialize(self) -> NDArray[np.float64]:
-        """Materialize the grid points (the canonical support array)."""
-        k = np.arange(self.n, dtype=np.float64)
-        if self.spacing_type == SpacingType.LINEAR:
-            return self.x_0 + k * self.step
-        return self.x_0 * np.power(self.step, k)
+        """Return all ``n`` points as an array.
 
-    def last_point(self) -> float:
-        """Last grid point, computed exactly as :meth:`materialize` produces it."""
-        k_last = np.float64(self.n - 1)
+        Lattice indices are formed in int64 before any float conversion, so index
+        arithmetic never loses precision to the coordinate magnitude.
+        """
+        k = (self.index_0 + np.arange(self.n, dtype=np.int64)).astype(np.float64)
         if self.spacing_type == SpacingType.LINEAR:
-            return float(self.x_0 + k_last * self.step)
-        return float(self.x_0 * np.power(self.step, k_last))
+            return self.anchor + k * self.step
+        return self.anchor * np.exp(k * self.step)
+
+    # -- Structure-preserving operations -----------------------------------
+
+    def slice(self, *, start: int, n: int) -> GridSpec:
+        """Return the child grid retaining ``[start, start + n)`` points."""
+        if start < 0 or n < 1 or start + n > self.n:
+            raise ValueError(f"Invalid slice: start={start}, n={n}, parent_n={self.n}")
+        return replace(self, index_0=self.index_0 + start, n=n)
+
+    def pad(self, *, left: int, right: int) -> GridSpec:
+        """Return the grid extended by ``left`` points below and ``right`` above."""
+        require_nonnegative_int(value=[left, right], name=["left", "right"])
+        return replace(self, index_0=self.index_0 - left, n=self.n + left + right)
+
+    def with_n(self, n: int) -> GridSpec:
+        """Return the same lattice with a different point count."""
+        return replace(self, n=n)
+
+    def reflect(self) -> GridSpec:
+        """Return the lattice of ``-x``, still in increasing order.
+
+        Negation is exact and rounding is symmetric about zero, so reflecting twice
+        returns the original coordinates bitwise.
+        """
+        if self.spacing_type != SpacingType.LINEAR:
+            raise ValueError(f"reflect requires a linear grid, got {self.spacing_type}")
+        return replace(self, anchor=-self.anchor, index_0=-(self.index_0 + self.n - 1))
+
+    def exp(self) -> GridSpec:
+        """Map a linear lattice to the geometric lattice of ``exp(x)``.
+
+        Spacing is unchanged. Coordinates match ``np.exp`` of the linear support only
+        when ``anchor == 0``; an affine grid uses ``exp(anchor) * exp(k * step)``.
+        """
+        if self.spacing_type != SpacingType.LINEAR:
+            raise ValueError(f"exp requires a linear grid, got {self.spacing_type}")
+        anchor = 1.0 if self.anchor == 0.0 else math.exp(self.anchor)
+        return replace(self, spacing_type=SpacingType.GEOMETRIC, anchor=anchor)
+
+    def log(self) -> GridSpec:
+        """Map a geometric lattice to the linear lattice of ``log(x)``.
+
+        Inverse of ``exp``. Exact on a unit anchor, where ``log(1)`` is zero.
+        """
+        if self.spacing_type != SpacingType.GEOMETRIC:
+            raise ValueError(f"log requires a geometric grid, got {self.spacing_type}")
+        anchor = 0.0 if self.anchor == 1.0 else math.log(self.anchor)
+        return replace(self, spacing_type=SpacingType.LINEAR, anchor=anchor)
+
+    def convolve(self, other: GridSpec) -> GridSpec:
+        """Return the support lattice of ``X + Y`` for two linear lattices."""
+        if self.spacing_type != SpacingType.LINEAR or other.spacing_type != SpacingType.LINEAR:
+            raise ValueError(
+                f"convolve requires linear grids, got {self.spacing_type} and {other.spacing_type}"
+            )
+        if self.step != other.step:
+            raise ValueError(
+                f"Convolution requires one exact step: {self.step:.17g} vs {other.step:.17g}"
+            )
+        return replace(
+            self,
+            anchor=self.anchor + other.anchor,
+            index_0=self.index_0 + other.index_0,
+            n=self.n + other.n - 1,
+        )
+
+    def self_convolve(self, num_convolutions: int) -> GridSpec:
+        """Return the support lattice of a ``num_convolutions``-fold self-sum."""
+        if self.spacing_type != SpacingType.LINEAR:
+            raise ValueError(f"self_convolve requires a linear grid, got {self.spacing_type}")
+        require_positive_int(value=num_convolutions, name="num_convolutions")
+        return replace(
+            self,
+            anchor=self.anchor * num_convolutions,
+            index_0=self.index_0 * num_convolutions,
+            n=num_convolutions * (self.n - 1) + 1,
+        )
 
 
 # =============================================================================
@@ -87,34 +251,28 @@ class GridSpec:
 
 
 class DiscreteDistBase(ABC):
-    """Abstract base for discrete PMF representations with boundary masses.
-
-    Attributes:
-        prob_arr: probability mass on finite support
-        p_min: mass at the lower boundary (−∞ for REALS, 0 for POSITIVES)
-        p_max: mass at +∞
-        domain: whether the support is over the reals or positive numbers
-    """
+    """Discrete PMF with finite-support masses and domain boundary masses."""
 
     def __init__(
         self,
+        *,
         prob_arr: NDArray[np.float64],
         p_min: float = 0.0,
         p_max: float = 0.0,
         domain: Domain = Domain.REALS,
     ) -> None:
-        """Initialize discrete distribution with PMF array and boundary masses."""
-        validate_discrete_pmf_and_boundaries(
-            prob_arr,
-            p_min,
-            p_max,
+        """Store validated masses, copying ``prob_arr`` and marking it read-only."""
+        require_nonnegative_masses(
+            prob_arr=prob_arr,
+            p_min=p_min,
+            p_max=p_max,
         )
 
         self._prob_arr = np.array(prob_arr, dtype=np.float64, copy=True)
         self._p_min = float(p_min)
         self._p_max = float(p_max)
         self._domain = domain
-        self._validate_basic()
+        self._require_unit_mass()
         self._prob_arr.setflags(write=False)
 
     def __deepcopy__(self, memo: dict[int, object]) -> Self:
@@ -154,12 +312,26 @@ class DiscreteDistBase(ABC):
     def x_array(self) -> NDArray[np.float64]:
         """Materialized support."""
 
-    def truncate_edges(self, tail_truncation: float, bound_type: BoundType) -> Self:
-        """Truncate distribution edges. Computation lives in distribution_utils."""
+    def truncate_edges(self, *, tail_truncation: float, bound_type: BoundType) -> Self:
+        """Return a copy with up to ``tail_truncation`` mass removed from each edge.
+
+        Removed mass moves to whichever boundary the bound direction makes
+        conservative, so the result still bounds the same quantity.
+        """
         new_prob_arr, new_p_min, new_p_max, min_ind, max_ind = compute_truncation(
-            self.prob_arr, self.p_min, self.p_max, tail_truncation, bound_type
+            prob_arr=self.prob_arr,
+            p_min=self.p_min,
+            p_max=self.p_max,
+            tail_truncation=tail_truncation,
+            bound_type=bound_type,
         )
-        return self._create_truncated(new_prob_arr, new_p_min, new_p_max, min_ind, max_ind)
+        return self._rebuild_on_range(
+            new_prob_arr=new_prob_arr,
+            new_p_min=new_p_min,
+            new_p_max=new_p_max,
+            min_ind=min_ind,
+            max_ind=max_ind,
+        )
 
     def with_probabilities(
         self,
@@ -168,57 +340,65 @@ class DiscreteDistBase(ABC):
         p_min: float,
         p_max: float,
     ) -> Self:
-        """Return a new distribution on the same support with different masses.
+        """Return a copy on the same support with replacement masses.
 
-        The support grid is preserved exactly, so ``prob_arr`` must keep its
-        shape. The result is built through the subclass constructor, which
-        re-runs every invariant the type declares.
-
-        Args:
-            prob_arr: Replacement finite-support masses, same shape as the current ones.
-            p_min: Replacement lower-boundary mass.
-            p_max: Replacement upper-boundary mass.
-
-        Returns:
-            A new distribution of the same type on the same support.
+        The support shape must remain unchanged. Rebuilding through the concrete
+        subclass re-runs its mass and representation invariants.
         """
         prob_arr = np.asarray(prob_arr, dtype=np.float64)
         if prob_arr.shape != self.prob_arr.shape:
-            raise ValueError(
-                "Replacement PMF must preserve the support shape, got "
-                f"{prob_arr.shape} instead of {self.prob_arr.shape}"
-            )
-        # A full-range "truncation" is exactly a support-preserving rebuild: each
-        # subclass already reconstructs itself through its own constructor there.
-        return self._create_truncated(prob_arr, float(p_min), float(p_max), 0, prob_arr.size - 1)
+            raise ValueError(f"{prob_arr.shape} does not match support shape {self.prob_arr.shape}")
+        return self._rebuild_on_range(
+            new_prob_arr=prob_arr,
+            new_p_min=float(p_min),
+            new_p_max=float(p_max),
+            min_ind=0,
+            max_ind=prob_arr.size - 1,
+        )
 
-    def _validate_basic(self) -> None:
-        # fsum avoids floating-point accumulation error, keeping mass sum close to 1.
-        pmf_sum = math.fsum(map(float, self.prob_arr))
-        total_mass = pmf_sum + self.p_min + self.p_max
-        mass_error = abs(total_mass - 1.0)
-        if mass_error > PMF_MASS_TOL:
+    def _require_unit_mass(self) -> None:
+        """Reject masses that do not total one, or a REALS law with mass at both boundaries."""
+        mass_error = abs(
+            signed_unit_residual(
+                values=self.prob_arr,
+                lower_term=self.p_min,
+                upper_term=self.p_max,
+            )
+        )
+        if mass_error > PMF_TOLERATED_MASS_TOL:
+            pmf_sum = math.fsum(map(float, self.prob_arr))
             raise ValueError(
                 f"PMF mass does not total 1: error={mass_error:.2e} "
-                f"(tolerance={PMF_MASS_TOL:.2e}), PMF sum={pmf_sum:.15f}, "
+                f"(tolerance={PMF_TOLERATED_MASS_TOL:.2e}), PMF sum={pmf_sum:.15f}, "
                 f"min={self.p_min:.2e}, max={self.p_max:.2e}, "
-                f"total mass={total_mass:.15f}"
+                f"total mass={pmf_sum + self.p_min + self.p_max:.15f}"
             )
 
-        # REALS domain: both boundaries being non-zero is not allowed.
-        if self.domain == Domain.REALS and self.p_min > PMF_MASS_TOL and self.p_max > PMF_MASS_TOL:
+        # Opposing infinite atoms would make later real-domain sums encounter ``-inf + inf``.
+        if (
+            self.domain == Domain.REALS
+            and self.p_min > PMF_TOLERATED_MASS_TOL
+            and self.p_max > PMF_TOLERATED_MASS_TOL
+        ):
             raise ValueError("REALS domain: p_min and p_max cannot both be non-zero")
 
     @abstractmethod
-    def _create_truncated(
+    def _rebuild_on_range(
         self,
+        *,
         new_prob_arr: NDArray[np.float64],
         new_p_min: float,
         new_p_max: float,
         min_ind: int,
         max_ind: int,
     ) -> Self:
-        """Create truncated instance preserving representation semantics."""
+        """Rebuild this distribution on ``support[min_ind : max_ind + 1]``.
+
+        The one construction hook each representation implements, so mass-changing
+        operations need not know how the support is stored. The range is the mass that
+        survived: empty edge cells are always dropped, tail truncation may drop more,
+        and a caller replacing masses in place passes the full range.
+        """
 
 
 # =============================================================================
@@ -227,28 +407,21 @@ class DiscreteDistBase(ABC):
 
 
 class SparseDiscreteDist(DiscreteDistBase):
-    """General discrete distribution with explicit support values.
-
-    Attributes:
-        x_array: explicit finite support points.
-        prob_arr: probability mass on finite support.
-        p_min: lower-boundary mass.
-        p_max: upper-boundary mass.
-        domain: support-domain semantics.
-    """
+    """Discrete distribution with an explicit, strictly increasing support."""
 
     def __init__(
         self,
+        *,
         x_array: NDArray[np.float64],
         prob_arr: NDArray[np.float64],
         p_min: float = 0.0,
         p_max: float = 0.0,
         domain: Domain = Domain.REALS,
     ) -> None:
-        """Initialize general discrete distribution with explicit support points."""
+        """Store an explicit support and its masses, both copied and marked read-only."""
         self._x_arr = np.array(x_array, dtype=np.float64, copy=True)
-        super().__init__(prob_arr, p_min, p_max, domain)
-        self._validate_x_array()
+        super().__init__(prob_arr=prob_arr, p_min=p_min, p_max=p_max, domain=domain)
+        self._require_x_array()
         self._x_arr.setflags(write=False)
 
     @property
@@ -256,14 +429,16 @@ class SparseDiscreteDist(DiscreteDistBase):
         """Return materialized support points."""
         return self._x_arr
 
-    def _create_truncated(
+    def _rebuild_on_range(
         self,
+        *,
         new_prob_arr: NDArray[np.float64],
         new_p_min: float,
         new_p_max: float,
         min_ind: int,
         max_ind: int,
     ) -> SparseDiscreteDist:
+        """Rebuild on the sliced explicit support."""
         return SparseDiscreteDist(
             x_array=self._x_arr[slice(min_ind, max_ind + 1)].copy(),
             prob_arr=new_prob_arr,
@@ -272,10 +447,11 @@ class SparseDiscreteDist(DiscreteDistBase):
             domain=self.domain,
         )
 
-    def _validate_x_array(self) -> None:
+    def _require_x_array(self) -> None:
+        """Reject a support that is not a 1-D, finite, strictly increasing match for the PMF."""
         if self._x_arr.ndim != 1 or self._x_arr.shape != self.prob_arr.shape:
             raise ValueError("x and PMF must be 1-D arrays of equal length")
-        validate_finite_array(self._x_arr, "x support")
+        require_finite_array(values=self._x_arr, name="x support")
         if not np.all(np.diff(self._x_arr) > 0):
             raise ValueError("x must be strictly increasing")
 
@@ -286,45 +462,29 @@ class SparseDiscreteDist(DiscreteDistBase):
 
 
 class DenseDiscreteDist(DiscreteDistBase):
-    """Discrete distribution on a regular (linear or geometric) grid.
-
-    spacing_type = LINEAR:    x[i] = x_0 + i * step   (step = additive gap > 0)
-    spacing_type = GEOMETRIC: x[i] = x_0 * step^i     (step = ratio > 1, x_0 > 0)
-
-    For geometric grids the domain is always POSITIVES (x_0 > 0 enforces positivity).
-
-    Attributes:
-        x_array: materialized finite support points.
-        prob_arr: probability mass on finite support.
-        p_min: lower-boundary mass.
-        p_max: upper-boundary mass.
-        domain: support-domain semantics.
-    """
+    """Regular linear or geometric grid distribution. Geometric grids are POSITIVES."""
 
     def __init__(
         self,
-        x_0: float,
-        step: float,
+        *,
+        grid: GridSpec,
         prob_arr: NDArray[np.float64],
         p_min: float = 0.0,
         p_max: float = 0.0,
-        spacing_type: SpacingType = SpacingType.LINEAR,
         domain: Domain = Domain.REALS,
     ) -> None:
-        """Initialize regular-grid discrete distribution."""
-        super().__init__(prob_arr, p_min, p_max, domain)
-        # The grid identity is held as a GridSpec; n is sourced from prob_arr.
-        self._grid = GridSpec(
-            x_0=float(x_0),
-            step=float(step),
-            n=self.prob_arr.size,
-            spacing_type=spacing_type,
-        )
-        self._validate_grid()
+        """Initialize a regular-grid discrete distribution on ``grid``."""
+        super().__init__(prob_arr=prob_arr, p_min=p_min, p_max=p_max, domain=domain)
+        if grid.n != self.prob_arr.size:
+            raise ValueError(
+                f"GridSpec n={grid.n} does not match prob_arr size {self.prob_arr.size}"
+            )
+        self._grid = grid
+        self._require_grid()
 
     @property
     def grid(self) -> GridSpec:
-        """Grid parameters ``(x_0, step, n, spacing_type)`` of this distribution."""
+        """Structural lattice of this distribution."""
         return self._grid
 
     @property
@@ -334,7 +494,7 @@ class DenseDiscreteDist(DiscreteDistBase):
 
     @property
     def step(self) -> float:
-        """Additive bin width (LINEAR) or multiplicative ratio (GEOMETRIC)."""
+        """Lattice spacing: additive bin width when linear, log ratio when geometric."""
         return self._grid.step
 
     @property
@@ -342,74 +502,36 @@ class DenseDiscreteDist(DiscreteDistBase):
         """Grid spacing family."""
         return self._grid.spacing_type
 
-    @classmethod
-    def from_x_array(
-        cls,
-        x_array: NDArray[np.float64],
-        prob_arr: NDArray[np.float64],
-        p_min: float = 0.0,
-        p_max: float = 0.0,
-        spacing_type: SpacingType = SpacingType.LINEAR,
-        domain: Domain = Domain.REALS,
-    ) -> "DenseDiscreteDist":
-        """Create DenseDiscreteDist from x_array by extracting x_0 and step."""
-        if spacing_type == SpacingType.LINEAR:
-            step = compute_bin_width(x_array)
-        elif spacing_type == SpacingType.GEOMETRIC:
-            step = compute_bin_ratio(x_array)
-        else:
-            raise ValueError(f"Unknown SpacingType: {spacing_type}")
-        return cls(
-            x_0=float(x_array[0]),
-            step=step,
-            prob_arr=prob_arr,
-            p_min=p_min,
-            p_max=p_max,
-            spacing_type=spacing_type,
-            domain=domain,
-        )
-
     @property
     def x_array(self) -> NDArray[np.float64]:
         """Return materialized support points."""
         return self._grid.materialize()
 
-    def _validate_grid(self) -> None:
-        if self.spacing_type == SpacingType.LINEAR:
-            if self.step <= 0.0:
-                raise ValueError("step must be positive for linear grid")
-        elif self.spacing_type == SpacingType.GEOMETRIC:
-            if self.x_0 <= 0.0:
-                raise ValueError("x_0 must be positive for geometric grid")
-            if self.step <= 1.0:
-                raise ValueError("step must be > 1 for geometric grid")
-            if self.domain != Domain.POSITIVES:
-                raise ValueError("Geometric spacing requires domain=Domain.POSITIVES")
-        else:
-            raise ValueError(f"Unknown SpacingType: {self.spacing_type}")
-        validate_finite_real(self._grid.last_point(), "dense grid last point")
+    def _require_grid(self) -> None:
+        """Reject grid/domain pairings the package does not define.
 
-    def _create_truncated(
+        A geometric lattice is positive, so it can only carry POSITIVES semantics.
+        """
+        if self.spacing_type == SpacingType.GEOMETRIC and self.domain != Domain.POSITIVES:
+            raise ValueError("Geometric spacing requires domain=Domain.POSITIVES")
+        require_finite_real(value=self._grid.last_point, name="dense grid last point")
+
+    def _rebuild_on_range(
         self,
+        *,
         new_prob_arr: NDArray[np.float64],
         new_p_min: float,
         new_p_max: float,
         min_ind: int,
         max_ind: int,
-    ) -> "DenseDiscreteDist":
-        if self.spacing_type == SpacingType.LINEAR:
-            new_x_0 = self.x_0 + min_ind * self.step
-        elif self.spacing_type == SpacingType.GEOMETRIC:
-            new_x_0 = self.x_0 * (self.step ** float(min_ind))
-        else:
-            raise ValueError(f"Unknown SpacingType: {self.spacing_type}")
-        return self.__class__(
-            x_0=new_x_0,
-            step=self.step,
+    ) -> Self:
+        """Rebuild on the sliced lattice, which the grid derives from ``min_ind``."""
+        del max_ind  # Unused; child length is encoded in ``new_prob_arr``.
+        return type(self)(
+            grid=self._grid.slice(start=min_ind, n=new_prob_arr.size),
             prob_arr=new_prob_arr,
             p_min=new_p_min,
             p_max=new_p_max,
-            spacing_type=self.spacing_type,
             domain=self.domain,
         )
 
@@ -420,52 +542,37 @@ class DenseDiscreteDist(DiscreteDistBase):
 
 
 class PLDRealization(DenseDiscreteDist):
-    """Linear-grid PLD realization in loss space.
-
-    Attributes:
-        x_array: materialized privacy-loss support points.
-        prob_arr: probability mass on finite privacy losses.
-        p_min: mass at negative-infinity loss, always zero for valid realizations.
-        p_max: mass at positive-infinity loss.
-    """
+    """Linear-grid PLD realization: ``p_min = 0`` and ``E[exp(-L)] <= 1``."""
 
     def __init__(
         self,
-        x_0: float,
-        step: float,
+        *,
+        grid: GridSpec,
         prob_arr: NDArray[np.float64],
         p_min: float = 0.0,
         p_max: float = 0.0,
+        domain: Domain = Domain.REALS,
     ) -> None:
-        """Initialize PLD realization with privacy loss values and probabilities."""
+        """Initialize a linear-grid PLD realization.
+
+        ``domain`` is accepted so base-class operations can rebuild a realization
+        through one signature, but only ``Domain.REALS`` is a realization.
+        """
+        if grid.spacing_type != SpacingType.LINEAR:
+            raise ValueError(f"PLDRealization requires a linear grid, got {grid.spacing_type}")
+        if domain != Domain.REALS:
+            raise ValueError(f"PLDRealization requires Domain.REALS, got {domain}")
         super().__init__(
-            x_0=x_0,
-            step=step,
+            grid=grid,
             prob_arr=prob_arr,
             p_min=float(p_min),
             p_max=float(p_max),
-            spacing_type=SpacingType.LINEAR,
             domain=Domain.REALS,
         )
-        self._validate_pld_realization()
-
-    @classmethod
-    def from_linear_dist(cls, dist: DenseDiscreteDist) -> "PLDRealization":
-        """Build a validated PLD realization from a linear-grid DenseDiscreteDist."""
-        if not isinstance(dist, DenseDiscreteDist) or dist.spacing_type != SpacingType.LINEAR:
-            raise TypeError(
-                f"from_linear_dist requires DenseDiscreteDist with LINEAR spacing, got {type(dist)}"
-            )
-        return cls(
-            x_0=dist.x_0,
-            step=dist.step,
-            prob_arr=dist.prob_arr,
-            p_max=dist.p_max,
-            p_min=dist.p_min,
-        )
+        self._require_pld_realization()
 
     def truncate_edges(  # type: ignore[override]
-        self, tail_truncation: float, bound_type: BoundType
+        self, *, tail_truncation: float, bound_type: BoundType
     ) -> DenseDiscreteDist:
         """Trim edge mass, returning a plain dense distribution when needed.
 
@@ -474,24 +581,16 @@ class PLDRealization(DenseDiscreteDist):
         intentionally downgraded to ``DenseDiscreteDist``.
         """
         if bound_type == BoundType.IS_DOMINATED:
-            # IS_DOMINATED can set p_min > 0, violating PLDRealization.p_min = 0.
-            # Delegate through a plain DenseDiscreteDist so the result is not a PLDRealization.
             return DenseDiscreteDist(
-                x_0=self.x_0,
-                step=self.step,
+                grid=self._grid,
                 prob_arr=self.prob_arr.copy(),
                 p_min=self.p_min,
                 p_max=self.p_max,
-            ).truncate_edges(tail_truncation, bound_type)
-        return super().truncate_edges(tail_truncation, bound_type)
+            ).truncate_edges(tail_truncation=tail_truncation, bound_type=bound_type)
+        return super().truncate_edges(tail_truncation=tail_truncation, bound_type=bound_type)
 
-    def _validate_pld_realization(self) -> None:
-        """Validate the properties of PLD-realization.
-
-        1. p(-inf) = 0 (p_min = 0).
-        2. E[e^(-X)] <= 1.
-        """
-        # PLD realizations must have zero mass at negative-infinity loss.
+    def _require_pld_realization(self) -> None:
+        """Require ``p_min = 0`` and ``E[exp(-L)] <= 1``."""
         if self.p_min != 0.0:
             raise ValueError(f"PLD realization requires p_min = 0, got {self.p_min:.2e}")
 
@@ -500,28 +599,63 @@ class PLDRealization(DenseDiscreteDist):
             raise ValueError(
                 "Exponential moment E[exp(-L)] is infinite, not a valid PLD realization"
             )
-        # fsum avoids floating-point accumulation error, keeping mass sum close to 1.
-        exp_moment_total = math.fsum(map(float, exp_moment_val))
-        if exp_moment_total > 1.0 + REALIZATION_MOMENT_TOL:
+        moment_residual = signed_unit_residual(
+            values=exp_moment_val, lower_term=0.0, upper_term=0.0
+        )
+        if moment_residual < -REALIZATION_MOMENT_TOL:
             raise ValueError(
-                f"Exponential moment E[exp(-L)] = {exp_moment_total:.15f} > 1.0, "
+                f"Exponential moment E[exp(-L)] = {1.0 - moment_residual:.15f} > 1.0, "
                 "not a valid PLD realization"
             )
 
-    def _create_truncated(
-        self,
-        new_prob_arr: NDArray[np.float64],
-        new_p_min: float,
-        new_p_max: float,
-        min_ind: int,
-        max_ind: int,
-    ) -> "PLDRealization":
-        """Create a truncated PLD realization while preserving linear-loss semantics."""
-        del max_ind  # Unused.
-        return PLDRealization(
-            x_0=self.x_0 + min_ind * self.step,
-            step=self.step,
-            prob_arr=new_prob_arr,
-            p_min=new_p_min,
-            p_max=new_p_max,
+
+def require_dense_dist(
+    *,
+    dist: object,
+    name: str,
+    spacing: SpacingType | None = None,
+    domain: Domain | None = None,
+) -> DenseDiscreteDist:
+    """Require a dense distribution, optionally of one spacing and domain."""
+    if not isinstance(dist, DenseDiscreteDist):
+        spacing_note = f" with {spacing.name} spacing" if spacing is not None else ""
+        raise TypeError(
+            f"{name} must be DenseDiscreteDist{spacing_note}, got {type(dist).__name__}"
         )
+    if spacing is not None and dist.spacing_type != spacing:
+        raise TypeError(
+            f"{name}: expected DenseDiscreteDist with {spacing.name} spacing, "
+            f"got {type(dist).__name__} with spacing {dist.spacing_type}"
+        )
+    if domain is not None and dist.domain != domain:
+        raise ValueError(f"{name} must use Domain.{domain.name}, got {dist.domain}")
+    return dist
+
+
+def require_linear_reals_dist(*, dist: object, name: str) -> DenseDiscreteDist:
+    """Require a linear-grid real-domain dense distribution."""
+    return require_dense_dist(dist=dist, name=name, spacing=SpacingType.LINEAR, domain=Domain.REALS)
+
+
+def require_zero_anchor(*, grid: GridSpec, name: str) -> GridSpec:
+    """Require a linear lattice on whole multiples of its step, i.e. ``anchor == 0``.
+
+    A loss lattice is ``k * step``; the offset of its first point belongs in ``index_0``.
+    A non-zero anchor is either an exp-space carrier grid, which does not belong here, or
+    an index written into the wrong field.
+    """
+    if grid.spacing_type != SpacingType.LINEAR:
+        raise ValueError(f"{name} must be a linear grid, got {grid.spacing_type}")
+    if grid.anchor != 0.0:
+        raise ValueError(
+            f"{name} must lie on whole multiples of its step (anchor == 0), got "
+            f"anchor={grid.anchor!r}, step={grid.step!r}; carry the offset in index_0"
+        )
+    return grid
+
+
+def require_geometric_positives_dist(*, dist: object, name: str) -> DenseDiscreteDist:
+    """Require a geometric-grid positive-domain dense distribution."""
+    return require_dense_dist(
+        dist=dist, name=name, spacing=SpacingType.GEOMETRIC, domain=Domain.POSITIVES
+    )

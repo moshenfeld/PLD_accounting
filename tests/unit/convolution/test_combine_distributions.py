@@ -5,7 +5,7 @@ import math
 import numpy as np
 import pytest
 
-from PLD_accounting.discrete_dist import DenseDiscreteDist
+from PLD_accounting.discrete_dist import DenseDiscreteDist, GridSpec
 from PLD_accounting.types import BoundType
 from PLD_accounting.utils import combine_best_of_two_plds, combine_distributions
 from tests.test_tolerances import TestTolerances as TOL
@@ -15,6 +15,15 @@ def test_combine_distributions_rejects_mismatched_grids():
     """Mismatched support grids are rejected; callers must project first."""
     dist_1 = _make_dist([0.0, 1.0], [0.4, 0.5], p_max=0.1)
     dist_2 = _make_dist([0.5, 1.5], [0.3, 0.6], p_max=0.1)
+
+    with pytest.raises(ValueError, match="identical support grids"):
+        combine_distributions(dist_1=dist_1, dist_2=dist_2, bound_type=BoundType.DOMINATES)
+
+
+def test_combine_distributions_rejects_close_but_nonidentical_grids() -> None:
+    """Support identity is exact and never inferred from ``allclose``."""
+    dist_1 = _make_dist([0.0, 1.0], [0.4, 0.5], p_max=0.1)
+    dist_2 = _make_dist([5e-13, 1.0000000000005], [0.4, 0.5], p_max=0.1)
 
     with pytest.raises(ValueError, match="identical support grids"):
         combine_distributions(dist_1=dist_1, dist_2=dist_2, bound_type=BoundType.DOMINATES)
@@ -114,8 +123,11 @@ def test_combine_best_rejects_noncanonical_boundary_on_either_input(
 def _make_dist(x_values, probs, p_max=0.0, p_min=0.0):
     x_array = np.array(x_values, dtype=np.float64)
     return DenseDiscreteDist(
-        x_0=float(x_array[0]),
-        step=float(x_array[1] - x_array[0]),
+        grid=GridSpec(
+            step=float(x_array[1] - x_array[0]),
+            n=(np.array(probs, dtype=np.float64)).size,
+            anchor=float(x_array[0]),
+        ),
         prob_arr=np.array(probs, dtype=np.float64),
         p_min=p_min,
         p_max=p_max,

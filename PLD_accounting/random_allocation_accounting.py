@@ -1,9 +1,14 @@
-"""Shared random-allocation composition helpers."""
+"""Shared random-allocation decomposition and composition helpers.
+
+The module owns the floor/ceil allocation split and the loss/tail budget ledger
+across base construction, exp-space or FFT composition, and final combination.
+"""
 
 from __future__ import annotations
 
 import math
 import warnings
+from dataclasses import replace
 from typing import Callable
 
 import numpy as np
@@ -13,7 +18,6 @@ from PLD_accounting.discrete_dist import DenseDiscreteDist
 from PLD_accounting.distribution_discretization import (
     rediscretize_dist_by_bound,
 )
-from PLD_accounting.distribution_utils import stable_isclose
 from PLD_accounting.dp_accounting_support import linear_dist_to_dp_accounting_pmf
 from PLD_accounting.fft_convolution import (
     MAX_FFT_BYTES,
@@ -24,22 +28,27 @@ from PLD_accounting.geometric_convolution import (
     geometric_convolve,
     geometric_self_convolve,
 )
-from PLD_accounting.types import BoundType, SpacingType
+from PLD_accounting.types import BoundType, SpacingType, require_bound_type
 from PLD_accounting.utils import (
     exp_linear_to_geometric,
     log_geometric_to_linear,
     negate_reverse_linear_distribution,
 )
 from PLD_accounting.validation import (
-    validate_allocation_params,
-    validate_bound_type,
-    validate_discretization_params,
+    require_allocation_counts,
+    require_nonnegative_real,
+    require_positive_int,
+    require_positive_real,
 )
 
 # Minimum number of bins to keep after per-epoch base PMF size capping.
 _MIN_BASE_PMF_BINS = 4
 # Estimated bytes consumed per input PMF bin in the direct epoch-compose cap.
 _DIRECT_COMPOSE_BYTES_PER_BASE_BIN = 16
+# Distinguishes last-bit step disagreement after "same common_step divided by
+# stage counts" from "the grid cap actually coarsened a component". Producer: the
+# floor/ceil budget split; units: relative step difference.
+_COMPONENT_STEP_ULP_BAND = 64.0 * float(np.finfo(np.float64).eps)
 
 # =============================================================================
 # Public API
@@ -64,26 +73,24 @@ def allocation_directional_pld(
     ``_allocation_directional_pld_core(...)`` and combines them with one final
     ``fft_convolve(...)``.
     """
-    # Input validation
-    validate_allocation_params(num_steps, num_selected, num_epochs)
-    validate_discretization_params(loss_discretization, tail_truncation)
-    validate_bound_type(bound_type)
-    # Floor/ceil decomposition: non-divisible num_steps / num_selected splits into
-    # rounds of floor(num_steps / num_selected) steps and rounds of one more step,
-    # with per-round multiplicities scaled by num_epochs.
-    new_num_steps_floor = int(num_steps // num_selected)
-    if new_num_steps_floor < 1:
-        raise ValueError("num_steps must be >= num_selected")
-    num_epochs_remainder = num_steps - num_selected * new_num_steps_floor
-    new_num_steps_ceil = new_num_steps_floor + 1
-    new_num_epochs_floor = (num_selected - num_epochs_remainder) * num_epochs
-    new_num_epochs_ceil = num_epochs_remainder * num_epochs
+    require_allocation_counts(num_steps=num_steps, num_selected=num_selected, num_epochs=num_epochs)
+    require_positive_real(value=loss_discretization, name="loss_discretization")
+    require_nonnegative_real(value=tail_truncation, name="tail_truncation")
+    require_bound_type(value=bound_type)
+    # README Parameter Mapping: floor/ceil remainder split of inner steps and
+    # outer epoch multiplicities. remainder is in [0, num_selected), so
+    # floor_epochs is always positive; ceil_epochs is zero iff remainder is 0.
+    floor_steps = num_steps // num_selected
+    remainder = num_steps - num_selected * floor_steps
+    ceil_steps = floor_steps + 1
+    floor_epochs = (num_selected - remainder) * num_epochs
+    ceil_epochs = remainder * num_epochs
     # Tail: active tail-consuming ops = one _allocation_directional_pld_core per component
     # plus one fft_convolve when both components are active, giving 2*component_count - 1
     # ops total (1 for component_count=1, 3 for component_count=2).  After
     # tail_truncation /= (2*component_count - 1), each op consumes at most the rescaled
     # budget, and all ops together sum to <= (2*component_count - 1) * rescaled = tail_truncation.
-    component_count = int(new_num_epochs_floor > 0) + int(new_num_epochs_ceil > 0)
+    component_count = int(floor_epochs > 0) + int(ceil_epochs > 0)
     tail_truncation /= 2 * component_count - 1
     # Loss: when both components are active, split the budget proportional to each
     # component's effective discretization count (num_epochs * base count).  This is
@@ -93,9 +100,9 @@ def allocation_directional_pld(
     # even when the base counts differ (GEOM counts depend on num_steps), which the
     # final fft_convolve requires.  The components' budgets still sum to
     # loss_discretization, so the total rounding error stays within budget.
-    if new_num_epochs_floor > 0 and new_num_epochs_ceil > 0:
-        floor_count = new_num_epochs_floor * base_loss_discretization_count(new_num_steps_floor)
-        ceil_count = new_num_epochs_ceil * base_loss_discretization_count(new_num_steps_ceil)
+    if floor_epochs > 0 and ceil_epochs > 0:
+        floor_count = floor_epochs * base_loss_discretization_count(floor_steps)
+        ceil_count = ceil_epochs * base_loss_discretization_count(ceil_steps)
         loss_disc_floor = loss_discretization * floor_count / (floor_count + ceil_count)
         loss_disc_ceil = loss_discretization * ceil_count / (floor_count + ceil_count)
     else:
@@ -104,20 +111,20 @@ def allocation_directional_pld(
 
     dist_floor = None
     dist_ceil = None
-    if new_num_epochs_floor > 0:
+    if floor_epochs > 0:
         dist_floor = _allocation_directional_pld_core(
             compute_base_pld=compute_base_pld,
-            num_steps=new_num_steps_floor,
-            num_epochs=new_num_epochs_floor,
+            num_steps=floor_steps,
+            num_epochs=floor_epochs,
             loss_discretization=loss_disc_floor,
             tail_truncation=tail_truncation,
             bound_type=bound_type,
         )
-    if new_num_epochs_ceil > 0:
+    if ceil_epochs > 0:
         dist_ceil = _allocation_directional_pld_core(
             compute_base_pld=compute_base_pld,
-            num_steps=new_num_steps_ceil,
-            num_epochs=new_num_epochs_ceil,
+            num_steps=ceil_steps,
+            num_epochs=ceil_epochs,
             loss_discretization=loss_disc_ceil,
             tail_truncation=tail_truncation,
             bound_type=bound_type,
@@ -155,13 +162,14 @@ def geometric_allocation_pld_base_remove(
     """Build the REMOVE component PLD via exp-space geometric composition.
 
     The callback ``base_distributions_creation`` provides one-step
-    ``(base, neg_dual_base)`` factors, which are shifted and composed.
+    ``(base, neg_dual_base)`` factors. They are exponentiated, summed according
+    to the paper's REMOVE construction, divided by ``num_steps``, and mapped
+    back to loss space.
     """
-    # Input validation
-    if num_steps < 1:
-        raise ValueError(f"num_steps must be >= 1, got {num_steps}")
-    validate_discretization_params(loss_discretization, tail_truncation)
-    validate_bound_type(bound_type)
+    require_positive_int(value=num_steps, name="num_steps")
+    require_positive_real(value=loss_discretization, name="loss_discretization")
+    require_nonnegative_real(value=tail_truncation, name="tail_truncation")
+    require_bound_type(value=bound_type)
     # For num_steps == 1 neither convolution stages nor Phases 2/3 execute, so no
     # division is needed for either budget.
     if num_steps > 1:
@@ -184,32 +192,14 @@ def geometric_allocation_pld_base_remove(
         tail_truncation=base_factor_tail_truncation,
         bound_type=bound_type,
     )
-    # For num_steps == 1 the centering shift is log(1) = 0 and the exp/log round-trip
-    # is an identity, so base is already the final result.
+    # A one-factor average is already ``base``; avoid an unnecessary exp/log round-trip.
     if num_steps == 1:
         return base
 
-    # Normalize each factor by num_steps before moving to exp-space.
-    log_num_steps = float(np.log(num_steps))
-    centered_neg_dual = DenseDiscreteDist(
-        x_0=neg_dual_base.x_0 - log_num_steps,
-        step=neg_dual_base.step,
-        prob_arr=neg_dual_base.prob_arr.copy(),
-        p_min=neg_dual_base.p_min,
-        p_max=neg_dual_base.p_max,
-    )
-    centered_base = DenseDiscreteDist(
-        x_0=base.x_0 - log_num_steps,
-        step=base.step,
-        prob_arr=base.prob_arr.copy(),
-        p_min=base.p_min,
-        p_max=base.p_max,
-    )
-
-    # Factor preparation in exp-space.
-    exp_neg_dual = exp_linear_to_geometric(centered_neg_dual)
-    exp_base = exp_linear_to_geometric(centered_base)
-    factor_anchor = 1.0 / num_steps
+    # Zero-anchored loss grids exp to anchor 1, so the composed anchor is the exact
+    # integer num_steps and the closing average is an exact division.
+    exp_neg_dual = exp_linear_to_geometric(neg_dual_base)
+    exp_base = exp_linear_to_geometric(base)
 
     # V_{t-1} <- self-conv(V1, t-1, ...).
     exp_convolved_dual = geometric_self_convolve(
@@ -217,18 +207,15 @@ def geometric_allocation_pld_base_remove(
         num_convolutions=num_steps - 1,
         tail_truncation=tail_truncation,
         bound_type=bound_type,
-        lattice_anchor=factor_anchor,
     )
-    # U_t <- conv(V_{t-1}, U1, ...). The num_convolutions normalized factors sum to anchor 1.
+    # U_t <- conv(V_{t-1}, U1, ...).
     exp_convolved = geometric_convolve(
         dist_1=exp_convolved_dual,
         dist_2=exp_base,
         tail_truncation=tail_truncation,
         bound_type=bound_type,
-        target_anchor=1.0,
     )
-    # The composed anchor is one, so the log-grid is aligned to zero loss.
-    return log_geometric_to_linear(exp_convolved)
+    return log_geometric_to_linear(_averaged_exp_factor(dist=exp_convolved, num_steps=num_steps))
 
 
 def geometric_allocation_pld_base_add(
@@ -242,13 +229,13 @@ def geometric_allocation_pld_base_add(
     """Build the ADD component PLD via exp-space geometric self-composition.
 
     The callback ``base_distributions_creation`` provides the one-step ADD
-    factor, which is shifted and composed before mapping back to linear loss.
+    factor. Its reflected loss is exponentiated, averaged after composition,
+    then mapped and reflected back to ADD loss.
     """
-    # Input validation
-    validate_discretization_params(loss_discretization, tail_truncation)
-    validate_bound_type(bound_type)
-    if num_steps < 1:
-        raise ValueError(f"num_steps must be >= 1, got {num_steps}")
+    require_positive_real(value=loss_discretization, name="loss_discretization")
+    require_nonnegative_real(value=tail_truncation, name="tail_truncation")
+    require_bound_type(value=bound_type)
+    require_positive_int(value=num_steps, name="num_steps")
     # For num_steps == 1 neither convolution stages nor Phase 2 execute, so no
     # division is needed for either budget.
     if num_steps > 1:
@@ -269,23 +256,14 @@ def geometric_allocation_pld_base_add(
         tail_truncation=base_factor_tail_truncation,
         bound_type=bound_type,
     )
-    # For num_steps == 1 the centering shift is log(1) = 0 and the exp/log round-trip
-    # is an identity, so base is already the final result.
+    # A one-factor average is already ``base``; avoid an unnecessary exp/log round-trip.
     if num_steps == 1:
         return base
 
     neg_base = negate_reverse_linear_distribution(base)
-    log_num_steps = float(np.log(num_steps))
-    centered_neg_base = DenseDiscreteDist(
-        x_0=neg_base.x_0 - log_num_steps,
-        step=neg_base.step,
-        prob_arr=neg_base.prob_arr.copy(),
-        p_min=neg_base.p_min,
-        p_max=neg_base.p_max,
-    )
 
-    # Factor preparation in exp-space.
-    exp_base = exp_linear_to_geometric(centered_neg_base)
+    # Zero-anchored loss grids exp to anchor 1; see the REMOVE route.
+    exp_base = exp_linear_to_geometric(neg_base)
     exp_bound_type = (
         BoundType.IS_DOMINATED if bound_type == BoundType.DOMINATES else BoundType.DOMINATES
     )
@@ -295,10 +273,10 @@ def geometric_allocation_pld_base_add(
         num_convolutions=num_steps,
         tail_truncation=tail_truncation,
         bound_type=exp_bound_type,
-        lattice_anchor=1.0 / num_steps,
     )
-    # The composed anchor is one, so the log-grid is aligned to zero loss.
-    log_dist = log_geometric_to_linear(exp_convolved)
+    log_dist = log_geometric_to_linear(
+        _averaged_exp_factor(dist=exp_convolved, num_steps=num_steps)
+    )
     return negate_reverse_linear_distribution(log_dist)
 
 
@@ -324,6 +302,7 @@ def compose_full_pld(
             "PLD construction requires remove-direction distribution. "
             "Provide remove_realization or use both directions."
         )
+    require_bound_type(value=bound_type)
     pmf_remove = linear_dist_to_dp_accounting_pmf(
         dist=remove_dist,
         bound_type=bound_type,
@@ -373,49 +352,99 @@ def _binary_self_convolution_call_count(num_convolutions: int) -> int:
     return int(np.floor(np.log2(num_convolutions)) + int(num_convolutions).bit_count() - 1)
 
 
+def _averaged_exp_factor(*, dist: DenseDiscreteDist, num_steps: int) -> DenseDiscreteDist:
+    """Divide a composed exp-space sum by ``num_steps`` to make it the average.
+
+    Composition sums the factors' unit anchors, so the anchor here is the exact integer
+    ``num_steps`` and ``x / x`` is exactly one: the averaged lattice is ``1 * r**k``, which
+    ``log`` maps to a zero-anchored loss grid.
+    """
+    anchor = dist.grid.anchor
+    if anchor != float(num_steps):
+        raise ValueError(
+            f"composed exp-space anchor {anchor!r} is not the unit-anchored factor count "
+            f"{float(num_steps)!r}; the loss factors were not zero-anchored"
+        )
+    return DenseDiscreteDist(
+        grid=replace(dist.grid, anchor=anchor / num_steps),
+        prob_arr=dist.prob_arr,
+        p_min=dist.p_min,
+        p_max=dist.p_max,
+        domain=dist.domain,
+    )
+
+
 def _align_component_grids(
     *,
     dist_floor: DenseDiscreteDist,
     dist_ceil: DenseDiscreteDist,
     bound_type: BoundType,
 ) -> tuple[DenseDiscreteDist, DenseDiscreteDist]:
-    """Fallback-align floor/ceil grids before the final ``fft_convolve``.
+    """Align floor/ceil grids before the final ``fft_convolve``.
 
-    Proportional budget pre-scaling normally yields equal steps, but max_grid
-    coarsening inside ``compute_base_pld`` can still produce unequal ones.
-    Align to the coarser of the two and warn.
+    Both components descend from one shared ``common_step``, but each divides it by
+    its own stage counts, so the two final steps can land a few ULP apart. An exact
+    match returns immediately; a last-bit difference is reconciled by unifying the
+    declared step without reprojection. A materially different step means the grid
+    cap coarsened one component, which is reported.
     """
-    if stable_isclose(value_1=dist_floor.step, value_2=dist_ceil.step):
+    if dist_floor.step == dist_ceil.step:
         return dist_floor, dist_ceil
-    floor_step_before = dist_floor.step
-    ceil_step_before = dist_ceil.step
-    floor_size_before = dist_floor.prob_arr.size
-    ceil_size_before = dist_ceil.prob_arr.size
-    target_step = max(dist_floor.step, dist_ceil.step)
-    if dist_floor.step < target_step:
-        dist_floor = rediscretize_dist_by_bound(
-            dist=dist_floor,
-            # Alignment must not spend the tail budget a second time.
-            tail_truncation=0.0,
-            loss_discretization=target_step,
-            bound_type=bound_type,
+
+    finer_step = min(dist_floor.step, dist_ceil.step)
+    coarser_step = max(dist_floor.step, dist_ceil.step)
+    if coarser_step <= finer_step * (1.0 + _COMPONENT_STEP_ULP_BAND):
+        return (
+            _with_declared_component_step(dist=dist_floor, target_step=coarser_step),
+            _with_declared_component_step(dist=dist_ceil, target_step=coarser_step),
         )
-    else:
-        dist_ceil = rediscretize_dist_by_bound(
-            dist=dist_ceil,
-            tail_truncation=0.0,
-            loss_discretization=target_step,
-            bound_type=bound_type,
-        )
-    warnings.warn(
-        "allocation_directional_pld: aligning mismatched floor/ceil grids. "
-        f"floor size {floor_size_before}->{dist_floor.prob_arr.size}, "
-        f"step {floor_step_before:.6e}->{dist_floor.step:.6e}; "
-        f"ceil size {ceil_size_before}->{dist_ceil.prob_arr.size}, "
-        f"step {ceil_step_before:.6e}->{dist_ceil.step:.6e}; "
-        f"target_step={target_step:.6e}"
+
+    target_step = coarser_step
+    finer = "floor" if dist_floor.step < target_step else "ceil"
+    source = dist_floor if finer == "floor" else dist_ceil
+    step_before = source.step
+    size_before = source.prob_arr.size
+    coarsened = rediscretize_dist_by_bound(
+        dist=source,
+        tail_truncation=0.0,  # Alignment must not spend the tail budget a second time.
+        loss_discretization=target_step,
+        bound_type=bound_type,
     )
+    if finer == "floor":
+        dist_floor = coarsened
+    else:
+        dist_ceil = coarsened
+
+    if target_step > step_before * (1.0 + _COMPONENT_STEP_ULP_BAND):
+        warnings.warn(
+            "allocation_directional_pld: aligning mismatched floor/ceil grids. "
+            f"{finer} size {size_before}->{coarsened.prob_arr.size}, "
+            f"step {step_before:.6e}->{coarsened.step:.6e}; "
+            f"requested target_step={target_step:.6e}"
+        )
     return dist_floor, dist_ceil
+
+
+def _with_declared_component_step(
+    *,
+    dist: DenseDiscreteDist,
+    target_step: float,
+) -> DenseDiscreteDist:
+    """Unify a last-bit step disagreement without reprojecting the PMF.
+
+    The caller has already established that both steps descend from one common
+    budget and differ only inside ``_COMPONENT_STEP_ULP_BAND``. Retaining the
+    integer indices avoids an additional directional rounding stage.
+    """
+    if dist.step == target_step:
+        return dist
+    return DenseDiscreteDist(
+        grid=replace(dist.grid, step=target_step),
+        prob_arr=dist.prob_arr,
+        p_min=dist.p_min,
+        p_max=dist.p_max,
+        domain=dist.domain,
+    )
 
 
 def _allocation_directional_pld_core(

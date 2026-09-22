@@ -1,34 +1,44 @@
-"""dp_accounting compatibility wrappers for subsampling implementation.
+"""Convert between ``dp_accounting`` PMFs and structured PLDs.
 
-Provides translation between dp_accounting's PrivacyLossDistribution objects
-and this project's structured discrete-distribution API.
+Imports admit only pessimistic PMFs, then classify negative mass, total-mass
+drift, and reciprocal-moment repair under separate caller-visible bands.
 """
 
 from __future__ import annotations
 
 import math
+from itertools import chain
 
 import numpy as np
 from dp_accounting.pld.pld_pmf import DensePLDPmf, PLDPmf, SparsePLDPmf
 
 from PLD_accounting.discrete_dist import (
-    REALIZATION_MOMENT_TOL,
     DenseDiscreteDist,
-    Domain,
+    GridSpec,
     PLDRealization,
+    require_linear_reals_dist,
+    require_zero_anchor,
 )
 from PLD_accounting.distribution_utils import (
-    MAX_SAFE_EXP_ARG,
-    PMF_MASS_TOL,
-    SPACING_ATOL,
-    exp_moment_terms,
+    PMF_MASS_DRIFT_TOL,
+    PMF_TOLERATED_MASS_TOL,
+    classify_residual,
+    enforce_mass_conservation,
+    trim_mass_to_moment_target,
 )
-from PLD_accounting.types import BoundType, SpacingType
-from PLD_accounting.validation import validate_bound_type
+from PLD_accounting.types import BoundType, require_bound_type
 
-# ============================================================================
-# Public conversion adapters
-# ============================================================================
+# Repair ceilings for an uncomposed dp_accounting PMF. The shared drift floor
+# keeps larger repairs visible; composed inputs may require wider ceilings.
+
+# Mass residual.
+DP_ACCOUNTING_MASS_REPAIR_TOL: float = 1e-5
+
+# Mass the reciprocal-moment repair moves to +inf.
+DP_ACCOUNTING_MOMENT_REPAIR_TOL: float = 1e-8
+
+# Negative mass clipped to zero before any repair.
+DP_ACCOUNTING_NEGATIVE_REPAIR_TOL: float = 1e-12
 
 
 def linear_dist_to_dp_accounting_pmf(
@@ -38,49 +48,26 @@ def linear_dist_to_dp_accounting_pmf(
 ) -> DensePLDPmf:
     """Convert a linear-grid loss PMF to a dp_accounting PMF.
 
-    ``DensePLDPmf`` only supports losses on the integer lattice ``k * step``,
-    while ``dist`` has support ``x_0 + i * step`` for an arbitrary ``x_0``.
-    The composition routes are expected to deliver grids already on that
-    lattice -- the GEOM route through anchored composition, the FFT routes
-    through their final aligned rediscretization -- so exact hits (up to fp
-    noise) are the normal case. Should a grid ever arrive off-lattice, it is
-    shifted whole onto the lattice in the direction that preserves the
-    requested bound: up (``ceil``) for a dominating PLD, down (``floor``) for a
-    dominated one. Rounding to the *nearest* lattice point would move losses
-    the wrong way by up to half a step and silently invalidate the bound.
-
-    ``dist.p_min`` (mass at ``-inf``) is not carried into the result: an atom at
-    ``-inf`` contributes zero to ``max(0, 1 - exp(epsilon - loss))`` for every
-    finite epsilon, so it cannot affect any hockey-stick divergence. Only
-    ``dist.p_max`` (mass at ``+inf``) becomes the PMF's infinity mass.
+    The input must use a zero-anchored ``k * step`` grid. Its ``index_0`` becomes
+    ``lower_loss`` and ``p_max`` becomes the infinity mass. ``p_min`` is omitted
+    because negative-infinity loss contributes no hockey-stick divergence.
 
     Args:
-        dist: Linear-grid loss distribution whose origin may be off the
-            integer lattice used by dp_accounting.
-        bound_type: Direction in which the lattice conversion must bound
-            ``dist``. Dominating conversion shifts the grid up; dominated
-            conversion shifts it down.
+        dist: Real-domain linear distribution on ``k * step``.
+        bound_type: Bound recorded by the PMF. A dominating export requires
+            ``p_min`` within ``PMF_TOLERATED_MASS_TOL`` of zero.
 
     Returns:
         dp_accounting DensePLDPmf with infinity mass taken from dist.p_max.
     """
-    if not (isinstance(dist, DenseDiscreteDist) and dist.spacing_type == SpacingType.LINEAR):
-        spacing = getattr(dist, "spacing_type", "?")
-        raise TypeError(
-            "linear_dist_to_dp_accounting_pmf requires DenseDiscreteDist input: "
-            "expected DenseDiscreteDist with LINEAR spacing, "
-            f"got {type(dist).__name__} with spacing {spacing}"
-        )
-    validate_bound_type(bound_type)
-    if dist.domain != Domain.REALS:
-        raise ValueError("dp_accounting PMF conversion requires a real-domain loss distribution")
-    if bound_type == BoundType.DOMINATES and dist.p_min > PMF_MASS_TOL:
+    require_linear_reals_dist(dist=dist, name="dist")
+    require_bound_type(value=bound_type)
+    if bound_type == BoundType.DOMINATES and dist.p_min > PMF_TOLERATED_MASS_TOL:
         raise ValueError("Dominating PMF conversion requires p_min = 0")
 
-    ratio = dist.x_0 / dist.step
-    base_index = int(np.rint(ratio))
-    if abs(dist.x_0 - base_index * dist.step) > SPACING_ATOL:
-        base_index = math.ceil(ratio) if bound_type == BoundType.DOMINATES else math.floor(ratio)
+    # Zero-anchored by contract, so the lattice index is the export index, exactly.
+    grid = require_zero_anchor(grid=dist.grid, name="dist.grid")
+    base_index = grid.index_0
     return DensePLDPmf(
         discretization=dist.step,
         lower_loss=base_index,
@@ -90,30 +77,107 @@ def linear_dist_to_dp_accounting_pmf(
     )
 
 
-def dp_accounting_pmf_to_pld_realization(pmf: PLDPmf) -> PLDRealization:
-    """Convert a dp_accounting PMF to a linear-grid PLD realization.
+def dp_accounting_pmf_to_pld_realization(
+    *,
+    pmf: PLDPmf,
+    mass_drift_tol: float = PMF_MASS_DRIFT_TOL,
+    mass_repair_tol: float = DP_ACCOUNTING_MASS_REPAIR_TOL,
+    moment_drift_tol: float = PMF_MASS_DRIFT_TOL,
+    moment_repair_tol: float = DP_ACCOUNTING_MOMENT_REPAIR_TOL,
+    negative_drift_tol: float = PMF_MASS_DRIFT_TOL,
+    negative_repair_tol: float = DP_ACCOUNTING_NEGATIVE_REPAIR_TOL,
+) -> PLDRealization:
+    """Convert a pessimistic dp_accounting PMF to a linear-grid PLD realization.
+
+    Negative finite and infinity mass are clipped to zero without an upper clip,
+    total mass is repaired directionally, and reciprocal-moment excess is moved
+    to ``+inf``. Repairs above their drift band warn; repairs at or above their
+    ceiling raise. Defaults cover an uncomposed PMF, so composed inputs may need
+    wider ceilings.
 
     Args:
-        pmf: dp_accounting DensePLDPmf or SparsePLDPmf to convert.
+        pmf: Dense or sparse pessimistic dp_accounting PMF.
+        mass_drift_tol: Mass residual normalized away as noise.
+        mass_repair_tol: Mass residual that rejects the input.
+        moment_drift_tol: Moment-repair mass movement treated as noise.
+        moment_repair_tol: Moment-repair mass movement that rejects the input.
+        negative_drift_tol: Negative mass clipped to zero as noise.
+        negative_repair_tol: Negative mass that rejects the input.
 
     Returns:
-        PLDRealization on a uniform linear grid with infinity mass in
-        p_max and p_min set to 0.
+        A zero-anchored ``PLDRealization`` satisfying the package invariants.
     """
-    x_min, discretization, probs_dense, x_values, inf_mass = _pmf_to_dense_components(pmf)
-    probs_dense, inf_mass = _normalize_finite_mass(probs=probs_dense, inf_mass=inf_mass)
-    probs_dense, inf_mass = _ensure_exp_moment_upper(
-        probs=probs_dense,
-        x_values=x_values,
-        inf_mass=inf_mass,
+    require_importable_dp_accounting_pmf(pmf)
+    grid, probs_dense, inf_mass = _pmf_to_dense_components(pmf)
+    # The moment repair and the realization both take their losses from this one grid,
+    # so they cannot disagree about a coordinate.
+    x_values = grid.materialize()
+
+    classify_residual(
+        residual=math.fsum(
+            chain(
+                (float(-value) for value in probs_dense[probs_dense < 0.0]),
+                (float(-inf_mass),) if inf_mass < 0.0 else (),
+            )
+        ),
+        drift_tol=negative_drift_tol,
+        repair_tol=negative_repair_tol,
+        context="dp_accounting import negative mass",
+        repair="clipping it to zero",
     )
+    probs_dense = np.maximum(probs_dense, 0.0)
+    inf_mass = max(inf_mass, 0.0)
+
+    # Repair total mass before the moment, because finite mass contributes to both.
+    probs_dense, _p_min, inf_mass = enforce_mass_conservation(
+        prob_arr=probs_dense,
+        expected_p_min=0.0,
+        expected_p_max=inf_mass,
+        bound_type=BoundType.DOMINATES,
+        drift_tol=mass_drift_tol,
+        repair_tol=mass_repair_tol,
+        context="dp_accounting import mass",
+    )
+    # Restore the moment invariant, then classify the mass this repair moved.
+    repaired_probs, repaired_inf_mass = trim_mass_to_moment_target(
+        prob_arr=probs_dense,
+        loss=x_values,
+        p_max=inf_mass,
+        context="dp_accounting import reciprocal moment",
+    )
+    moved_mass = repaired_inf_mass - inf_mass
+    classify_residual(
+        residual=moved_mass,
+        drift_tol=moment_drift_tol,
+        repair_tol=moment_repair_tol,
+        context="dp_accounting import reciprocal moment",
+        repair="moving finite mass to +inf",
+    )
+    probs_dense, inf_mass = repaired_probs, repaired_inf_mass
+
+    # The constructor validates unit mass against PMF_TOLERATED_MASS_TOL and the
+    # reciprocal moment against REALIZATION_MOMENT_TOL, so the repairs above are
+    # checked by construction; a separate postcondition would restate it.
     return PLDRealization(
-        x_0=x_min,
-        step=discretization,
+        grid=grid,
         prob_arr=probs_dense,
         p_max=inf_mass,
         p_min=0.0,
     )
+
+
+def require_importable_dp_accounting_pmf(pmf: object) -> PLDPmf:
+    """Reject an unsupported representation or an optimistic dp_accounting PMF."""
+    if not isinstance(pmf, (DensePLDPmf, SparsePLDPmf)):
+        raise TypeError(
+            f"Unrecognized PMF format: {type(pmf)}. Expected DensePLDPmf or SparsePLDPmf."
+        )
+    if getattr(pmf, "_pessimistic_estimate") is not True:
+        raise ValueError(
+            "An optimistic dp_accounting PMF does not map to either package BoundType. "
+            "Only pessimistic PMFs can be imported."
+        )
+    return pmf
 
 
 # ============================================================================
@@ -121,10 +185,8 @@ def dp_accounting_pmf_to_pld_realization(pmf: PLDPmf) -> PLDRealization:
 # ============================================================================
 
 
-def _pmf_to_dense_components(
-    pmf: PLDPmf,
-) -> tuple[float, float, np.ndarray, np.ndarray, float]:
-    """Densify a dp_accounting PMF into a uniform loss grid."""
+def _pmf_to_dense_components(pmf: PLDPmf) -> tuple[GridSpec, np.ndarray, float]:
+    """Densify a dp_accounting PMF on its zero-anchored integer lattice."""
     if isinstance(pmf, DensePLDPmf):
         lower_index = int(pmf._lower_loss)
         probs_dense = np.asarray(pmf._probs, dtype=np.float64).copy()
@@ -142,73 +204,14 @@ def _pmf_to_dense_components(
         for idx, prob in zip(loss_indices, probs_sparse):
             probs_dense[int(idx - lower_index)] = float(prob)
     else:
-        raise AttributeError(
+        raise TypeError(
             f"Unrecognized PMF format: {type(pmf)}. Expected DensePLDPmf or SparsePLDPmf."
         )
 
-    discretization = float(pmf._discretization)
-    x_min = float(lower_index) * discretization
-    x_values = x_min + discretization * np.arange(probs_dense.size, dtype=np.float64)
-    return x_min, discretization, probs_dense, x_values, float(pmf._infinity_mass)
-
-
-def _normalize_finite_mass(*, probs: np.ndarray, inf_mass: float) -> tuple[np.ndarray, float]:
-    """Clip probabilities and adjust inf_mass so total mass equals exactly 1.
-
-    Clipping negative entries to 0 can reduce the finite sum below ``1 - inf_mass``.
-    Any such deficit is conservatively routed to ``inf_mass`` (i.e. ``p_max``),
-    which is safe under DOMINATES semantics.  Excess finite mass is scaled down.
-    """
-    probs = np.clip(np.asarray(probs, dtype=np.float64), 0.0, 1.0)
-    inf_mass = float(np.clip(inf_mass, 0.0, 1.0))
-    sum_probs = math.fsum(map(float, probs))
-    finite_target = max(0.0, 1.0 - inf_mass)
-    if sum_probs > finite_target:
-        probs = probs * (finite_target / sum_probs)
-    elif sum_probs < finite_target:
-        # Deficit from clipped negatives: add to inf_mass to conserve total mass.
-        inf_mass += finite_target - sum_probs
-    return probs, inf_mass
-
-
-def _ensure_exp_moment_upper(
-    *,
-    probs: np.ndarray,
-    x_values: np.ndarray,
-    inf_mass: float,
-) -> tuple[np.ndarray, float]:
-    """Enforce ``E[exp(-L)] <= 1`` by removing mass from the lowest-loss bins.
-
-    Removed mass is routed to ``p_max``, which is conservative for DOMINATES
-    semantics. Uses cumsum + ``searchsorted`` to locate the pivot bin in one pass.
-    """
-    if probs.size == 0:
-        return probs, inf_mass
-
-    contributions = exp_moment_terms(prob_arr=probs, x_vals=x_values)
-    exp_moment_val = math.fsum(map(float, contributions))
-    if exp_moment_val <= 1.0:
-        return probs, inf_mass
-
-    # Add a buffer of REALIZATION_MOMENT_TOL so floating-point rounding in the
-    # repair itself cannot leave a residual that still fails validation.
-    excess = exp_moment_val - 1.0 + REALIZATION_MOMENT_TOL
-    cumsum = np.cumsum(contributions, dtype=np.float64)
-    pivot = int(np.searchsorted(cumsum, excess, side="left"))
-    prior = math.fsum(map(float, contributions[:pivot]))
-    delta_contribution = max(0.0, excess - prior)
-
-    if delta_contribution == 0.0:
-        delta_mass = 0.0
-    elif x_values[pivot] < -MAX_SAFE_EXP_ARG:
-        delta_mass = math.exp(math.log(delta_contribution) + float(x_values[pivot]))
-    else:
-        delta_mass = delta_contribution / math.exp(-float(x_values[pivot]))
-    delta_mass = min(max(0.0, delta_mass), float(probs[pivot]))
-
-    new_probs = probs.copy()
-    new_probs[:pivot] = 0.0
-    new_probs[pivot] = max(0.0, float(probs[pivot]) - delta_mass)
-    removed_mass = math.fsum(map(float, probs[:pivot])) + delta_mass
-    new_inf_mass = inf_mass + removed_mass
-    return new_probs, new_inf_mass
+    inf_mass = float(pmf._infinity_mass)
+    grid = GridSpec(
+        step=float(pmf._discretization),
+        n=probs_dense.size,
+        index_0=lower_index,
+    )
+    return grid, probs_dense, inf_mass

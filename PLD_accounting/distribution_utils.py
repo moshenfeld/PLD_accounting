@@ -1,23 +1,42 @@
-"""Utility functions for distribution combination and regridding."""
+"""Mass, moment and summation primitives shared by every distribution operation.
+
+Mass conservation and residual policy, reciprocal-moment repair, compensated
+accumulation, and edge truncation. All work on bare arrays, so they can be used
+before a distribution object exists.
+
+Repairs take their admission band from the caller rather than choosing one: the
+operation that owns the budget decides what counts as tolerable drift.
+"""
 
 from __future__ import annotations
 
 import math
+import warnings
+from itertools import chain
 
 import numpy as np
 from numpy.typing import NDArray
 
 from PLD_accounting.types import BoundType, optional_njit
-from PLD_accounting.validation import validate_discrete_pmf_and_boundaries
+from PLD_accounting.validation import (
+    require_closed_unit_interval,
+    require_nonnegative_masses,
+)
 
-PMF_MASS_TOL = 10 * np.finfo(float).eps  # total-mass tolerance (10× machine epsilon)
-SPACING_ATOL = 1e-12
-SPACING_RTOL = 1e-6
-MIN_GRID_SIZE = 100  # Minimum number of points in a discretization grid.
+# Drift is repaired silently; larger repairs are directional and warn.
+# Units: probability mass.
+# These bands assume a compensated producer (``math.fsum`` /
+# ``compensated_segmented_sum``). An uncompensated producer such as FFT must pass an
+# explicit size-scaled pair from ``_fft_mass_tolerances``; inheriting this default
+# without scaling raises inside the repair helper.
+PMF_MASS_DRIFT_TOL: float = float(4 * np.finfo(float).eps)
+PMF_TOLERATED_MASS_TOL: float = float(10 * np.finfo(float).eps)
+MIN_GRID_SIZE = 100
 MAX_SAFE_EXP_ARG = math.log(np.finfo(np.float64).max)
 
+
 # =============================================================================
-# Public Utility Functions
+# Mass Conservation and Residual Policy
 # =============================================================================
 
 
@@ -27,183 +46,200 @@ def enforce_mass_conservation(
     expected_p_min: float,
     expected_p_max: float,
     bound_type: BoundType,
+    drift_tol: float = PMF_MASS_DRIFT_TOL,
+    repair_tol: float = PMF_TOLERATED_MASS_TOL,
+    context: str = "enforce_mass_conservation",
 ) -> tuple[NDArray[np.float64], float, float]:
-    """Enforce total mass with one bound-type-selected boundary held fixed.
+    """Enforce total mass, holding the bound-type-selected boundary fixed.
 
-    - ``DOMINATES`` enforces ``expected_p_max``.
-    - ``IS_DOMINATED`` enforces ``expected_p_min``.
-
-    Excess mass is removed directionally over an extended array that includes the
-    opposite boundary, matching the truncation logic:
-    - ``DOMINATES`` trims from the left over ``[p_min, *prob_arr]``.
-    - ``IS_DOMINATED`` trims from the right over ``[*prob_arr, p_max]``.
-
-    Callers must include genuine omitted support in ``expected_p_min`` or
-    ``expected_p_max``. Any remaining numerical slack is assigned to the
-    directionally conservative finite edge.
+    ``DOMINATES`` fixes ``p_max`` and repairs from the low-loss side of
+    ``[p_min, *prob_arr]``; ``IS_DOMINATED`` fixes ``p_min`` and repairs from
+    the high-loss side of ``[*prob_arr, p_max]``. Callers must include genuine
+    omitted support in the expected boundaries. Residuals below ``drift_tol``
+    are repaired silently; larger admitted repairs warn.
     """
+    if not 0.0 <= drift_tol <= repair_tol:
+        raise ValueError(
+            f"require 0 <= drift_tol <= repair_tol, got drift_tol={drift_tol:.3e}, "
+            f"repair_tol={repair_tol:.3e}"
+        )
     prob_arr = np.asarray(prob_arr, dtype=np.float64).copy()
-    validate_discrete_pmf_and_boundaries(
-        prob_arr,
-        expected_p_min,
-        expected_p_max,
+    # Clamp boundary overshoot first so a float that landed just outside [0, 1] is
+    # admitted before the nonnegative check sees it. Callers then use the coerced
+    # values; neither branch below range-checks or clamps again.
+    expected_p_min, expected_p_max = require_closed_unit_interval(
+        value=[expected_p_min, expected_p_max],
+        name=["expected_p_min", "expected_p_max"],
+        atol=PMF_TOLERATED_MASS_TOL,
     )
-
-    total_mass = math.fsum(map(float, prob_arr)) + expected_p_min + expected_p_max
+    require_nonnegative_masses(prob_arr=prob_arr, p_min=expected_p_min, p_max=expected_p_max)
+    total_mass = 1.0 - signed_unit_residual(
+        values=prob_arr, lower_term=expected_p_min, upper_term=expected_p_max
+    )
     if total_mass <= 0.0:
         raise ValueError("Cannot enforce mass conservation with zero total mass")
 
     if bound_type == BoundType.DOMINATES:
-        if expected_p_max > 1.0 + PMF_MASS_TOL:
-            raise ValueError("Expected p_max cannot exceed 1 beyond numerical tolerance")
-        expected_p_max = min(expected_p_max, 1.0)
-        # Keep semantic upper-boundary mass fixed; the array holds all other mass.
+        # Hold semantic p_max fixed; every other mass is giveable from the left.
+        fixed_boundary = expected_p_max
         extended = np.concatenate(([expected_p_min], prob_arr))
-        target_mass = 1.0 - expected_p_max
-        current_mass = math.fsum(map(float, extended))
-        excess = current_mass - target_mass
-        if excess > 0:
-            if excess < PMF_MASS_TOL:
-                # Tiny excess is accepted as floating-point noise; proportional
-                # scaling avoids creating a directional artifact at one bin.
-                extended = extended * (target_mass / current_mass)
-            else:
-                # Remove material excess from the low-loss side.
-                extended = _zero_mass(values=extended, mass=excess, from_left=True, exact=True)
-        current_mass = math.fsum(map(float, extended))
-        deficit = max(0.0, target_mass - current_mass)
-        # Put numerical deficit in the largest finite-loss bin.
-        extended[-1] += deficit
-        return (
-            extended[1:].copy(),
-            float(extended[0]),
-            expected_p_max,
-        )
-
-    if bound_type == BoundType.IS_DOMINATED:
-        if expected_p_min > 1.0 + PMF_MASS_TOL:
-            raise ValueError("Expected p_min cannot exceed 1 beyond numerical tolerance")
-        expected_p_min = min(expected_p_min, 1.0)
-        # Keep semantic lower-boundary mass fixed; the array holds all other mass.
+        from_left, deficit_edge = True, -1
+    elif bound_type == BoundType.IS_DOMINATED:
+        # Hold semantic p_min fixed; every other mass is giveable from the right.
+        fixed_boundary = expected_p_min
         extended = np.concatenate((prob_arr, [expected_p_max]))
-        target_mass = 1.0 - expected_p_min
-        current_mass = math.fsum(map(float, extended))
-        excess = current_mass - target_mass
-        if excess > 0:
-            if excess < PMF_MASS_TOL:
-                # Tiny excess is accepted as floating-point noise; proportional
-                # scaling avoids creating a directional artifact at one bin.
-                extended = extended * (target_mass / current_mass)
-            else:
-                # Remove material excess from the high-loss side.
-                extended = _zero_mass(values=extended, mass=excess, from_left=False, exact=True)
-        current_mass = math.fsum(map(float, extended))
-        deficit = max(0.0, target_mass - current_mass)
-        # Put numerical deficit in the smallest finite-loss bin.
-        extended[0] += deficit
-        return (
-            extended[:-1].copy(),
-            expected_p_min,
-            float(extended[-1]),
-        )
-
-    raise ValueError(
-        f"Invalid bound_type: {bound_type}. Must be BoundType.DOMINATES or BoundType.IS_DOMINATED."
-    )
-
-
-def compute_bin_ratio_two_arrays(
-    *, x_array_1: NDArray[np.float64], x_array_2: NDArray[np.float64]
-) -> float:
-    """Compute geometric spacing ratio for two grids and return their average."""
-    r1 = compute_bin_ratio(x_array_1)
-    r2 = compute_bin_ratio(x_array_2)
-    if not stable_isclose(value_1=r1, value_2=r2):
-        raise ValueError(f"Grid ratios must match: ratio_1={r1:.12g}, ratio_2={r2:.12g}")
-    return (r1 + r2) / 2
-
-
-def compute_bin_width_two_arrays(
-    *, x_array_1: NDArray[np.float64], x_array_2: NDArray[np.float64]
-) -> float:
-    """Compute linear spacing width for two grids and return their average."""
-    w1 = compute_bin_width(x_array_1)
-    w2 = compute_bin_width(x_array_2)
-    if not stable_isclose(value_1=w1, value_2=w2):
-        raise ValueError(f"Grid spacing must match: w1={w1:.12g} vs w2={w2:.12g}")
-    return (w1 + w2) / 2
-
-
-# =============================================================================
-# Grid Spacing Utilities
-# =============================================================================
-
-
-def compute_bin_ratio(x_array: NDArray[np.float64]) -> float:
-    """Compute geometric spacing ratio for a grid."""
-    if x_array.size < 2:
-        raise ValueError("Cannot compute geometric bin ratio with less than 2 bins")
-    if np.any(x_array <= 0):
-        raise ValueError("Cannot compute geometric bin ratio for non-positive values")
-    log_ratios = np.log(x_array[1:] / x_array[:-1])
-    med_log_ratio = np.median(log_ratios)
-    if not np.allclose(med_log_ratio, log_ratios, rtol=SPACING_RTOL, atol=SPACING_ATOL):
-        max_diff = np.max(np.abs(med_log_ratio - log_ratios))
+        from_left, deficit_edge = False, 0
+    else:
         raise ValueError(
-            "Distribution has non-uniform bin widths: "
-            f"median_ratio={np.median(log_ratios)}, max_diff={max_diff}"
+            f"Invalid bound_type: {bound_type}. "
+            "Must be BoundType.DOMINATES or BoundType.IS_DOMINATED."
         )
-    return np.exp(med_log_ratio)
 
-
-def compute_bin_width(x_array: NDArray[np.float64]) -> float:
-    """Compute linear spacing width for a grid."""
-    if x_array.size < 2:
-        raise ValueError("Cannot compute width with less than 2 bins")
-    diffs = np.diff(x_array)
-    median_diff = np.median(diffs)
-    if not np.allclose(median_diff, diffs, rtol=SPACING_RTOL, atol=SPACING_ATOL):
-        max_diff = np.max(np.abs(median_diff - diffs))
-        raise ValueError(
-            "Distribution has non-uniform bin widths: "
-            f"median_diff={median_diff}, max diff={max_diff}"
+    # One residual, repaired in whichever direction it points: negative is surplus mass,
+    # positive a shortfall.
+    residual = signed_unit_residual(values=extended, lower_term=0.0, upper_term=fixed_boundary)
+    if residual != 0.0:
+        # The bands judge what the caller handed in, so they are applied once, here.
+        classify_residual(
+            residual=abs(residual),
+            drift_tol=drift_tol,
+            repair_tol=repair_tol,
+            context=context,
+            repair=(
+                "trimming it from the giveable edge"
+                if residual < 0.0
+                else "assigning it to the conservative edge"
+            ),
         )
-    return float(median_diff)
+
+    if residual < 0.0:
+        # Surplus: give it back from the edge this bound type is free to move.
+        extended = _drain_mass_from_edge(
+            values=extended, mass=-residual, from_left=from_left, exact=True
+        )
+        residual = signed_unit_residual(values=extended, lower_term=0.0, upper_term=fixed_boundary)
+
+    if residual > 0.0:
+        # Shortfall, either the caller's or the split remainder above.
+        extended[deficit_edge] += residual
+
+    if bound_type == BoundType.DOMINATES:
+        return extended[1:].copy(), float(extended[0]), fixed_boundary
+    return extended[:-1].copy(), fixed_boundary, float(extended[-1])
 
 
-# =============================================================================
-# Numerical Stability Utilities
-# =============================================================================
-
-
-@optional_njit()
-def kahan_reverse_exclusive_cumsum(
-    values: NDArray[np.float64],
+def trim_mass_from_edge(
+    *,
+    prob_arr: NDArray[np.float64],
+    mass: float,
+    from_left: bool,
 ) -> NDArray[np.float64]:
-    """Compute ``out[i] = sum(values[i + 1:])`` with Kahan summation."""
-    n = len(values)
-    ccdf = np.zeros(n, dtype=np.float64)
-    running_sum = 0.0
-    compensation = 0.0
-    for i in range(n - 1, -1, -1):
-        ccdf[i] = running_sum
-        y = values[i] - compensation
-        updated = running_sum + y
-        compensation = (updated - running_sum) - y
-        running_sum = updated
-    return ccdf
-
-
-def stable_isclose(*, value_1: float, value_2: float) -> bool:
-    """Consistent closeness check using shared spacing tolerances."""
-    return bool(np.isclose(value_1, value_2, rtol=SPACING_RTOL, atol=SPACING_ATOL))
-
-
-def stable_array_equal(*, value_1: NDArray[np.float64], value_2: NDArray[np.float64]) -> bool:
-    """Consistent array closeness check using shared spacing tolerances."""
-    return value_1.shape == value_2.shape and np.allclose(
-        value_1, value_2, rtol=SPACING_RTOL, atol=SPACING_ATOL
+    """Return a copy with exactly ``mass`` removed from one support edge."""
+    return _drain_mass_from_edge(
+        values=np.asarray(prob_arr, dtype=np.float64).copy(),
+        mass=mass,
+        from_left=from_left,
+        exact=True,
     )
+
+
+def signed_unit_residual(
+    *,
+    values: NDArray[np.float64],
+    lower_term: float,
+    upper_term: float,
+) -> float:
+    """Return ``1 - (lower_term + sum(values) + upper_term)`` using ``math.fsum``."""
+    return math.fsum(
+        chain(
+            (1.0, -float(lower_term), -float(upper_term)),
+            (-float(value) for value in np.asarray(values, dtype=np.float64)),
+        )
+    )
+
+
+def classify_residual(
+    *,
+    residual: float,
+    drift_tol: float,
+    repair_tol: float,
+    context: str,
+    repair: str,
+) -> None:
+    """Admit drift silently, warn for repair, and raise at the ceiling."""
+    if not 0.0 <= drift_tol <= repair_tol:
+        raise ValueError(
+            f"require 0 <= drift_tol <= repair_tol, got drift_tol={drift_tol:.3e}, "
+            f"repair_tol={repair_tol:.3e}"
+        )
+    if residual >= repair_tol:
+        raise ValueError(
+            f"{context}: residual {residual:.6e} exceeds the repair tolerance "
+            f"{repair_tol:.3e}. A residual this large is outside the declared numerical "
+            "repair policy."
+        )
+    if residual < drift_tol:
+        return
+    warnings.warn(
+        f"{context}: residual {residual:.3e} exceeds the drift tolerance "
+        f"{drift_tol:.3e}; {repair}.",
+        RuntimeWarning,
+        stacklevel=4,
+    )
+
+
+# =============================================================================
+# Reciprocal-Moment Repair
+# =============================================================================
+
+
+def trim_mass_to_moment_target(
+    *,
+    prob_arr: NDArray[np.float64],
+    loss: NDArray[np.float64],
+    p_max: float,
+    target_residual: float = 0.0,
+    max_removed: float | None = None,
+    context: str = "moment repair",
+) -> tuple[NDArray[np.float64], float]:
+    """Trim low-loss mass until the reciprocal residual reaches its target.
+
+    Removed mass is banked at ``p_max``. A target of zero restores the PLD
+    invariant; a positive target surrenders additional moment required by the
+    caller's semantics. Pass ``p_max=0`` to read the movement from the return value.
+    """
+    original = np.asarray(prob_arr, dtype=np.float64)
+    loss = np.asarray(loss, dtype=np.float64)
+    if original.shape != loss.shape:
+        raise ValueError("prob_arr and loss must have the same shape")
+    target_residual = require_closed_unit_interval(value=target_residual, name="target_residual")
+
+    repaired = original.copy()
+    moment_terms = exp_moment_terms(prob_arr=repaired, x_vals=loss)
+    residual = signed_unit_residual(values=moment_terms, lower_term=0.0, upper_term=0.0)
+    if residual >= target_residual:
+        return repaired, p_max
+
+    _drain_moment_from_left(
+        prob_arr=repaired,
+        loss=loss,
+        contributions=moment_terms,
+        moment=target_residual - residual,
+    )
+    residual = signed_unit_residual(
+        values=exp_moment_terms(prob_arr=repaired, x_vals=loss),
+        lower_term=0.0,
+        upper_term=0.0,
+    )
+    if residual < target_residual:
+        raise ValueError(
+            f"{context} did not reach residual {target_residual:.3e}: still at {residual:.3e}"
+        )
+
+    moved = math.fsum(map(float, original - repaired))
+    if max_removed is not None and moved > max_removed:
+        raise ValueError(f"{context} moved {moved:.3e} of mass, above the {max_removed:.3e} cap")
+    return repaired, p_max + moved
 
 
 def exp_moment_terms(
@@ -211,13 +247,11 @@ def exp_moment_terms(
     prob_arr: NDArray[np.float64],
     x_vals: NDArray[np.float64],
 ) -> NDArray[np.float64]:
-    """Return per-bin contributions to ``E[exp(-X)]``.
+    """Return per-bin contributions ``p * exp(-x)`` without avoidable overflow.
 
-    For very negative ``x_vals`` the naive product ``p * exp(-x)`` can overflow
-    even when the combined term is representable. In that regime we evaluate the
-    contribution as ``exp(log(p) - x)`` instead.
-
-    Terms that still exceed float64 range are returned as ``inf``.
+    When ``exp(-x)`` alone overflows but the product is representable, evaluate
+    it as ``exp(log(p) - x)``. A combined term beyond float64 range remains
+    ``inf`` so callers can reject the invalid moment rather than silently clip it.
     """
     prob_arr = np.asarray(prob_arr, dtype=np.float64)
     x_vals = np.asarray(x_vals, dtype=np.float64)
@@ -241,67 +275,208 @@ def exp_moment_terms(
 
 
 # =============================================================================
+# Compensated Accumulation
+# =============================================================================
+
+
+@optional_njit()
+def compensated_segmented_sum(
+    *,
+    bin_index: NDArray[np.intp],
+    weights: NDArray[np.float64],
+    num_bins: int,
+) -> NDArray[np.float64]:
+    """Sum ``weights`` into bins with per-bin Kahan accumulation, in ``O(n + num_bins)``."""
+    weights = np.asarray(weights, dtype=np.float64)
+    bin_index = np.asarray(bin_index, dtype=np.intp)
+    if bin_index.shape != weights.shape:
+        raise ValueError("bin_index and weights must have the same shape")
+    if num_bins < 0:
+        raise ValueError(f"num_bins must be non-negative, got {num_bins}")
+    totals = np.zeros(num_bins, dtype=np.float64)
+    if weights.size == 0:
+        return totals
+    if bin_index.min() < 0 or bin_index.max() >= num_bins:
+        raise ValueError(
+            f"bin_index out of range for num_bins={num_bins}: "
+            f"min={int(bin_index.min())}, max={int(bin_index.max())}"
+        )
+
+    compensations = np.zeros(num_bins, dtype=np.float64)
+    for i in range(weights.size):
+        bin_id = bin_index[i]
+        y = weights[i] - compensations[bin_id]
+        updated = totals[bin_id] + y
+        compensations[bin_id] = (updated - totals[bin_id]) - y
+        totals[bin_id] = updated
+    return totals
+
+
+@optional_njit()
+def kahan_reverse_exclusive_cumsum(
+    values: NDArray[np.float64],
+) -> NDArray[np.float64]:
+    """Compute ``out[i] = sum(values[i + 1:])`` with Kahan summation."""
+    n = len(values)
+    ccdf = np.zeros(n, dtype=np.float64)
+    running_sum = 0.0
+    compensation = 0.0
+    for i in range(n - 1, -1, -1):
+        ccdf[i] = running_sum
+        y = values[i] - compensation
+        updated = running_sum + y
+        compensation = (updated - running_sum) - y
+        running_sum = updated
+    return ccdf
+
+
+# =============================================================================
 # Distribution Edge Truncation
 # =============================================================================
 
 
 def compute_truncation(
+    *,
     prob_arr: NDArray[np.float64],
     p_min: float,
     p_max: float,
     tail_truncation: float,
     bound_type: BoundType,
 ) -> tuple[NDArray[np.float64], float, float, int, int]:
-    """Compute truncated distribution parameters without creating objects.
+    """Return truncated masses and their surviving range in ``prob_arr``.
 
-    Algorithm:
-      A. Remove leading/trailing zeros from PMF (always done).
-      B. If tail_truncation > 0:
-         - Compute how much to consume from each side (up to tail_truncation).
-         - For DOMINATES:    Operate over the [p_min, *prob_arr] range.
-                             Left tail folds into first remaining element;
-                             right tail goes to p_max.
-         - For IS_DOMINATED: Operate over the [*prob_arr, p_max] range.
-                             Right tail folds into last remaining element;
-                             left tail goes to p_min;
-      C. Apply step A again to remove any newly created leading/trailing zeros.
-
-    Returns:
-        (new_prob_arr, new_p_min, new_p_max, min_ind, max_ind) where min_ind and
-        max_ind are indices into the original prob_arr.
+    For ``DOMINATES``, removed left mass folds into the first retained value and
+    removed right mass moves to ``p_max``; ``IS_DOMINATED`` applies the mirror
+    policy. Zero edges are stripped once at the end -- including any the
+    truncation itself created -- so the returned indices span the surviving
+    nonzero range of the original array.
     """
-    # Remove zero probability tails to reduce unnecessary computations
-    inner_min, inner_max = _strip_zero_edges(prob_arr)
-    trimmed_prob_arr = prob_arr[slice(inner_min, inner_max + 1)].copy()
-
     if tail_truncation == 0.0:
-        return trimmed_prob_arr.copy(), p_min, p_max, inner_min, inner_max
-
-    if bound_type == BoundType.DOMINATES:
+        prob_arr_out, p_min_out, p_max_out = prob_arr, p_min, p_max
+    elif bound_type == BoundType.DOMINATES:
         prob_arr_out, p_min_out, p_max_out = _truncate_dominating_edges(
-            trimmed_prob_arr, p_min, p_max, tail_truncation
+            prob_arr=prob_arr,
+            p_min=p_min,
+            p_max=p_max,
+            tail_truncation=tail_truncation,
         )
     elif bound_type == BoundType.IS_DOMINATED:
         prob_arr_out, p_min_out, p_max_out = _truncate_dominated_edges(
-            trimmed_prob_arr, p_min, p_max, tail_truncation
+            prob_arr=prob_arr,
+            p_min=p_min,
+            p_max=p_max,
+            tail_truncation=tail_truncation,
         )
     else:
         raise ValueError(f"Unknown BoundType: {bound_type}")
 
-    # Remove zero probability tails to reduce unnecessary computations
-    inner_min_new, inner_max_new = _strip_zero_edges(prob_arr_out)
-    min_ind_new = inner_min + inner_min_new
-    max_ind_new = inner_min + inner_max_new
+    # One strip, after whatever the routing did. Stripping first would be redundant:
+    # leading zeros contribute nothing to the cumulative scan, so they cannot move the
+    # pivot, and the mass folds into the first *nonzero* bin either way.
+    nonzero = np.nonzero(prob_arr_out)[0]
+    if nonzero.size == 0:
+        raise ValueError("Cannot truncate distribution with zero finite mass")
+    inner_min, inner_max = int(nonzero[0]), int(nonzero[-1])
     return (
-        prob_arr_out[slice(inner_min_new, inner_max_new + 1)].copy(),
+        prob_arr_out[slice(inner_min, inner_max + 1)].copy(),
         p_min_out,
         p_max_out,
-        min_ind_new,
-        max_ind_new,
+        inner_min,
+        inner_max,
     )
 
 
+# =============================================================================
+# Internal Helper Functions
+# =============================================================================
+
+
+def _drain_mass_from_edge(
+    *,
+    values: NDArray[np.float64],
+    mass: float,
+    from_left: bool,
+    exact: bool,
+) -> NDArray[np.float64]:
+    """Remove mass inward from one edge of ``values``, in place.
+
+    ``exact`` also part-debits the bin the target falls inside, so precisely ``mass``
+    comes off; otherwise that bin is left whole.
+    """
+    if mass <= 0.0:
+        return values
+    total_mass = math.fsum(map(float, values))
+    if mass >= total_mass:
+        raise ValueError(
+            "mass must be smaller than total array mass, "
+            f"got mass={mass:.12g}, total={total_mass:.12g}"
+        )
+
+    # Mirror a right-edge removal so the scan always runs left to right.
+    if not from_left:
+        values = values[::-1]
+
+    cumsum = np.cumsum(values, dtype=np.float64)
+    pivot = int(np.searchsorted(cumsum, mass, side="left" if exact else "right"))
+    pivot = min(pivot, values.size - 1)
+    removed_before = float(cumsum[pivot - 1]) if pivot > 0 else 0.0
+    if pivot > 0:
+        values[:pivot] = 0.0
+    if exact:
+        values[pivot] = max(0.0, values[pivot] - (mass - removed_before))
+
+    if not from_left:
+        values = values[::-1]
+    return values
+
+
+def _drain_moment_from_left(
+    *,
+    prob_arr: NDArray[np.float64],
+    loss: NDArray[np.float64],
+    contributions: NDArray[np.float64],
+    moment: float,
+) -> None:
+    """Remove ``moment`` from the low-loss edge of ``prob_arr``, in place.
+
+    ``contributions`` is ``exp_moment_terms`` for the current ``prob_arr``, which the
+    caller has already built to measure the residual. A request the law cannot supply
+    raises rather than draining everything: surrendering the whole law would satisfy
+    any target while leaving a vacuous result.
+    """
+    if moment >= math.fsum(map(float, contributions)):
+        raise ValueError(f"Reciprocal-moment shortfall {moment:.3e} exceeds the law's total moment")
+
+    cumulative = np.cumsum(contributions, dtype=np.float64)
+    # cumsum is uncompensated, so it can land just short of a target fsum admits above.
+    pivot = min(int(np.searchsorted(cumulative, moment, side="left")), prob_arr.size - 1)
+    remainder = max(0.0, moment - math.fsum(map(float, contributions[:pivot])))
+    prob_arr[:pivot] = 0.0
+    if remainder > 0.0:
+        loss_at_pivot = float(loss[pivot])
+        # Mass per unit of moment. The direct product is ~10x more accurate here than
+        # ``exp(log(remainder) + loss)``, which exponentiates the error of the sum.
+        scale = math.exp(loss_at_pivot)
+        if scale == 0.0 or not math.isfinite(scale):
+            log_mass = math.log(remainder) + loss_at_pivot
+            pivot_mass = math.exp(log_mass) if log_mass <= MAX_SAFE_EXP_ARG else math.inf
+        else:
+            # Overshoot by one ulp of whichever quantity the residual rebuild is
+            # coarsest in. Removing extra moment only raises the residual, so this is
+            # free insurance against that rebuild landing a fraction short.
+            moment_ulp = max(
+                float(np.spacing(max(float(contributions[pivot]), moment))),
+                float(np.spacing(1.0)),
+            )
+            pivot_mass = remainder * scale + max(
+                float(np.spacing(float(prob_arr[pivot]))),
+                moment_ulp * scale,
+            )
+        prob_arr[pivot] = max(0.0, float(prob_arr[pivot]) - pivot_mass)
+
+
 def _truncate_dominating_edges(
+    *,
     prob_arr: NDArray[np.float64],
     p_min: float,
     p_max: float,
@@ -314,13 +489,13 @@ def _truncate_dominating_edges(
     """
     extended_prob = np.concatenate([[p_min], prob_arr])
     original_mass = math.fsum(map(float, extended_prob))
-    extended_prob = _zero_mass(
+    extended_prob = _drain_mass_from_edge(
         values=extended_prob, mass=tail_truncation, from_left=True, exact=False
     )
     shifted_mass = original_mass - math.fsum(map(float, extended_prob))
     extended_prob[np.nonzero(extended_prob)[0][0]] += shifted_mass
     p_min_out = extended_prob[0]
-    extended_prob = _zero_mass(
+    extended_prob = _drain_mass_from_edge(
         values=extended_prob, mass=tail_truncation, from_left=False, exact=False
     )
     shifted_mass = original_mass - math.fsum(map(float, extended_prob))
@@ -328,6 +503,7 @@ def _truncate_dominating_edges(
 
 
 def _truncate_dominated_edges(
+    *,
     prob_arr: NDArray[np.float64],
     p_min: float,
     p_max: float,
@@ -340,71 +516,14 @@ def _truncate_dominated_edges(
     """
     extended_prob = np.concatenate((prob_arr, [p_max]))
     original_mass = math.fsum(map(float, extended_prob))
-    extended_prob = _zero_mass(
+    extended_prob = _drain_mass_from_edge(
         values=extended_prob, mass=tail_truncation, from_left=False, exact=False
     )
     shifted_mass = original_mass - math.fsum(map(float, extended_prob))
     extended_prob[np.nonzero(extended_prob)[0][-1]] += shifted_mass
     p_max_out = extended_prob[-1]
-    extended_prob = _zero_mass(
+    extended_prob = _drain_mass_from_edge(
         values=extended_prob, mass=tail_truncation, from_left=True, exact=False
     )
     shifted_mass = original_mass - math.fsum(map(float, extended_prob))
     return extended_prob[:-1], p_min + shifted_mass, p_max_out
-
-
-def _strip_zero_edges(prob_arr: NDArray[np.float64]) -> tuple[int, int]:
-    """Return (min_ind, max_ind) of the nonzero range in prob_arr.
-
-    Raises ValueError if all mass is zero.
-    """
-    nonzero_indices = np.nonzero(prob_arr)[0]
-    if nonzero_indices.size == 0:
-        raise ValueError("Cannot truncate distribution with zero finite mass")
-    return int(nonzero_indices[0]), int(nonzero_indices[-1])
-
-
-def _zero_mass(
-    *,
-    values: NDArray[np.float64],
-    mass: float,
-    from_left: bool,
-    exact: bool,
-) -> NDArray[np.float64]:
-    """Remove mass probability from values from one of the side, based on ``from_left``.
-
-    If ``exact`` is true, partially consume the pivot bin so that exactly
-    ``mass`` is removed. Otherwise, consume only complete bins whose cumulative
-    mass does not exceed ``mass`` and leave the pivot bin unchanged.
-    """
-    if mass <= 0.0:
-        return values
-    total_mass = math.fsum(map(float, values))
-    if mass >= total_mass:
-        raise ValueError(
-            "mass must be smaller than total array mass, "
-            f"got mass={mass:.12g}, total={total_mass:.12g}"
-        )
-
-    # When removing from the right, we just flip the array before and after the calculation
-    if not from_left:
-        values = values[::-1]
-
-    # Find the pivot index
-    cumsum = np.cumsum(values, dtype=np.float64)
-    if exact:
-        pivot = int(np.searchsorted(cumsum, mass, side="left"))
-    else:
-        pivot = int(np.searchsorted(cumsum, mass, side="right"))
-
-    # Remove the probability mass below the pivot
-    removed_before = float(cumsum[pivot - 1]) if pivot > 0 else 0.0
-    if pivot > 0:
-        values[:pivot] = 0.0
-    # Remove the additional probability mass from the pivot if needed
-    if exact:
-        values[pivot] = max(0.0, values[pivot] - (mass - removed_before))
-
-    if not from_left:
-        values = values[::-1]
-    return values

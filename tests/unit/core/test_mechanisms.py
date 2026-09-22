@@ -9,10 +9,11 @@ import pytest
 from PLD_accounting.discrete_dist import (
     DenseDiscreteDist,
     Domain,
+    GridSpec,
     PLDRealization,
     SparseDiscreteDist,
 )
-from PLD_accounting.distribution_utils import PMF_MASS_TOL
+from PLD_accounting.distribution_utils import PMF_TOLERATED_MASS_TOL
 from PLD_accounting.fft_convolution import fft_convolve
 from PLD_accounting.mechanisms import (
     _LaplacePLD,
@@ -38,13 +39,17 @@ def _noise_distribution(
 ) -> DenseDiscreteDist:
     """Build a count-noise distribution for mechanism tests."""
     domain = Domain.POSITIVES if spacing_type == SpacingType.GEOMETRIC else Domain.REALS
+    if spacing_type == SpacingType.GEOMETRIC:
+        grid = GridSpec(
+            step=math.log(step), spacing_type=SpacingType.GEOMETRIC, n=pmf.size, anchor=x_0
+        )
+    else:
+        grid = GridSpec(step=step, n=pmf.size, anchor=x_0)
     return DenseDiscreteDist(
-        x_0=x_0,
-        step=step,
+        grid=grid,
         prob_arr=pmf,
         p_min=boundaries[0],
         p_max=boundaries[1],
-        spacing_type=spacing_type,
         domain=domain,
     )
 
@@ -85,14 +90,14 @@ def _exact_count_noise_atoms(
 
 def test_gaussian_distribution_dominates_returns_pld_realization():
     """Gaussian distribution dominates returns pld realization."""
-    d = gaussian_distribution(1.0, tail_truncation=DEFAULT_TAIL_TRUNCATION)
+    d = gaussian_distribution(scale=1.0, tail_truncation=DEFAULT_TAIL_TRUNCATION)
     assert isinstance(d, PLDRealization)
 
 
 def test_gaussian_distribution_ctd_returns_pld_realization():
     """Gaussian CtD upper discretization returns a valid PLD realization."""
     d = gaussian_distribution(
-        1.0,
+        scale=1.0,
         value_discretization=0.05,
         tail_truncation=1e-10,
     )
@@ -104,7 +109,7 @@ def test_gaussian_distribution_ctd_returns_pld_realization():
 def test_gaussian_distribution_is_dominated_returns_linear_only():
     """Gaussian distribution is dominated returns linear only."""
     d = gaussian_distribution(
-        1.0,
+        scale=1.0,
         tail_truncation=DEFAULT_TAIL_TRUNCATION,
         bound_type=BoundType.IS_DOMINATED,
     )
@@ -114,14 +119,14 @@ def test_gaussian_distribution_is_dominated_returns_linear_only():
 
 def test_laplace_distribution_dominates_returns_pld_realization():
     """Laplace distribution dominates returns pld realization."""
-    d = laplace_distribution(1.0, tail_truncation=DEFAULT_TAIL_TRUNCATION)
+    d = laplace_distribution(scale=1.0, tail_truncation=DEFAULT_TAIL_TRUNCATION)
     assert isinstance(d, PLDRealization)
 
 
 def test_laplace_distribution_ctd_returns_pld_realization():
     """Laplace CtD upper discretization accounts for the mixed atoms."""
     d = laplace_distribution(
-        1.0,
+        scale=1.0,
         value_discretization=0.02,
         tail_truncation=1e-12,
     )
@@ -147,7 +152,7 @@ def test_laplace_pld_tail_functions_include_boundary_atoms():
 def test_laplace_distribution_is_dominated_returns_linear_only():
     """Laplace distribution is dominated returns linear only."""
     d = laplace_distribution(
-        1.0,
+        scale=1.0,
         tail_truncation=DEFAULT_TAIL_TRUNCATION,
         bound_type=BoundType.IS_DOMINATED,
     )
@@ -158,7 +163,7 @@ def test_laplace_distribution_is_dominated_returns_linear_only():
 @pytest.mark.parametrize("scale", [0.5, 1.0, 2.0])
 def test_laplace_distribution_has_no_infinite_mass(scale):
     """Laplace PLD is bounded in [-lam, lam]; p_max must be 0 or negligible."""
-    d = laplace_distribution(scale, tail_truncation=DEFAULT_TAIL_TRUNCATION)
+    d = laplace_distribution(scale=scale, tail_truncation=DEFAULT_TAIL_TRUNCATION)
     assert d.p_max < 1e-6, (
         f"laplace_distribution(scale={scale}) produced p_max={d.p_max:.3e}; "
         "the 0.5 atom at +lam must land in a finite bin, not at infinity"
@@ -211,7 +216,7 @@ def test_count_noise_coalesces_duplicate_loss_atoms():
     np.testing.assert_allclose(
         atomic_hockey_stick(remove.x_array, remove.prob_arr, remove.x_array, remove.p_max),
         atomic_hockey_stick(losses, probs, remove.x_array, p_max),
-        atol=5 * PMF_MASS_TOL,
+        atol=5 * PMF_TOLERATED_MASS_TOL,
     )
 
 
@@ -234,13 +239,13 @@ def test_discrete_distribution_match_exact_shift_profiles(sensitivity: int):
         result_profile = atomic_hockey_stick(
             result.x_array, result.prob_arr, epsilons, result.p_max
         )
-        assert np.all(result_profile >= exact_profile - 5 * PMF_MASS_TOL)
+        assert np.all(result_profile >= exact_profile - 5 * PMF_TOLERATED_MASS_TOL)
         np.testing.assert_allclose(
             atomic_hockey_stick(result.x_array, result.prob_arr, result.x_array, result.p_max),
             atomic_hockey_stick(losses, probs, result.x_array, p_max),
-            atol=5 * PMF_MASS_TOL,
+            atol=5 * PMF_TOLERATED_MASS_TOL,
         )
-        assert result.p_max == pytest.approx(p_max, abs=5 * PMF_MASS_TOL)
+        assert result.p_max == pytest.approx(p_max, abs=5 * PMF_TOLERATED_MASS_TOL)
 
 
 def test_count_noise_support_offset_does_not_change_pld():
@@ -280,8 +285,10 @@ def test_count_noise_each_boundary_mass_is_routed_to_infinity(boundaries, bounda
         tail_truncation=0.0,
     )
 
-    assert remove.p_max == pytest.approx(interior[-1] + boundary_mass, abs=5 * PMF_MASS_TOL)
-    assert add.p_max == pytest.approx(interior[0] + boundary_mass, abs=5 * PMF_MASS_TOL)
+    assert remove.p_max == pytest.approx(
+        interior[-1] + boundary_mass, abs=5 * PMF_TOLERATED_MASS_TOL
+    )
+    assert add.p_max == pytest.approx(interior[0] + boundary_mass, abs=5 * PMF_TOLERATED_MASS_TOL)
 
 
 def test_count_noise_keeps_every_positive_loss_atom():
@@ -294,8 +301,8 @@ def test_count_noise_keeps_every_positive_loss_atom():
         tail_truncation=0.0,
     )
 
-    assert remove.p_max == pytest.approx(0.25 - tiny, abs=5 * PMF_MASS_TOL)
-    assert add.p_max == pytest.approx(tiny, abs=5 * PMF_MASS_TOL)
+    assert remove.p_max == pytest.approx(0.25 - tiny, abs=5 * PMF_TOLERATED_MASS_TOL)
+    assert add.p_max == pytest.approx(tiny, abs=5 * PMF_TOLERATED_MASS_TOL)
 
 
 def test_discrete_distribution_rediscretizes_sparse_loss_laws(monkeypatch):
@@ -305,8 +312,11 @@ def test_discrete_distribution_rediscretizes_sparse_loss_laws(monkeypatch):
     def fake_rediscretize_dist_by_bound(**kwargs):
         calls.append(kwargs)
         return PLDRealization(
-            x_0=0.0,
-            step=kwargs["loss_discretization"],
+            grid=GridSpec(
+                step=kwargs["loss_discretization"],
+                n=1,
+                anchor=0.0,
+            ),
             prob_arr=np.array([1.0]),
         )
 
@@ -366,6 +376,8 @@ def test_discrete_distribution_requires_numerical_parameters():
     [
         ({"sensitivity": 1.5}, TypeError, "sensitivity must be an integer"),
         ({"sensitivity": True}, TypeError, "sensitivity must be an integer"),
+        ({"sensitivity": 0}, ValueError, "sensitivity must be >= 1"),
+        ({"sensitivity": -1}, ValueError, "sensitivity must be >= 1"),
     ],
 )
 def test_count_noise_rejects_invalid_parameters(kwargs, error_type, match):
@@ -381,7 +393,14 @@ def test_count_noise_rejects_invalid_parameters(kwargs, error_type, match):
     [
         (np.array([0.4, 0.6]), TypeError, "must be a DenseDiscreteDist"),
         (
-            PLDRealization(x_0=0.0, step=1.0, prob_arr=np.array([1.0])),
+            PLDRealization(
+                grid=GridSpec(
+                    step=1.0,
+                    n=1,
+                    anchor=0.0,
+                ),
+                prob_arr=np.array([1.0]),
+            ),
             TypeError,
             "not a PLDRealization",
         ),

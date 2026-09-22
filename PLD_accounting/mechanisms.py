@@ -32,6 +32,7 @@ from scipy.stats._distn_infrastructure import rv_frozen
 from PLD_accounting.discrete_dist import (
     DenseDiscreteDist,
     Domain,
+    GridSpec,
     PLDRealization,
     SparseDiscreteDist,
 )
@@ -45,8 +46,14 @@ from PLD_accounting.types import (
     DEFAULT_TAIL_TRUNCATION,
     BoundType,
     SpacingType,
+    require_bound_type,
 )
-from PLD_accounting.validation import validate_bound_type, validate_integer
+from PLD_accounting.validation import (
+    require_nonnegative_real,
+    require_open_unit_interval,
+    require_positive_int,
+    require_positive_real,
+)
 
 # =============================================================================
 # Public mechanism factories
@@ -54,6 +61,7 @@ from PLD_accounting.validation import validate_bound_type, validate_integer
 
 
 def gaussian_distribution(
+    *,
     scale: float,
     value_discretization: float = DEFAULT_LOSS_DISCRETIZATION,
     tail_truncation: float = DEFAULT_TAIL_TRUNCATION,
@@ -67,14 +75,17 @@ def gaussian_distribution(
         tail_truncation: Tail probability budget; quantiles ``ppf``/``isf`` at
             this level define the grid range.
         bound_type: Rounding semantics for mapping continuous mass to grid points.
-            ``DOMINATES`` for upper bound and ``IS_DOMINATED`` for lower
+            ``DOMINATES`` for an upper bound and ``IS_DOMINATED`` for a lower bound.
+
     Returns:
         ``PLDRealization`` when ``bound_type`` is ``DOMINATES``,
         ``DenseDiscreteDist`` when it is ``IS_DOMINATED``.
     """
-    validate_bound_type(bound_type)
-    if scale <= 0.0:
-        raise ValueError(f"scale must be positive, got {scale}")
+    require_bound_type(value=bound_type)
+    require_positive_real(
+        value=[scale, value_discretization], name=["scale", "value_discretization"]
+    )
+    require_open_unit_interval(value=tail_truncation, name="tail_truncation")
     scale_f = float(scale)
     mu = 1.0 / (2.0 * scale_f**2)
     sd = 1.0 / scale_f
@@ -89,6 +100,7 @@ def gaussian_distribution(
 
 
 def laplace_distribution(
+    *,
     scale: float,
     value_discretization: float = DEFAULT_LOSS_DISCRETIZATION,
     tail_truncation: float = DEFAULT_TAIL_TRUNCATION,
@@ -102,14 +114,17 @@ def laplace_distribution(
         tail_truncation: Tail probability budget; quantiles ``ppf``/``isf`` at
             this level define the grid range.
         bound_type: Rounding semantics for mapping continuous mass to grid points.
-            ``DOMINATES`` for upper bound and ``IS_DOMINATED`` for lower
+            ``DOMINATES`` for an upper bound and ``IS_DOMINATED`` for a lower bound.
+
     Returns:
         ``PLDRealization`` when ``bound_type`` is ``DOMINATES``,
         ``DenseDiscreteDist`` when it is ``IS_DOMINATED``.
     """
-    validate_bound_type(bound_type)
-    if scale <= 0.0:
-        raise ValueError(f"scale must be positive, got {scale}")
+    require_bound_type(value=bound_type)
+    require_positive_real(
+        value=[scale, value_discretization], name=["scale", "value_discretization"]
+    )
+    require_open_unit_interval(value=tail_truncation, name="tail_truncation")
     dist = _LaplacePLD(sigma=scale)
     return _continuous_mechanism_distribution(
         dist=dist,
@@ -153,6 +168,9 @@ def discrete_distribution(
     Returns:
         The ``(remove, add)`` PLDRealization pair.
     """
+    require_positive_real(value=loss_discretization, name="loss_discretization")
+    require_nonnegative_real(value=tail_truncation, name="tail_truncation")
+    require_positive_int(value=sensitivity, name="sensitivity")
     if not isinstance(noise_dist, DenseDiscreteDist) or isinstance(noise_dist, PLDRealization):
         raise TypeError("noise_dist must be a DenseDiscreteDist, not a PLDRealization")
     if noise_dist.spacing_type != SpacingType.LINEAR or noise_dist.domain != Domain.REALS:
@@ -162,7 +180,6 @@ def discrete_distribution(
             "noise_dist must have unit spacing and an integer grid origin, got "
             f"x_0={noise_dist.x_0}, step={noise_dist.step}"
         )
-    validate_integer(sensitivity, "sensitivity")
 
     # REMOVE: atom o (mass C(o)) read against C(o+s).
     remove_dist = _count_noise_direction_pld(
@@ -332,8 +349,7 @@ def _count_noise_direction_pld(
     )
     if finite_probs.size == 0:
         return PLDRealization(
-            x_0=0.0,
-            step=float(loss_discretization),
+            grid=GridSpec(step=float(loss_discretization), n=2, anchor=0.0),
             prob_arr=np.zeros(2, dtype=np.float64),
             p_max=infinite_loss_mass,
         )

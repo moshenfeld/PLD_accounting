@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -13,7 +14,12 @@ import PLD_accounting.random_allocation_accounting as random_allocation_accounti
 import PLD_accounting.random_allocation_api as random_allocation_api_module
 import PLD_accounting.random_allocation_gaussian as random_allocation_gaussian_module
 import PLD_accounting.random_allocation_realization as random_allocation_realization_module
-from PLD_accounting.discrete_dist import DenseDiscreteDist, Domain, PLDRealization
+from PLD_accounting.discrete_dist import (
+    DenseDiscreteDist,
+    Domain,
+    GridSpec,
+    PLDRealization,
+)
 from PLD_accounting.random_allocation_accounting import (
     _allocation_directional_pld_core as allocation_directional_pld_core,
 )
@@ -32,27 +38,101 @@ from PLD_accounting.types import (
 from tests.test_tolerances import TestTolerances as TOL
 
 
+def _core_composition_calls(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    num_steps: int,
+    num_selected: int,
+    num_epochs: int,
+) -> list[tuple[int, int]]:
+    """Return ``(num_steps, num_epochs)`` passed to each core component build."""
+    calls: list[tuple[int, int]] = []
+
+    def fake_core(**kwargs: Any) -> DenseDiscreteDist:
+        calls.append((kwargs["num_steps"], kwargs["num_epochs"]))
+        return _stub_linear_dist()
+
+    monkeypatch.setattr(
+        random_allocation_accounting_module,
+        "_allocation_directional_pld_core",
+        fake_core,
+    )
+    random_allocation_accounting_module.allocation_directional_pld(
+        compute_base_pld=lambda **_kwargs: _stub_linear_dist(),
+        base_loss_discretization_count=lambda _n: 1,
+        num_steps=num_steps,
+        num_selected=num_selected,
+        num_epochs=num_epochs,
+        loss_discretization=0.1,
+        tail_truncation=1e-10,
+        bound_type=BoundType.DOMINATES,
+    )
+    return calls
+
+
+class TestAllocationCompositionCounts:
+    """Integer lock tests for the README Parameter Mapping split."""
+
+    def test_divisible_split(self, monkeypatch: pytest.MonkeyPatch):
+        """Divisible ``num_steps`` uses only the floor branch."""
+        assert _core_composition_calls(monkeypatch, num_steps=10, num_selected=2, num_epochs=3) == [
+            (5, 6)
+        ]
+
+    def test_remainder_split(self, monkeypatch: pytest.MonkeyPatch):
+        """A nonzero remainder splits epochs across floor and ceil branches."""
+        assert _core_composition_calls(monkeypatch, num_steps=11, num_selected=2, num_epochs=3) == [
+            (5, 3),
+            (6, 3),
+        ]
+
+    def test_num_selected_one(self, monkeypatch: pytest.MonkeyPatch):
+        """``num_selected=1`` is a single ceil-empty floor composition."""
+        assert _core_composition_calls(monkeypatch, num_steps=17, num_selected=1, num_epochs=4) == [
+            (17, 4)
+        ]
+
+
 def _simple_realization() -> PLDRealization:
     return PLDRealization(
-        x_0=0.0,
-        step=0.5,
-        prob_arr=np.array([0.6, 0.3, 0.1]),
+        grid=GridSpec(step=0.5, n=3, anchor=0.0), prob_arr=np.array([0.6, 0.3, 0.1])
+    )
+
+
+def _summed_anchor_stub(**kwargs: Any) -> DenseDiscreteDist:
+    """Identity convolution that still sums the two multiplicative anchors."""
+    dist, other = kwargs["dist_1"], kwargs["dist_2"]
+    return DenseDiscreteDist(
+        grid=replace(dist.grid, anchor=dist.grid.anchor + other.grid.anchor),
+        prob_arr=dist.prob_arr,
+        p_min=dist.p_min,
+        p_max=dist.p_max,
+        domain=dist.domain,
+    )
+
+
+def _self_convolved_stub(**kwargs: Any) -> DenseDiscreteDist:
+    """Identity convolution that still accumulates the multiplicative anchor."""
+    dist = kwargs["dist"]
+    return DenseDiscreteDist(
+        grid=replace(dist.grid, anchor=dist.grid.anchor * kwargs["num_convolutions"]),
+        prob_arr=dist.prob_arr,
+        p_min=dist.p_min,
+        p_max=dist.p_max,
+        domain=dist.domain,
     )
 
 
 def _stub_linear_dist() -> DenseDiscreteDist:
     return DenseDiscreteDist(
-        x_0=0.0,
-        step=0.5,
-        prob_arr=np.array([0.5, 0.3, 0.2]),
+        grid=GridSpec(step=0.5, n=3, anchor=0.0), prob_arr=np.array([0.5, 0.3, 0.2])
     )
 
 
 def _aligned_base_dist(step: float, origin_index: int) -> DenseDiscreteDist:
     """Build a small loss distribution on exact integer multiples of ``step``."""
     return DenseDiscreteDist(
-        x_0=origin_index * step,
-        step=step,
+        grid=GridSpec(step=step, n=4, index_0=origin_index),
         prob_arr=np.array([1e-8, 0.2, 0.5, 0.29999999]),
     )
 
@@ -145,8 +225,7 @@ class TestGeneralAllocationWiring:
         """Realization REMOVE and ADD factors use the shared geometric grid cap."""
         max_grid_mult = 100
         realization = PLDRealization(
-            x_0=0.0,
-            step=1e-3,
+            grid=GridSpec(step=1e-3, n=np.full(1_001, 1.0 / 1_001).size, anchor=0.0),
             prob_arr=np.full(1_001, 1.0 / 1_001),
         )
 
@@ -181,9 +260,7 @@ class TestGeneralAllocationWiring:
     def test_realization_geometric_factors_require_two_grid_points(self, builder):
         """Realization factor builders reject a grid with no finite interval."""
         realization = PLDRealization(
-            x_0=0.0,
-            step=0.1,
-            prob_arr=np.array([1.0]),
+            grid=GridSpec(step=0.1, n=1, anchor=0.0), prob_arr=np.array([1.0])
         )
 
         with pytest.raises(ValueError, match="at least two finite grid points"):
@@ -291,9 +368,7 @@ def test_gaussian_allocation_best_of_two_combines_full_pipelines(
         # GEOM pipelines emit a finer grid than FFT ones.
         step = 0.25 if method == ConvolutionMethod.GEOM else 0.5
         return DenseDiscreteDist(
-            x_0=0.0,
-            step=step,
-            prob_arr=np.array([0.5, 0.3, 0.2]),
+            grid=GridSpec(step=step, n=3, anchor=0.0), prob_arr=np.array([0.5, 0.3, 0.2])
         )
 
     monkeypatch.setattr(
@@ -348,8 +423,7 @@ def test_gaussian_fft_add_folds_zero_atom_before_actual_self_convolution(
 ) -> None:
     """ADD includes zero-plus-finite cross terms in the FFT array convolution."""
     source = DenseDiscreteDist(
-        x_0=1.0,
-        step=1.0,
+        grid=GridSpec(step=1.0, n=2, anchor=1.0),
         prob_arr=np.array([0.5, 0.3]),
         p_min=0.2,
         domain=Domain.POSITIVES,
@@ -366,12 +440,10 @@ def test_gaussian_fft_add_folds_zero_atom_before_actual_self_convolution(
         conv_dist = kwargs["dist"]
         captured["conv_dist"] = conv_dist
         return DenseDiscreteDist(
-            x_0=1.0,
-            step=np.e,
+            grid=GridSpec.geometric(ratio=np.e, n=conv_dist.prob_arr.size, anchor=1.0),
             prob_arr=conv_dist.prob_arr,
             p_min=conv_dist.p_min,
             p_max=conv_dist.p_max,
-            spacing_type=SpacingType.GEOMETRIC,
             domain=Domain.POSITIVES,
         )
 
@@ -406,8 +478,7 @@ def test_gaussian_fft_add_folds_zero_atom_before_actual_self_convolution(
 def test_gaussian_fft_add_embeds_boundary_at_nonpositive_cell_for_wide_offset() -> None:
     """The prepended-cell count puts the zero atom at or below zero."""
     source = DenseDiscreteDist(
-        x_0=2.5,
-        step=1.0,
+        grid=GridSpec(step=1.0, n=1, anchor=2.5),
         prob_arr=np.array([0.7]),
         p_min=0.3,
         domain=Domain.POSITIVES,
@@ -421,16 +492,16 @@ def test_gaussian_fft_add_embeds_boundary_at_nonpositive_cell_for_wide_offset() 
     assert result.x_0 == -0.5
     assert result.p_min == 0.0
     np.testing.assert_array_equal(result.prob_arr, np.array([0.3, 0.0, 0.0, 0.7]))
+    np.testing.assert_array_equal(result.x_array[3:], source.x_array)
 
 
-def test_gaussian_fft_add_embed_falls_back_when_x_0_is_swallowed_by_step() -> None:
-    """A cancellation-prone offset folds in place instead of corrupting the lattice."""
+def test_gaussian_fft_add_embed_pads_when_x_0_is_swallowed_by_step() -> None:
+    """A cancellation-prone origin still occupies a new nonpositive REALS cell."""
     p_min = 1e-13
     prob_arr = np.array([0.999999, 7.0e-07, 3.0e-07])
     prob_arr *= (1.0 - p_min) / prob_arr.sum()
     source = DenseDiscreteDist(
-        x_0=1.2644809843750233e-14,
-        step=11820.764697407296,
+        grid=GridSpec(step=11820.764697407296, n=prob_arr.size, anchor=1.2644809843750233e-14),
         prob_arr=prob_arr,
         p_min=p_min,
         domain=Domain.POSITIVES,
@@ -440,21 +511,45 @@ def test_gaussian_fft_add_embed_falls_back_when_x_0_is_swallowed_by_step() -> No
         source
     )
 
-    # No cell is prepended: x_0 - step would round to exactly -step, so every
-    # subsequent cell's recovered position would silently collapse to 0.
+    n_pad = result.prob_arr.size - source.prob_arr.size
+    assert n_pad >= 1
     assert result.domain == Domain.REALS
-    assert result.x_0 == source.x_0
+    assert result.x_0 <= 0.0
     assert result.p_min == 0.0
-    expected = prob_arr.copy()
-    expected[0] += source.p_min
-    np.testing.assert_allclose(result.prob_arr, expected)
+    np.testing.assert_array_equal(result.x_array[n_pad:], source.x_array)
+    np.testing.assert_array_equal(result.prob_arr[n_pad:], source.prob_arr)
+    assert result.prob_arr[0] == source.p_min
+
+
+def test_gaussian_fft_add_embed_corrects_an_under_counted_ceil() -> None:
+    """When fl(k * step) rounds low, ceil leaves a positive origin and one more cell is taken."""
+    # ceil(x_0 / step) is 5 here, but pad(left=5) lands at +9.09e-13 rather than at or
+    # below zero, because 5 * step rounds below the real product.
+    step = 1309.374640277622
+    source = DenseDiscreteDist(
+        grid=GridSpec(step=step, n=3, anchor=6546.87320138811, index_0=0),
+        prob_arr=np.array([0.5, 0.3, 0.1]),
+        p_min=0.1,
+        domain=Domain.POSITIVES,
+    )
+    assert source.grid.pad(left=5, right=0).x_0 > 0.0
+
+    result = random_allocation_gaussian_module._embed_positive_boundary_on_nonpositive_real_cell(
+        source
+    )
+
+    n_pad = result.prob_arr.size - source.prob_arr.size
+    assert n_pad == 6
+    assert result.x_0 <= 0.0
+    assert result.p_min == 0.0
+    assert result.prob_arr[0] == source.p_min
+    np.testing.assert_array_equal(result.x_array[n_pad:], source.x_array)
 
 
 def test_gaussian_fft_add_folds_all_nonpositive_cells_to_zero_boundary() -> None:
     """Post-processing preserves mass while tightening nonpositive artifacts to zero."""
     source = DenseDiscreteDist(
-        x_0=-1.0,
-        step=1.0,
+        grid=GridSpec(step=1.0, n=4, anchor=-1.0),
         prob_arr=np.array([0.1, 0.2, 0.3, 0.35]),
         p_min=0.05,
         domain=Domain.REALS,
@@ -619,14 +714,14 @@ def test_allocation_directional_pld_core_truncates_without_regridding(
     assert np.isclose(
         captured["core_loss_discretization"],
         expected_core_loss,
-        atol=TOL.SPACING_ATOL,
+        atol=TOL.GRID_ATOL,
     )
     assert np.isclose(
         captured["base_gap_at_compose"],
         expected_step,
-        atol=TOL.SPACING_ATOL,
+        atol=TOL.GRID_ATOL,
     )
-    assert np.isclose(result.step, expected_step, atol=TOL.SPACING_ATOL)
+    assert np.isclose(result.step, expected_step, atol=TOL.GRID_ATOL)
 
 
 def test_allocation_directional_pld_warns_when_fallback_regrids(
@@ -637,16 +732,15 @@ def test_allocation_directional_pld_warns_when_fallback_regrids(
     def fake_core(**kwargs: Any) -> DenseDiscreteDist:
         step = 0.1 if kwargs["num_steps"] == 3 else 0.2
         return DenseDiscreteDist(
-            x_0=0.0,
-            step=step,
-            prob_arr=np.array([0.5, 0.5]),
+            grid=GridSpec(step=step, n=2, anchor=0.0), prob_arr=np.array([0.5, 0.5])
         )
 
     def fake_rediscretize_dist(**kwargs: Any) -> DenseDiscreteDist:
         dist = kwargs["dist"]
         return DenseDiscreteDist(
-            x_0=dist.x_0,
-            step=kwargs["loss_discretization"],
+            grid=GridSpec(
+                step=kwargs["loss_discretization"], n=dist.prob_arr.size, anchor=dist.x_0
+            ),
             prob_arr=dist.prob_arr,
         )
 
@@ -774,14 +868,17 @@ def test_geom_is_dominated_path_handles_tiny_nonpositive_exp_tail():
     assert epsilon > 0.0
 
 
-def test_gaussian_remove_geom_dominates_discretizes_only_primary(monkeypatch):
-    """Gaussian upper REMOVE derives its transformed dual after one discretization."""
+def test_gaussian_remove_geom_dominates_retains_discretize_then_dual(monkeypatch):
+    """Gaussian upper REMOVE retains the original discretize-then-dual flow."""
     calls = []
+    realizations = []
     actual_discretize = random_allocation_gaussian_module.discretize_continuous_ctd
 
     def recording_discretize(**kwargs):
         calls.append(kwargs)
-        return actual_discretize(**kwargs)
+        realization = actual_discretize(**kwargs)
+        realizations.append(realization)
+        return realization
 
     monkeypatch.setattr(
         random_allocation_gaussian_module,
@@ -801,13 +898,13 @@ def test_gaussian_remove_geom_dominates_discretizes_only_primary(monkeypatch):
         ),
     )
     expected = random_allocation_gaussian_module.negate_reverse_linear_distribution(
-        random_allocation_gaussian_module.calc_pld_dual(base)
+        random_allocation_gaussian_module.calc_pld_dual(realizations[0])
     )
 
     assert len(calls) == 1
     assert "dual_dist" in calls[0]
     assert isinstance(base, PLDRealization)
-    assert np.isclose(base.step, neg_dual.step, atol=TOL.SPACING_ATOL)
+    assert np.isclose(base.step, neg_dual.step, atol=TOL.GRID_ATOL)
     np.testing.assert_array_equal(neg_dual.x_array, expected.x_array)
     np.testing.assert_array_equal(neg_dual.prob_arr, expected.prob_arr)
     assert neg_dual.p_min == expected.p_min
@@ -815,25 +912,21 @@ def test_gaussian_remove_geom_dominates_discretizes_only_primary(monkeypatch):
 
 
 @pytest.mark.parametrize("sigma", [0.05, 0.15])
-def test_gaussian_remove_geom_warns_when_negative_dual_mean_lacks_grid_margin(sigma: float):
-    """Gaussian REMOVE requires one standard deviation around its negative-dual mean."""
+def test_gaussian_remove_geom_joint_grid_covers_negative_dual_mean(sigma: float):
+    """Joint CtD support covers the reflected-dual law even for small sigma."""
     config = AllocationSchemeConfig()
 
-    with pytest.warns(
-        RuntimeWarning,
-        match="negative-dual mean is not at least one standard deviation inside",
-    ):
-        base, _ = random_allocation_gaussian_module._gaussian_remove_geom_loss_factors(
-            loss_discretization=config.loss_discretization,
-            tail_truncation=config.tail_truncation,
-            bound_type=BoundType.DOMINATES,
-            sigma=sigma,
-            config=config,
-        )
-
-    negative_dual_mean = -0.5 / sigma**2
-    negative_dual_std = 1.0 / sigma
-    assert negative_dual_mean < base.x_array[0] + negative_dual_std
+    base, _ = random_allocation_gaussian_module._gaussian_remove_geom_loss_factors(
+        loss_discretization=config.loss_discretization,
+        tail_truncation=config.tail_truncation,
+        bound_type=BoundType.DOMINATES,
+        sigma=sigma,
+        config=config,
+    )
+    sigma_inv = 1.0 / sigma
+    negative_dual_mean = -(sigma_inv**2) / 2.0
+    assert base.x_array[0] + sigma_inv <= negative_dual_mean
+    assert negative_dual_mean <= base.x_array[-1] - sigma_inv
 
 
 def test_gaussian_remove_geom_dominates_honors_max_grid_mult():
@@ -963,7 +1056,6 @@ class TestGeometricBaseTailScaling:
     ):
         """Remove base factor tail scales with num steps."""
         captured_tails: list[float] = []
-        sentinel = object()
 
         def fake_base_distributions_creation(
             *,
@@ -976,15 +1068,27 @@ class TestGeometricBaseTailScaling:
             return _stub_linear_dist(), _stub_linear_dist()
 
         monkeypatch.setattr(
-            random_allocation_accounting_module, "exp_linear_to_geometric", lambda _dist: sentinel
+            random_allocation_accounting_module,
+            "exp_linear_to_geometric",
+            lambda dist: DenseDiscreteDist(
+                grid=dist.grid.exp(),
+                prob_arr=dist.prob_arr,
+                p_min=dist.p_min,
+                p_max=dist.p_max,
+                domain=Domain.POSITIVES,
+            ),
         )
         monkeypatch.setattr(
             random_allocation_accounting_module,
             "geometric_self_convolve",
-            lambda **_kwargs: sentinel,
+            _self_convolved_stub,
         )
         monkeypatch.setattr(
-            random_allocation_accounting_module, "geometric_convolve", lambda **_kwargs: sentinel
+            random_allocation_accounting_module,
+            "geometric_convolve",
+            # The closing average divides by the factor count, so the stub must sum
+            # anchors like the real convolution or that check correctly rejects it.
+            _summed_anchor_stub,
         )
         monkeypatch.setattr(
             random_allocation_accounting_module,
@@ -1012,7 +1116,6 @@ class TestGeometricBaseTailScaling:
     ):
         """Add base factor tail scales with num steps."""
         captured_tails: list[float] = []
-        sentinel = object()
 
         def fake_base_distributions_creation(
             *,
@@ -1025,12 +1128,20 @@ class TestGeometricBaseTailScaling:
             return _stub_linear_dist()
 
         monkeypatch.setattr(
-            random_allocation_accounting_module, "exp_linear_to_geometric", lambda _dist: sentinel
+            random_allocation_accounting_module,
+            "exp_linear_to_geometric",
+            lambda dist: DenseDiscreteDist(
+                grid=dist.grid.exp(),
+                prob_arr=dist.prob_arr,
+                p_min=dist.p_min,
+                p_max=dist.p_max,
+                domain=Domain.POSITIVES,
+            ),
         )
         monkeypatch.setattr(
             random_allocation_accounting_module,
             "geometric_self_convolve",
-            lambda **_kwargs: sentinel,
+            _self_convolved_stub,
         )
         monkeypatch.setattr(
             random_allocation_accounting_module,
@@ -1088,5 +1199,5 @@ def test_geometric_allocation_preserves_integer_loss_lattice(bound_type: BoundTy
         assert np.isclose(
             dist.x_0,
             lower_index * dist.step,
-            atol=TOL.SPACING_ATOL,
+            atol=TOL.GRID_ATOL,
         )

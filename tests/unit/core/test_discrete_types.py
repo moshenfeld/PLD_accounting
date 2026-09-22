@@ -6,6 +6,7 @@ and transform functions between linear and geometric grids.
 """
 
 import copy
+import math
 
 import numpy as np
 import pytest
@@ -13,9 +14,10 @@ import pytest
 from PLD_accounting.discrete_dist import (
     DenseDiscreteDist,
     Domain,
+    GridSpec,
     SparseDiscreteDist,
 )
-from PLD_accounting.distribution_utils import PMF_MASS_TOL
+from PLD_accounting.distribution_utils import PMF_TOLERATED_MASS_TOL
 from PLD_accounting.types import BoundType, ConvolutionMethod, SpacingType
 from PLD_accounting.utils import (
     exp_linear_to_geometric,
@@ -141,7 +143,7 @@ class TestGeneralDiscreteDist:
     def test_mass_within_tolerance_accepted(self):
         """Test that mass within tolerance is accepted at construction."""
         x = np.array([1.0, 2.0])
-        pmf = np.array([0.5, 0.5 + PMF_MASS_TOL / 2], dtype=np.float64)
+        pmf = np.array([0.5, 0.5 + PMF_TOLERATED_MASS_TOL / 2], dtype=np.float64)
         dist = SparseDiscreteDist(x_array=x, prob_arr=pmf)
         assert dist is not None
 
@@ -208,19 +210,40 @@ class TestDenseDiscreteDistLinear:
 
     def test_valid_dense_linear(self):
         """Test creating valid dense linear distribution."""
-        dist = DenseDiscreteDist(x_0=0.0, step=0.5, prob_arr=np.array([0.2, 0.5, 0.3]))
+        dist = DenseDiscreteDist(
+            grid=GridSpec(
+                step=0.5,
+                n=3,
+                anchor=0.0,
+            ),
+            prob_arr=np.array([0.2, 0.5, 0.3]),
+        )
         expected_x = np.array([0.0, 0.5, 1.0])
         assert np.allclose(dist.x_array, expected_x)
 
     def test_skip_must_be_positive(self):
         """Test that negative step raises error."""
         with pytest.raises(ValueError, match="step must be positive"):
-            DenseDiscreteDist(x_0=0.0, step=-0.1, prob_arr=np.array([0.5, 0.5]))
+            DenseDiscreteDist(
+                grid=GridSpec(
+                    step=-0.1,
+                    n=2,
+                    anchor=0.0,
+                ),
+                prob_arr=np.array([0.5, 0.5]),
+            )
 
     def test_zero_skip_raises(self):
         """Test that zero step raises error."""
         with pytest.raises(ValueError, match="step must be positive"):
-            DenseDiscreteDist(x_0=0.0, step=0.0, prob_arr=np.array([0.5, 0.5]))
+            DenseDiscreteDist(
+                grid=GridSpec(
+                    step=0.0,
+                    n=2,
+                    anchor=0.0,
+                ),
+                prob_arr=np.array([0.5, 0.5]),
+            )
 
 
 class TestDenseDiscreteDistGeometric:
@@ -229,34 +252,43 @@ class TestDenseDiscreteDistGeometric:
     def test_valid_dense_geometric(self):
         """Test creating valid dense geometric distribution."""
         dist = DenseDiscreteDist(
-            x_0=1.0,
-            step=2.0,
+            grid=GridSpec(
+                step=math.log(2.0),
+                spacing_type=SpacingType.GEOMETRIC,
+                n=3,
+                anchor=1.0,
+            ),
             prob_arr=np.array([0.2, 0.5, 0.3]),
-            spacing_type=SpacingType.GEOMETRIC,
             domain=Domain.POSITIVES,
         )
         expected_x = np.array([1.0, 2.0, 4.0])  # x_min * ratio^i
         assert np.allclose(dist.x_array, expected_x)
 
     def test_x_0_must_be_positive(self):
-        """Test that non-positive x_0 raises error for geometric grid."""
-        with pytest.raises(ValueError, match="x_0 must be positive"):
+        """Non-positive geometric anchors are rejected."""
+        with pytest.raises(ValueError, match="must be positive"):
             DenseDiscreteDist(
-                x_0=0.0,
-                step=2.0,
+                grid=GridSpec(
+                    step=math.log(2.0),
+                    spacing_type=SpacingType.GEOMETRIC,
+                    n=2,
+                    anchor=0.0,
+                ),
                 prob_arr=np.array([0.5, 0.5]),
-                spacing_type=SpacingType.GEOMETRIC,
                 domain=Domain.POSITIVES,
             )
 
-    def test_skip_must_exceed_one(self):
-        """Test that step <= 1 raises error for geometric grid."""
-        with pytest.raises(ValueError, match="step must be > 1"):
+    def test_ratio_must_exceed_one(self):
+        """A geometric ratio of one is a zero log-step, which is not a lattice."""
+        with pytest.raises(ValueError, match="step must be positive"):
             DenseDiscreteDist(
-                x_0=1.0,
-                step=1.0,
+                grid=GridSpec(
+                    step=math.log(1.0),
+                    spacing_type=SpacingType.GEOMETRIC,
+                    n=2,
+                    anchor=1.0,
+                ),
                 prob_arr=np.array([0.5, 0.5]),
-                spacing_type=SpacingType.GEOMETRIC,
                 domain=Domain.POSITIVES,
             )
 
@@ -265,8 +297,15 @@ class TestLinearGeometricTransforms:
     """Test exp_linear_to_geometric and log_geometric_to_linear transform functions."""
 
     def test_dense_linear_to_geometric_roundtrip(self):
-        """Test dense linear -> geometric -> linear preserves structure."""
-        dist_linear = DenseDiscreteDist(x_0=1.0, step=0.5, prob_arr=np.array([0.2, 0.5, 0.3]))
+        """Test dense linear -> geometric -> linear preserves structure.
+
+        Uses a zero-anchored grid: the transform is defined only there, because that is
+        the only anchor for which it agrees bitwise with ``np.exp`` of the support.
+        """
+        dist_linear = DenseDiscreteDist(
+            grid=GridSpec(step=0.5, n=3, index_0=2),
+            prob_arr=np.array([0.2, 0.5, 0.3]),
+        )
 
         # Transform to geometric (exp)
         dist_geom = exp_linear_to_geometric(dist_linear)
@@ -282,9 +321,8 @@ class TestLinearGeometricTransforms:
             and dist_linear_back.spacing_type == SpacingType.LINEAR
         )
 
-        # Check roundtrip preserves values
-        assert np.isclose(dist_linear.x_0, dist_linear_back.x_0)
-        assert np.isclose(dist_linear.step, dist_linear_back.step)
+        # Structural round trip: exact, not approximate.
+        assert dist_linear_back.grid == dist_linear.grid
         assert np.allclose(dist_linear.prob_arr, dist_linear_back.prob_arr)
         assert dist_linear.p_min == dist_linear_back.p_min
         assert dist_linear.p_max == dist_linear_back.p_max
@@ -292,10 +330,14 @@ class TestLinearGeometricTransforms:
     def test_dense_geometric_to_linear_roundtrip(self):
         """Test dense geometric -> linear -> geometric preserves structure."""
         dist_geom = DenseDiscreteDist(
-            x_0=2.0,
-            step=1.5,
+            grid=GridSpec(
+                step=math.log(1.5),
+                n=3,
+                spacing_type=SpacingType.GEOMETRIC,
+                anchor=1.0,
+                index_0=2,
+            ),
             prob_arr=np.array([0.2, 0.5, 0.3]),
-            spacing_type=SpacingType.GEOMETRIC,
             domain=Domain.POSITIVES,
         )
 
@@ -318,6 +360,20 @@ class TestLinearGeometricTransforms:
         assert np.isclose(dist_geom.step, dist_geom_back.step)
         assert np.allclose(dist_geom.prob_arr, dist_geom_back.prob_arr)
 
+    def test_exp_of_an_affine_grid_still_preserves_the_step(self):
+        """Affine transforms keep the spacing exactly; only coordinates may shift a ULP."""
+        affine = DenseDiscreteDist(
+            grid=GridSpec(
+                step=0.5,
+                n=3,
+                anchor=1.0,
+            ),
+            prob_arr=np.array([0.2, 0.5, 0.3]),
+        )
+        geom = exp_linear_to_geometric(affine)
+        assert geom.grid.step == affine.grid.step
+        assert log_geometric_to_linear(geom).grid.step == affine.grid.step
+
     def test_transform_preserves_boundary_masses(self):
         """Test that exp/log transforms preserve p_min and p_max.
 
@@ -326,8 +382,7 @@ class TestLinearGeometricTransforms:
         """
         # REALS with p_min (mass at -inf) only
         dist_neg = DenseDiscreteDist(
-            x_0=1.0,
-            step=0.5,
+            grid=GridSpec(step=0.5, n=2, index_0=2),
             prob_arr=np.array([0.7, 0.2]),
             p_min=0.1,
         )
@@ -340,8 +395,7 @@ class TestLinearGeometricTransforms:
 
         # REALS with p_max (mass at +inf) only
         dist_pos = DenseDiscreteDist(
-            x_0=1.0,
-            step=0.5,
+            grid=GridSpec(step=0.5, n=2, index_0=2),
             prob_arr=np.array([0.6, 0.2]),
             p_max=0.2,
         )
@@ -354,12 +408,15 @@ class TestLinearGeometricTransforms:
 
         # POSITIVES with both non-zero is valid
         geom_both = DenseDiscreteDist(
-            x_0=np.exp(1.0),
-            step=np.exp(0.5),
+            grid=GridSpec(
+                step=math.log(np.exp(0.5)),
+                spacing_type=SpacingType.GEOMETRIC,
+                n=2,
+                anchor=np.exp(1.0),
+            ),
             prob_arr=np.array([0.3, 0.5]),
             p_min=0.1,
             p_max=0.1,
-            spacing_type=SpacingType.GEOMETRIC,
             domain=Domain.POSITIVES,
         )
         assert geom_both.p_min == 0.1

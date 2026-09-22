@@ -7,7 +7,6 @@ import warnings
 from dataclasses import dataclass
 from typing import Callable
 
-import numpy as np
 from dp_accounting.pld import privacy_loss_distribution
 
 from PLD_accounting.types import (
@@ -15,15 +14,13 @@ from PLD_accounting.types import (
     BoundType,
     ConvolutionMethod,
     PrivacyParams,
+    require_privacy_params,
 )
-from PLD_accounting.validation import (
-    validate_optional_discretization_params,
-    validate_privacy_params,
-)
+from PLD_accounting.validation import require_finite_real, require_positive_real
 
-# Global configuration constants
 MAX_ITERATIONS = 10
-# Default relative accuracy when auto-targeting or tightening bounds (fraction of a scale).
+# Default relative ratio bound (upper/lower <= 1 + this value), tail init, and
+# Poisson grid seed. Negative target_accuracy selects this ratio; it is not auto-target.
 DEFAULT_RELATIVE_ACCURACY = 0.1
 POISSON_GUESS_DISCRETIZATION = 1e-4
 MIN_DISCRETIZATION = 1e-6
@@ -39,7 +36,7 @@ DISCRETIZATION_REFINEMENT_FACTOR = 2.0
 TAIL_TRUNCATION_REFINEMENT_FACTOR = 10.0
 
 
-@dataclass
+@dataclass(kw_only=True)
 class AdaptiveResult:
     """Result from adaptive allocation computation.
 
@@ -48,12 +45,13 @@ class AdaptiveResult:
         lower_bound: Best lower bound found across all iterations.
         absolute_gap: Final gap between upper and lower bounds.
         converged: Whether the algorithm converged to target accuracy.
-        iterations: Number of refinement iterations performed.
+        iterations: Number of evaluations performed.
         initial_discretization: Starting loss_discretization value.
-        discretization: Final loss_discretization value used.
+        discretization: Last evaluated loss_discretization.
         initial_tail_truncation: Starting tail_truncation value.
-        tail_truncation: Final tail_truncation value used.
-        target_accuracy: Target absolute gap for convergence.
+        tail_truncation: Last evaluated tail_truncation.
+        target_accuracy: Requested accuracy. Nonnegative is an absolute gap;
+            negative selects the default relative ratio bound.
 
     """
 
@@ -82,26 +80,30 @@ def optimize_allocation_epsilon_range(
     initial_discretization: float | None = None,
     initial_tail_truncation: float | None = None,
 ) -> AdaptiveResult:
-    """Fixed-schedule adaptive refinement for epsilon bounds."""
-    # Input validation
-    validate_privacy_params(params, require_delta=True)
-    validate_optional_discretization_params(initial_discretization, initial_tail_truncation)
+    """Refine paired epsilon bounds on a fixed numerical schedule.
 
-    delta = params.delta
-    assert delta is not None
+    Each iteration builds dominating and dominated PLDs with one shared
+    configuration, retains the best bounds seen so far, halves the loss step,
+    and reduces the tail budget by a decade until the requested accuracy is met.
+    A negative ``target_accuracy`` stops when ``upper_bound / lower_bound`` is
+    at most ``1 + DEFAULT_RELATIVE_ACCURACY``.
+    """
+    require_privacy_params(value=params)
+    delta = params.require_delta()
+    require_finite_real(value=target_accuracy, name="target_accuracy")
+    if initial_discretization is not None:
+        require_positive_real(value=initial_discretization, name="initial_discretization")
+    if initial_tail_truncation is not None:
+        require_positive_real(value=initial_tail_truncation, name="initial_tail_truncation")
 
-    estimated_epsilon = None
-    if target_accuracy < 0.0:
-        estimated_epsilon = estimate_poisson_query(
-            params=params,
-            query_func=lambda pld: float(pld.get_epsilon_for_delta(delta)),
-        )
-    target_accuracy, auto_target_accuracy = _auto_target_accuracy(
-        target_accuracy=target_accuracy,
-        estimated_value=estimated_epsilon if estimated_epsilon is not None else target_accuracy,
-    )
     if initial_discretization is None:
-        initial_discretization = target_accuracy / DISCRETIZATION_REFINEMENT_FACTOR
+        accuracy_scale = target_accuracy
+        if target_accuracy < 0.0:
+            accuracy_scale = DEFAULT_RELATIVE_ACCURACY * estimate_poisson_query(
+                params=params,
+                query_func=lambda pld: float(pld.get_epsilon_for_delta(delta)),
+            )
+        initial_discretization = accuracy_scale / DISCRETIZATION_REFINEMENT_FACTOR
     if initial_tail_truncation is None:
         initial_tail_truncation = DEFAULT_RELATIVE_ACCURACY * delta
 
@@ -110,60 +112,68 @@ def optimize_allocation_epsilon_range(
     effective_initial_discretization = discretization
     effective_initial_tail_truncation = tail_truncation
 
-    upper_bound = np.inf
-    lower_bound = -np.inf
-    converged = False
-    iteration = 0
-
-    while not converged and iteration < MAX_ITERATIONS:
-        iteration += 1
-
-        config = AllocationSchemeConfig(
-            loss_discretization=discretization,
+    upper_bound, lower_bound = _evaluate_pair_epsilons(
+        params=params,
+        discretization=discretization,
+        tail_truncation=tail_truncation,
+        pld_builder=pld_builder,
+        delta=delta,
+    )
+    if _has_converged(
+        upper_bound=upper_bound,
+        lower_bound=lower_bound,
+        target_accuracy=target_accuracy,
+    ):
+        return AdaptiveResult(
+            upper_bound=upper_bound,
+            lower_bound=lower_bound,
+            absolute_gap=upper_bound - lower_bound,
+            converged=True,
+            iterations=1,
+            initial_discretization=effective_initial_discretization,
+            discretization=discretization,
+            initial_tail_truncation=effective_initial_tail_truncation,
             tail_truncation=tail_truncation,
-            convolution_method=ConvolutionMethod.GEOM,
+            target_accuracy=target_accuracy,
         )
 
-        pld_upper, pld_lower = _build_pld_pair(
-            params=params,
-            config=config,
-            pld_builder=pld_builder,
-        )
-        new_upper = float(pld_upper.get_epsilon_for_delta(delta))
-        new_lower = float(pld_lower.get_epsilon_for_delta(delta))
-
-        if new_upper < new_lower:
-            raise RuntimeError(
-                "Adaptive refinement produced invalid bounds: dominating bound "
-                f"{new_upper:.12g} is below dominated bound {new_lower:.12g}"
-            )
-
-        upper_bound = min(upper_bound, new_upper)
-        lower_bound = max(lower_bound, new_lower)
-
-        if upper_bound < lower_bound:
-            raise RuntimeError(
-                "Adaptive refinement produced invalid bounds: dominating bound "
-                f"{upper_bound:.12g} is below dominated bound {lower_bound:.12g}"
-            )
-
-        if auto_target_accuracy:
-            target_accuracy = max(target_accuracy, DEFAULT_RELATIVE_ACCURACY * lower_bound)
-        gap = upper_bound - lower_bound
-        if gap < target_accuracy:
-            converged = True
-            break
-
+    # Counted after the call, so a refinement that clamps to a no-change step exits
+    # without claiming an evaluation it never ran.
+    evaluations = 1
+    converged = False
+    for _ in range(1, MAX_ITERATIONS):
         discretization, tail_truncation, changed = _apply_refinement_step(
             discretization=discretization,
             tail_truncation=tail_truncation,
         )
         if not changed:
             break
+        new_upper, new_lower = _evaluate_pair_epsilons(
+            params=params,
+            discretization=discretization,
+            tail_truncation=tail_truncation,
+            pld_builder=pld_builder,
+            delta=delta,
+        )
+        evaluations += 1
+        upper_bound = min(upper_bound, new_upper)
+        lower_bound = max(lower_bound, new_lower)
+        if upper_bound < lower_bound:
+            raise RuntimeError(
+                "Adaptive refinement produced invalid bounds: dominating bound "
+                f"{upper_bound:.12g} is below dominated bound {lower_bound:.12g}"
+            )
+        if _has_converged(
+            upper_bound=upper_bound,
+            lower_bound=lower_bound,
+            target_accuracy=target_accuracy,
+        ):
+            converged = True
+            break
 
     if not converged:
         warnings.warn(
-            f"Adaptive refinement did not converge after {MAX_ITERATIONS} iterations. "
+            f"Adaptive refinement did not converge after {evaluations} evaluations. "
             f"Final gap: {upper_bound - lower_bound:.6e}, target: {target_accuracy:.6e}. "
             f"Returning best bounds found.",
             RuntimeWarning,
@@ -174,7 +184,7 @@ def optimize_allocation_epsilon_range(
         lower_bound=lower_bound,
         absolute_gap=upper_bound - lower_bound,
         converged=converged,
-        iterations=iteration,
+        iterations=evaluations,
         initial_discretization=effective_initial_discretization,
         discretization=discretization,
         initial_tail_truncation=effective_initial_tail_truncation,
@@ -194,8 +204,7 @@ def estimate_poisson_query(
     query_func: Callable[[privacy_loss_distribution.PrivacyLossDistribution], float],
 ) -> float:
     """Estimate the query value with a Poisson-subsampled Gaussian approximation."""
-    # Input validation
-    validate_privacy_params(params)
+    require_privacy_params(value=params)
 
     # Approximate random allocation as Poisson subsampling applied once per
     # allocation step. Each epoch has ``num_steps`` opportunities, and each
@@ -247,37 +256,32 @@ def _apply_refinement_step(
     return next_discretization, next_tail_truncation, changed
 
 
-def _auto_target_accuracy(
+def _has_converged(
     *,
+    upper_bound: float,
+    lower_bound: float,
     target_accuracy: float,
-    estimated_value: float,
-) -> tuple[float, bool]:
-    """Resolve a negative target accuracy into a relative one, or validate a fixed one."""
-    if target_accuracy >= 0.0:
-        if not math.isfinite(target_accuracy):
-            raise RuntimeError(
-                "Adaptive refinement received an invalid target accuracy: " f"{target_accuracy!r}"
-            )
-        return float(target_accuracy), False
-
-    auto_target_accuracy = DEFAULT_RELATIVE_ACCURACY * estimated_value
-    if not math.isfinite(auto_target_accuracy) or auto_target_accuracy < 0.0:
-        raise RuntimeError(
-            "Adaptive refinement produced an invalid automatic target accuracy: "
-            f"{auto_target_accuracy!r}"
-        )
-    return auto_target_accuracy, True
+) -> bool:
+    """Return whether the current pair meets the requested accuracy."""
+    if target_accuracy < 0.0:
+        return lower_bound > 0.0 and upper_bound / lower_bound <= 1.0 + DEFAULT_RELATIVE_ACCURACY
+    return upper_bound - lower_bound < target_accuracy
 
 
-def _build_pld_pair(
+def _evaluate_pair_epsilons(
     *,
     params: PrivacyParams,
-    config: AllocationSchemeConfig,
+    discretization: float,
+    tail_truncation: float,
     pld_builder: Callable[..., privacy_loss_distribution.PrivacyLossDistribution],
-) -> tuple[
-    privacy_loss_distribution.PrivacyLossDistribution,
-    privacy_loss_distribution.PrivacyLossDistribution,
-]:
+    delta: float,
+) -> tuple[float, float]:
+    """Build one dominating/dominated pair and return its epsilon estimates."""
+    config = AllocationSchemeConfig(
+        loss_discretization=discretization,
+        tail_truncation=tail_truncation,
+        convolution_method=ConvolutionMethod.GEOM,
+    )
     pld_upper = pld_builder(
         params=params,
         config=config,
@@ -288,4 +292,11 @@ def _build_pld_pair(
         config=config,
         bound_type=BoundType.IS_DOMINATED,
     )
-    return pld_upper, pld_lower
+    new_upper = float(pld_upper.get_epsilon_for_delta(delta))
+    new_lower = float(pld_lower.get_epsilon_for_delta(delta))
+    if new_upper < new_lower:
+        raise RuntimeError(
+            "Adaptive refinement produced invalid bounds: dominating bound "
+            f"{new_upper:.12g} is below dominated bound {new_lower:.12g}"
+        )
+    return new_upper, new_lower

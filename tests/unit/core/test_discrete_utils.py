@@ -33,12 +33,8 @@ from PLD_accounting.distribution_discretization import (
     rediscretize_prob as pmf_remap_to_grid_kernel,
 )
 from PLD_accounting.distribution_utils import (
-    PMF_MASS_TOL,
-    _zero_mass,
-    compute_bin_ratio,
-    compute_bin_width,
-    compute_truncation,
     enforce_mass_conservation,
+    signed_unit_residual,
 )
 from PLD_accounting.types import BoundType, SpacingType
 from PLD_accounting.utils import _ccdf_from_pmf, exp_linear_to_geometric
@@ -135,15 +131,16 @@ class TestDiscretizeRange:
     def test_linear_aligned_spacing_matches_requested_step(self):
         """Aligned linear grids use the requested discretization as bin width."""
         discretization = 0.25
-        x = aligned_grid_params(
+        grid = aligned_grid_params(
             x_min=-1.12,
             x_max=2.18,
             spacing_type=SpacingType.LINEAR,
             align_to_multiples=True,
             discretization=discretization,
-        ).materialize()
+        )
+        x = grid.materialize()
 
-        assert np.isclose(compute_bin_width(x), discretization)
+        assert grid.step == discretization
         assert np.allclose(x / discretization, np.round(x / discretization))
 
     def test_continuous_discretization_uses_requested_linear_step(self):
@@ -156,7 +153,7 @@ class TestDiscretizeRange:
             align_to_multiples=True,
         )
 
-        assert np.isclose(compute_bin_width(result.x_array), 0.1)
+        assert result.grid.step == 0.1
 
     def test_exponentiating_continuous_discretization_uses_requested_geometric_ratio(self):
         """Exponentiating a linear discretization produces the requested ratio."""
@@ -169,7 +166,7 @@ class TestDiscretizeRange:
         )
         result = exp_linear_to_geometric(linear_dist)
 
-        assert np.isclose(compute_bin_ratio(result.x_array), 1.05)
+        assert np.isclose(math.exp(result.grid.step), 1.05)
 
     def test_continuous_ctd_requires_pld_dual(self):
         """CtD needs both laws in the closed-form privacy-profile identity."""
@@ -197,52 +194,6 @@ class TestDiscretizeRange:
 
         assert isinstance(result, PLDRealization)
         assert result.p_min == 0.0
-
-
-class TestComputeBinWidth:
-    """Test compute_bin_width function."""
-
-    def test_uniform_grid(self):
-        """Test bin width computation for uniform grid."""
-        x = np.array([1.0, 2.0, 3.0, 4.0])
-        width = compute_bin_width(x)
-        assert np.isclose(width, 1.0)
-
-    def test_nonuniform_grid_raises(self):
-        """Test bin width for non-uniform grid raises error."""
-        x = np.array([1.0, 2.0, 3.5, 6.0])
-        # Should raise ValueError for non-uniform grid
-        with pytest.raises(ValueError, match="non-uniform bin widths"):
-            compute_bin_width(x)
-
-    def test_single_point_raises(self):
-        """Test that single point raises an error."""
-        x = np.array([1.0])
-        with pytest.raises(ValueError, match="less than 2 bins"):
-            compute_bin_width(x)
-
-
-class TestComputeBinRatio:
-    """Test compute_bin_ratio function."""
-
-    def test_geometric_grid(self):
-        """Test ratio computation for geometric grid."""
-        x = np.array([1.0, 2.0, 4.0, 8.0])
-        step = compute_bin_ratio(x)
-        assert np.isclose(step, 2.0)
-
-    def test_nonuniform_grid_raises(self):
-        """Test ratio for non-uniform grid raises error."""
-        x = np.array([1.0, 3.0, 6.0, 18.0])
-        # Should raise ValueError for non-uniform grid
-        with pytest.raises(ValueError, match="non-uniform bin widths"):
-            compute_bin_ratio(x)
-
-    def test_single_point_raises(self):
-        """Test that a single-point geometric grid raises an explicit error."""
-        x = np.array([1.0])
-        with pytest.raises(ValueError, match="less than 2 bins"):
-            compute_bin_ratio(x)
 
 
 class TestComputeDiscretePMF:
@@ -300,7 +251,9 @@ class TestPMFRemapToGrid:
         pmf_in = np.array([0.2, 0.5, 0.3], dtype=np.float64)
         x_out = x_in.copy()
 
-        pmf_out = pmf_remap_to_grid_kernel(x_in, pmf_in, x_out, dominates=True)
+        pmf_out = pmf_remap_to_grid_kernel(
+            x_array=x_in, prob_arr=pmf_in, x_array_out=x_out, dominates=True
+        )
         assert np.allclose(pmf_out, pmf_in)
 
     def test_dominates_rounding(self):
@@ -309,7 +262,9 @@ class TestPMFRemapToGrid:
         pmf_in = np.array([0.3, 0.4, 0.3], dtype=np.float64)
         x_out = np.array([1.0, 2.0, 3.0, 4.0])
 
-        pmf_out = pmf_remap_to_grid_kernel(x_in, pmf_in, x_out, dominates=True)
+        pmf_out = pmf_remap_to_grid_kernel(
+            x_array=x_in, prob_arr=pmf_in, x_array_out=x_out, dominates=True
+        )
         # 2.5 should round up to 3.0
         assert pmf_out[2] >= 0.4
 
@@ -319,7 +274,9 @@ class TestPMFRemapToGrid:
         pmf_in = np.array([0.3, 0.4, 0.3], dtype=np.float64)
         x_out = np.array([1.0, 2.0, 3.0, 4.0])
 
-        pmf_out = pmf_remap_to_grid_kernel(x_in, pmf_in, x_out, dominates=False)
+        pmf_out = pmf_remap_to_grid_kernel(
+            x_array=x_in, prob_arr=pmf_in, x_array_out=x_out, dominates=False
+        )
         # 2.5 should round down to 2.0
         assert pmf_out[1] >= 0.4
 
@@ -329,7 +286,9 @@ class TestPMFRemapToGrid:
         pmf_in = np.array([0.3, 0.4, 0.3], dtype=np.float64)
         x_out = np.array([1.0, 2.0, 3.0])  # 5.0 is beyond output grid
 
-        pmf_out = pmf_remap_to_grid_kernel(x_in, pmf_in, x_out, dominates=True)
+        pmf_out = pmf_remap_to_grid_kernel(
+            x_array=x_in, prob_arr=pmf_in, x_array_out=x_out, dominates=True
+        )
         _, _, ppos = enforce_mass_conservation(
             prob_arr=pmf_out,
             expected_p_min=0.0,
@@ -344,7 +303,9 @@ class TestPMFRemapToGrid:
         pmf_in = np.array([0.1, 0.3, 0.4, 0.2], dtype=np.float64)
         x_out = np.array([1.0, 2.0, 3.0])
 
-        pmf_out = pmf_remap_to_grid_kernel(x_in, pmf_in, x_out, dominates=True)
+        pmf_out = pmf_remap_to_grid_kernel(
+            x_array=x_in, prob_arr=pmf_in, x_array_out=x_out, dominates=True
+        )
         total_in = math.fsum(map(float, pmf_in))
         pmf_out, pneg, ppos = enforce_mass_conservation(
             prob_arr=pmf_out,
@@ -362,15 +323,18 @@ class TestStochasticProjectionBoundaries:
     def test_dominating_projection_preserves_p_max_and_adds_right_overflow(self):
         """A dominating projection retains source and overflow upper-boundary mass."""
         dist = DenseDiscreteDist(
-            x_0=0.0,
-            step=1.0,
+            grid=GridSpec(
+                step=1.0,
+                n=3,
+                anchor=0.0,
+            ),
             prob_arr=np.array([0.2, 0.3, 0.4], dtype=np.float64),
             p_max=0.1,
         )
 
         result = project_dist_onto_grid_stoch_dom(
             dist=dist,
-            grid=GridSpec(x_0=0.0, step=1.0, n=2),
+            grid=GridSpec(anchor=0.0, step=1.0, n=2),
             bound_type=BoundType.DOMINATES,
         )
 
@@ -381,21 +345,36 @@ class TestStochasticProjectionBoundaries:
     def test_dominated_projection_preserves_p_min_and_adds_left_underflow(self):
         """A dominated projection retains source and underflow lower-boundary mass."""
         dist = DenseDiscreteDist(
-            x_0=0.0,
-            step=1.0,
+            grid=GridSpec(
+                step=1.0,
+                n=3,
+                anchor=0.0,
+            ),
             prob_arr=np.array([0.2, 0.3, 0.4], dtype=np.float64),
             p_min=0.1,
         )
 
         result = project_dist_onto_grid_stoch_dom(
             dist=dist,
-            grid=GridSpec(x_0=1.0, step=1.0, n=2),
+            grid=GridSpec(anchor=1.0, step=1.0, n=2),
             bound_type=BoundType.IS_DOMINATED,
         )
 
-        np.testing.assert_array_equal(result.prob_arr, np.array([0.3, 0.4]))
+        # expected_p_min is 0.1 + 0.2 = 0.30000000000000004, so the projection carries a
+        # 5.55e-17 excess. The directional trim actually removes it from the giveable
+        # edge; the previous proportional rescale computed a factor of exactly 1.0 and
+        # silently left the excess in place.
+        np.testing.assert_allclose(result.prob_arr, np.array([0.3, 0.4]), rtol=1e-15)
         assert result.p_min == pytest.approx(0.3)
         assert result.p_max == 0.0
+        assert (
+            abs(
+                signed_unit_residual(
+                    values=result.prob_arr, lower_term=result.p_min, upper_term=result.p_max
+                )
+            )
+            <= 2.0**-53
+        )
 
     @pytest.mark.parametrize(
         ("bound_type", "source_boundary", "grid_x_0", "result_boundary"),
@@ -415,15 +394,14 @@ class TestStochasticProjectionBoundaries:
         boundaries = {"p_min": 0.0, "p_max": 0.0}
         boundaries[source_boundary] = 0.1
         dist = DenseDiscreteDist(
-            x_0=1.0,
-            step=1.0,
+            grid=GridSpec(step=1.0, n=2, anchor=1.0),
             prob_arr=np.array([0.3, 0.6000000000000001], dtype=np.float64),
             **boundaries,
         )
 
         result = project_dist_onto_grid_stoch_dom(
             dist=dist,
-            grid=GridSpec(x_0=grid_x_0, step=1.0, n=1),
+            grid=GridSpec(anchor=grid_x_0, step=1.0, n=1),
             bound_type=bound_type,
         )
 
@@ -441,226 +419,17 @@ def test_ccdf_from_pmf_padded():
     assert np.allclose(ccdf, np.array([1.0, 0.75, 0.25, 0.0]))
 
 
-class TestEnforceMassConservation:
-    """Test directional boundary enforcement semantics."""
-
-    @pytest.mark.parametrize("bound_type", [BoundType.DOMINATES, BoundType.IS_DOMINATED])
-    def test_tiny_excess_is_renormalized_proportionally(self, bound_type: BoundType) -> None:
-        """Sub-threshold floating-point excess scales every finite bin."""
-        prob_arr = np.array(
-            [0.2, 0.3, 0.5 + PMF_MASS_TOL / 2],
-            dtype=np.float64,
-        )
-        current_mass = math.fsum(map(float, prob_arr))
-        excess = current_mass - 1.0
-        assert 0.0 < excess < PMF_MASS_TOL
-
-        prob_out, _, _ = enforce_mass_conservation(
-            prob_arr=prob_arr,
-            expected_p_min=0.0,
-            expected_p_max=0.0,
-            bound_type=bound_type,
-        )
-
-        expected = prob_arr * (1.0 / current_mass)
-        assert np.array_equal(prob_out, expected)
-
-    def test_dominates_can_consume_soft_p_min(self):
-        """DOMINATES holds p_max fixed and trims from the left including p_min."""
-        prob_arr = np.array([0.4, 0.1], dtype=np.float64)
-        prob_out, p_min, p_max = enforce_mass_conservation(
-            prob_arr=prob_arr,
-            expected_p_min=0.3,
-            expected_p_max=0.4,
-            bound_type=BoundType.DOMINATES,
-        )
-
-        assert np.allclose(prob_out, np.array([0.4, 0.1]))
-        assert np.isclose(p_min, 0.1)
-        assert np.isclose(p_max, 0.4)
-        assert np.isclose(math.fsum([*map(float, prob_out), p_min, p_max]), 1.0)
-
-    def test_is_dominated_can_consume_soft_p_max(self):
-        """IS_DOMINATED holds p_min fixed and trims from the right including p_max."""
-        prob_arr = np.array([0.1, 0.4], dtype=np.float64)
-        prob_out, p_min, p_max = enforce_mass_conservation(
-            prob_arr=prob_arr,
-            expected_p_min=0.4,
-            expected_p_max=0.3,
-            bound_type=BoundType.IS_DOMINATED,
-        )
-
-        assert np.allclose(prob_out, np.array([0.1, 0.4]))
-        assert np.isclose(p_min, 0.4)
-        assert np.isclose(p_max, 0.1)
-        assert np.isclose(math.fsum([*map(float, prob_out), p_min, p_max]), 1.0)
-
-
-class TestMassEnforcementDeficit:
-    """Test repair of roundoff-sized mass deficits."""
-
-    @pytest.mark.parametrize(
-        "bound_type",
-        [
-            BoundType.DOMINATES,
-            BoundType.IS_DOMINATED,
-        ],
-    )
-    def test_places_tiny_deficit_at_directionally_safe_finite_edge(
-        self,
-        bound_type: BoundType,
-    ) -> None:
-        """Sub-tolerance boundary slack returns to the conservative finite edge."""
-        prob_arr = np.array([0.4, 0.5999999999999999])
-        deficit = 1.0 - math.fsum(map(float, prob_arr))
-        expected_prob = prob_arr.copy()
-        edge_index = -1 if bound_type == BoundType.DOMINATES else 0
-        expected_prob[edge_index] += deficit
-
-        prob_out, p_min_out, p_max_out = enforce_mass_conservation(
-            prob_arr=prob_arr,
-            expected_p_min=0.0,
-            expected_p_max=0.0,
-            bound_type=bound_type,
-        )
-
-        np.testing.assert_array_equal(prob_out, expected_prob)
-        assert p_min_out == 0.0
-        assert p_max_out == 0.0
-
-    @pytest.mark.parametrize("bound_type", [BoundType.DOMINATES, BoundType.IS_DOMINATED])
-    def test_repairs_deficit_without_magnitude_restriction(self, bound_type: BoundType) -> None:
-        """Mass enforcement does not assume a bound on numerical error."""
-        prob_arr = np.array([0.4, 0.4])
-        expected_prob = prob_arr.copy()
-        edge_index = -1 if bound_type == BoundType.DOMINATES else 0
-        expected_prob[edge_index] += 0.2
-
-        prob_out, p_min, p_max = enforce_mass_conservation(
-            prob_arr=prob_arr,
-            expected_p_min=0.0,
-            expected_p_max=0.0,
-            bound_type=bound_type,
-        )
-
-        np.testing.assert_allclose(prob_out, expected_prob)
-        assert p_min == 0.0
-        assert p_max == 0.0
-
-
-class TestComputeTruncation:
-    """Test zero-edge stripping and index bookkeeping in truncation."""
-
-    def test_strips_zero_edges_before_tail_truncation(self):
-        """Strips zero edges before tail truncation."""
-        new_prob_arr, new_p_min, new_p_max, min_ind, max_ind = compute_truncation(
-            prob_arr=np.array([0.0, 0.8], dtype=np.float64),
-            p_min=0.0,
-            p_max=0.2,
-            tail_truncation=0.1,
-            bound_type=BoundType.DOMINATES,
-        )
-
-        assert np.allclose(new_prob_arr, np.array([0.8], dtype=np.float64))
-        assert np.isclose(new_p_min, 0.0)
-        assert np.isclose(new_p_max, 0.2)
-        assert (min_ind, max_ind) == (1, 1)
-
-    def test_keeps_boundary_when_it_is_the_first_remaining_element(self):
-        """Keeps boundary when it is the first remaining element."""
-        new_prob_arr, new_p_min, new_p_max, min_ind, max_ind = compute_truncation(
-            prob_arr=np.array([0.0, 0.2, 0.5], dtype=np.float64),
-            p_min=0.3,
-            p_max=0.0,
-            tail_truncation=0.1,
-            bound_type=BoundType.DOMINATES,
-        )
-
-        assert np.allclose(new_prob_arr, np.array([0.2, 0.5], dtype=np.float64))
-        assert np.isclose(new_p_min, 0.3)
-        assert np.isclose(new_p_max, 0.0)
-        assert (min_ind, max_ind) == (1, 2)
-
-    def test_truncation_folds_consumed_boundary_into_first_finite_bin(self):
-        """Truncation folds consumed boundary into first finite bin."""
-        new_prob_arr, new_p_min, new_p_max, min_ind, max_ind = compute_truncation(
-            prob_arr=np.array([0.2, 0.75], dtype=np.float64),
-            p_min=0.05,
-            p_max=0.0,
-            tail_truncation=0.1,
-            bound_type=BoundType.DOMINATES,
-        )
-
-        assert np.allclose(new_prob_arr, np.array([0.25, 0.75], dtype=np.float64))
-        assert np.isclose(new_p_min, 0.0)
-        assert np.isclose(new_p_max, 0.0)
-        assert (min_ind, max_ind) == (0, 1)
-
-    def test_strips_zero_edges_for_is_dominated_right_tail(self):
-        """Strips zero edges for is dominated right tail."""
-        new_prob_arr, new_p_min, new_p_max, min_ind, max_ind = compute_truncation(
-            prob_arr=np.array([0.8, 0.0], dtype=np.float64),
-            p_min=0.2,
-            p_max=0.0,
-            tail_truncation=0.1,
-            bound_type=BoundType.IS_DOMINATED,
-        )
-
-        assert np.allclose(new_prob_arr, np.array([0.8], dtype=np.float64))
-        assert np.isclose(new_p_min, 0.2)
-        assert np.isclose(new_p_max, 0.0)
-        assert (min_ind, max_ind) == (0, 0)
-
-    def test_dense_truncate_edges_updates_x_min_after_zero_edge_removal(self):
-        """Dense truncate edges updates x min after zero edge removal."""
-        dist = DenseDiscreteDist(
-            x_0=0.0,
-            step=1.0,
-            prob_arr=np.array([0.0, 0.8], dtype=np.float64),
-            p_max=0.2,
-        )
-
-        result = dist.truncate_edges(0.1, BoundType.DOMINATES)
-
-        assert np.allclose(result.x_array, np.array([1.0], dtype=np.float64))
-        assert np.allclose(result.prob_arr, np.array([0.8], dtype=np.float64))
-        assert np.isclose(result.p_min, 0.0)
-        assert np.isclose(result.p_max, 0.2)
-
-    def test_sparse_truncate_edges_updates_support_after_tail_zero_removal(self):
-        """Sparse truncate edges updates support after tail zero removal."""
-        dist = SparseDiscreteDist(
-            x_array=np.array([1.0, 2.0, 3.0], dtype=np.float64),
-            prob_arr=np.array([0.8, 0.1, 0.1], dtype=np.float64),
-        )
-
-        result = dist.truncate_edges(0.15, BoundType.DOMINATES)
-
-        assert np.allclose(result.x_array, np.array([1.0, 2.0], dtype=np.float64))
-        assert np.allclose(result.prob_arr, np.array([0.8, 0.1], dtype=np.float64))
-        assert np.isclose(result.p_min, 0.0)
-        assert np.isclose(result.p_max, 0.1)
-
-
-def test_raises_when_mass_is_at_least_total():
-    """Raises when mass is at least total."""
-    with pytest.raises(ValueError, match="mass must be smaller than total array mass"):
-        _zero_mass(
-            values=np.array([0.2, 0.8], dtype=np.float64),
-            mass=1.0,
-            from_left=True,
-            exact=True,
-        )
-
-
 class TestRediscretizeBoundarySemantics:
     """Test explicit boundary contracts during rediscretization."""
 
     def test_ctd_rejects_single_point_range(self):
         """CtD rediscretization requires distinct truncated support bounds."""
         dist = PLDRealization(
-            x_0=0.0,
-            step=1.0,
+            grid=GridSpec(
+                step=1.0,
+                n=1,
+                anchor=0.0,
+            ),
             prob_arr=np.array([1.0], dtype=np.float64),
         )
 
@@ -676,8 +445,11 @@ class TestRediscretizeBoundarySemantics:
         # Both bins have mass >> tail_truncation so neither is consumed.
         """Rediscretize near point mass distribution."""
         dist = DenseDiscreteDist(
-            x_0=0.5,
-            step=0.5,
+            grid=GridSpec(
+                step=0.5,
+                n=2,
+                anchor=0.5,
+            ),
             prob_arr=np.array([1.0 - 1e-6, 1e-6], dtype=np.float64),
         )
 
@@ -697,8 +469,8 @@ class TestRediscretizeBoundarySemantics:
 
     def test_is_dominated_moves_p_max_into_last_finite_cell(self):
         """A lower bound deliberately relaxes +inf to the last finite cell."""
-        dist = DenseDiscreteDist.from_x_array(
-            x_array=np.array([0.0, 1.0, 2.0], dtype=np.float64),
+        dist = DenseDiscreteDist(
+            grid=GridSpec(step=1.0, n=3, anchor=0.0),
             prob_arr=np.array([0.2, 0.3, 0.4], dtype=np.float64),
             p_max=0.1,
         )
@@ -720,8 +492,11 @@ class TestRediscretizeBoundarySemantics:
     def test_is_dominated_boundary_fold_downgrades_pld_realization(self):
         """Relaxing positive-infinity mass downgrades an exact realization."""
         dist = PLDRealization(
-            x_0=math.log(0.9),
-            step=0.1,
+            grid=GridSpec(
+                step=0.1,
+                n=2,
+                anchor=math.log(0.9),
+            ),
             prob_arr=np.array([0.8, 0.1], dtype=np.float64),
             p_max=0.1,
         )
@@ -741,8 +516,8 @@ class TestRediscretizeBoundarySemantics:
 
     def test_is_dominated_relaxes_p_max_before_left_tail_truncation(self):
         """Lower canonicalization prevents simultaneous real-domain boundaries."""
-        dist = DenseDiscreteDist.from_x_array(
-            x_array=np.array([0.0, 1.0, 2.0], dtype=np.float64),
+        dist = DenseDiscreteDist(
+            grid=GridSpec(step=1.0, n=3, anchor=0.0),
             prob_arr=np.array([0.05, 0.4, 0.45], dtype=np.float64),
             p_max=0.1,
         )
@@ -761,8 +536,8 @@ class TestRediscretizeBoundarySemantics:
 
     def test_dominates_moves_real_p_min_into_first_finite_cell(self):
         """An upper real bound absorbs -inf mass into its first finite cell."""
-        dist = DenseDiscreteDist.from_x_array(
-            x_array=np.array([0.0, 1.0, 2.0], dtype=np.float64),
+        dist = DenseDiscreteDist(
+            grid=GridSpec(step=1.0, n=3, anchor=0.0),
             prob_arr=np.array([0.2, 0.3, 0.4], dtype=np.float64),
             p_min=0.1,
         )
@@ -781,11 +556,10 @@ class TestRediscretizeBoundarySemantics:
 
     def test_dominates_geometric_keeps_zero_atom(self):
         """Dominates geometric keeps zero atom."""
-        dist = DenseDiscreteDist.from_x_array(
-            x_array=np.array([1.0, 2.0, 4.0], dtype=np.float64),
+        dist = DenseDiscreteDist(
+            grid=GridSpec(step=math.log(2.0), n=3, spacing_type=SpacingType.GEOMETRIC, anchor=1.0),
             prob_arr=np.array([0.2, 0.3, 0.4], dtype=np.float64),
             p_min=0.1,
-            spacing_type=SpacingType.GEOMETRIC,
             domain=Domain.POSITIVES,
         )
 
@@ -805,8 +579,11 @@ class TestRediscretizeBoundarySemantics:
     def test_ctd_real_linear_rediscretization_preserves_mass(self):
         """CtD rejects a real-domain distribution that is not a PLD realization."""
         dist = DenseDiscreteDist(
-            x_0=-1.0,
-            step=0.5,
+            grid=GridSpec(
+                step=0.5,
+                n=4,
+                anchor=-1.0,
+            ),
             prob_arr=np.array([0.15, 0.2, 0.25, 0.4], dtype=np.float64),
         )
 
@@ -821,8 +598,11 @@ class TestRediscretizeBoundarySemantics:
         """A truncation budget cannot hide an invalid negative-infinity atom."""
         p_min = 1e-6
         dist = DenseDiscreteDist(
-            x_0=0.0,
-            step=1.0,
+            grid=GridSpec(
+                step=1.0,
+                n=2,
+                anchor=0.0,
+            ),
             prob_arr=np.array([0.5, 0.5 - p_min], dtype=np.float64),
             p_min=p_min,
         )
@@ -837,11 +617,14 @@ class TestRediscretizeBoundarySemantics:
     def test_ctd_positive_geometric_rediscretization_preserves_zero_atom(self):
         """CtD rejects positive/geometric grids rather than silently rounding."""
         dist = DenseDiscreteDist(
-            x_0=1.0,
-            step=2.0,
+            grid=GridSpec(
+                step=math.log(2.0),
+                spacing_type=SpacingType.GEOMETRIC,
+                n=3,
+                anchor=1.0,
+            ),
             prob_arr=np.array([0.2, 0.3, 0.4], dtype=np.float64),
             p_min=0.1,
-            spacing_type=SpacingType.GEOMETRIC,
             domain=Domain.POSITIVES,
         )
 
@@ -849,7 +632,7 @@ class TestRediscretizeBoundarySemantics:
             project_dist_onto_grid_ctd(
                 dist=dist,
                 grid=GridSpec(
-                    x_0=1.0,
+                    anchor=1.0,
                     step=2.0,
                     n=3,
                     spacing_type=SpacingType.GEOMETRIC,
@@ -859,8 +642,11 @@ class TestRediscretizeBoundarySemantics:
     def test_ctd_rejects_positive_domain_linear_rediscretization(self):
         """CtD must not reinterpret positive values as real privacy losses."""
         dist = DenseDiscreteDist(
-            x_0=1.0,
-            step=1.0,
+            grid=GridSpec(
+                step=1.0,
+                n=2,
+                anchor=1.0,
+            ),
             prob_arr=np.array([0.4, 0.6], dtype=np.float64),
             domain=Domain.POSITIVES,
         )

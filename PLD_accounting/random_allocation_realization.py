@@ -6,8 +6,14 @@ from PLD_accounting.discrete_dist import DenseDiscreteDist, PLDRealization
 from PLD_accounting.distribution_discretization import (
     rediscretize_dist_by_bound,
 )
-from PLD_accounting.types import BoundType, SpacingType
+from PLD_accounting.types import BoundType, SpacingType, require_bound_type
 from PLD_accounting.utils import calc_pld_dual, negate_reverse_linear_distribution
+from PLD_accounting.validation import (
+    require_integer,
+    require_nonnegative_real,
+    require_positive_real,
+    require_type,
+)
 
 
 def realization_remove_base_distributions(
@@ -37,6 +43,11 @@ def realization_remove_base_distributions(
         Tuple ``(base, dual_base)`` with the requested linear-grid spacing.
 
     """
+    require_type(value=realization, expected_type=PLDRealization, name="realization")
+    require_positive_real(value=loss_discretization, name="loss_discretization")
+    require_nonnegative_real(value=tail_truncation, name="tail_truncation")
+    require_bound_type(value=bound_type)
+    require_integer(value=max_grid_mult, name="max_grid_mult")
     # Since dual can be derived only from a PLD realization, discretization can
     # come first for DOMINATES, but dual derivation must come first for IS_DOMINATED.
     # As described in the paper's CtD implementation remark, the DOMINATES path
@@ -65,9 +76,10 @@ def realization_remove_base_distributions(
     # plain DenseDiscreteDist rediscretization route unconditionally.
     dual_realization = calc_pld_dual(realization)
     neg_dual_linear = negate_reverse_linear_distribution(dual_realization)
+    # Type downgrade only: the same GridSpec carries over, so the rediscretization
+    # below bins against the identical coordinates the realization already had.
     lower_realization_input = DenseDiscreteDist(
-        x_0=realization.x_0,
-        step=realization.step,
+        grid=realization.grid,
         prob_arr=realization.prob_arr.copy(),
         p_min=realization.p_min,
         p_max=realization.p_max,
@@ -121,6 +133,11 @@ def realization_add_base_distribution(
         One ADD loss factor aligned to the requested linear grid.
 
     """
+    require_type(value=realization, expected_type=PLDRealization, name="realization")
+    require_positive_real(value=loss_discretization, name="loss_discretization")
+    require_nonnegative_real(value=tail_truncation, name="tail_truncation")
+    require_bound_type(value=bound_type)
+    require_integer(value=max_grid_mult, name="max_grid_mult")
     # Avoid inflating the grid when the target is finer than the original one.
     effective_disc = _realization_geom_loss_discretization(
         realization=realization,

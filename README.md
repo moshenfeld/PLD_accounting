@@ -45,22 +45,25 @@ Internal composition:
 
 Gaussian path (most common):
 
-- `gaussian_allocation_epsilon_range(delta, sigma, num_steps, num_selected=1, num_epochs=1, epsilon_accuracy=-1.0)`
+- `gaussian_allocation_epsilon_range(*, delta, sigma, num_steps, num_selected=1, num_epochs=1, epsilon_accuracy=-1.0)`
   - Adaptive upper/lower bounds for epsilon.
-- `gaussian_allocation_epsilon_configurable(params, config, bound_type=BoundType.DOMINATES)`
+- `gaussian_allocation_epsilon_configurable(*, params, config, bound_type=BoundType.DOMINATES)`
   - Single epsilon query with explicit discretization/convolution config.
-- `gaussian_allocation_delta_configurable(params, config, bound_type=BoundType.DOMINATES)`
+- `gaussian_allocation_delta_configurable(*, params, config, bound_type=BoundType.DOMINATES)`
   - Single delta query with explicit discretization/convolution config.
-- `gaussian_allocation_pld(params, config, bound_type=BoundType.DOMINATES)`
+- `gaussian_allocation_pld(*, params, config, bound_type=BoundType.DOMINATES)`
   - Build a reusable `dp_accounting.PrivacyLossDistribution`.
+- `gaussian_allocation_directional_pld(*, params, config, direction, bound_type=BoundType.DOMINATES)`
+  - One ADD or REMOVE directional distribution for the Gaussian path.
 
-Realization path (advanced):
+Realization path (advanced): these APIs require `ConvolutionMethod.GEOM`; other
+methods raise `ValueError`.
 
-- `general_allocation_pld(num_steps, num_selected, num_epochs, remove_realization, add_realization, config, bound_type=BoundType.DOMINATES)`
+- `general_allocation_pld(*, num_steps, num_selected, num_epochs, remove_realization, add_realization, config, bound_type=BoundType.DOMINATES)`
   - Build PLD from explicit `PLDRealization` inputs.
-- `general_allocation_epsilon(delta, num_steps, num_selected, num_epochs, remove_realization, add_realization, config, bound_type=BoundType.DOMINATES)`
+- `general_allocation_epsilon(*, delta, num_steps, num_selected, num_epochs, remove_realization, add_realization, config, bound_type=BoundType.DOMINATES)`
   - Epsilon query from explicit realizations.
-- `general_allocation_delta(epsilon, num_steps, num_selected, num_epochs, remove_realization, add_realization, config, bound_type=BoundType.DOMINATES)`
+- `general_allocation_delta(*, epsilon, num_steps, num_selected, num_epochs, remove_realization, add_realization, config, bound_type=BoundType.DOMINATES)`
   - Delta query from explicit realizations.
 
 Common notes:
@@ -84,20 +87,26 @@ regridding use the internal stochastic-domination engine required by those
 representations. This routing is fixed by the operation; there is no public
 discretization-method option.
 
+CtD reads each cell's mass and reciprocal moment from the source law and its
+dual, so a `loss_discretization` too coarse to leave at least four knots over
+the joint source/dual support raises `ValueError` instead of being clamped to a
+grid on which the float64 interval measures are not valid.
+
 For fixed-gap real-loss regridding, use
-`rediscretize_dist_by_bound(dist, tail_truncation, loss_discretization,
-bound_type)`. This public entry point selects CtD for `DOMINATES` and
+`rediscretize_dist_by_bound(*, dist, tail_truncation, loss_discretization, bound_type)`.
+This public entry point selects CtD for `DOMINATES` and
 directional stochastic domination for `IS_DOMINATED`; callers do not choose a
-discretization engine.
+discretization engine. The caller remains responsible for proving that the source
+dominates the mechanism it represents.
 
 ### Mechanism PLD Helpers
 
 Factory helpers for building `PLDRealization` inputs from specific mechanisms:
 
-- `gaussian_distribution(scale, value_discretization, tail_truncation, bound_type=BoundType.DOMINATES)`
+- `gaussian_distribution(*, scale, value_discretization=DEFAULT_LOSS_DISCRETIZATION, tail_truncation=DEFAULT_TAIL_TRUNCATION, bound_type=BoundType.DOMINATES)`
   - Discretizes the Gaussian mechanism PLD (L2 sensitivity 1) onto a linear grid.
   - Returns a `PLDRealization` for `DOMINATES` and a `DenseDiscreteDist` for `IS_DOMINATED`.
-- `laplace_distribution(scale, value_discretization, tail_truncation, bound_type=BoundType.DOMINATES)`
+- `laplace_distribution(*, scale, value_discretization=DEFAULT_LOSS_DISCRETIZATION, tail_truncation=DEFAULT_TAIL_TRUNCATION, bound_type=BoundType.DOMINATES)`
   - Discretizes the Laplace mechanism PLD (L1 sensitivity 1) onto a linear grid.
   - Same return semantics as `gaussian_distribution`.
 - `discrete_distribution(*, noise_dist, loss_discretization, tail_truncation, sensitivity=1)`
@@ -113,12 +122,29 @@ the general allocation APIs.
 
 PLD-based subsampling helpers:
 
-- `subsample_pld(pld, sampling_probability)`
+- `subsample_pld(*, pld, sampling_probability)`
   - Applies subsampling amplification to a `dp_accounting` PLD.
-- `subsample_pld_realization(base_pld, sampling_prob, direction)`
+  - Uses the dp_accounting adapter's default import bands.
+- `subsample_pld_realization(*, base_pld, sampling_prob, direction)`
   - Lower-level helper for `PLDRealization` inputs (REMOVE/ADD direction).
 
 Subsampling helpers use DOMINATES semantics (upper-bound style).
+
+### Supporting exports
+
+- `compose_full_pld(*, remove_dist, add_dist, bound_type)`
+  - Convert internal directional PLDs into a `dp_accounting` PLD.
+- `rediscretize_dist_by_bound(*, dist, tail_truncation, loss_discretization, bound_type)`
+  - Public fixed-gap real-loss regridding. See the bound-type notes above.
+- `dp_accounting_pmf_to_pld_realization(*, pmf, mass_drift_tol=..., mass_repair_tol=..., moment_drift_tol=..., moment_repair_tol=..., negative_drift_tol=..., negative_repair_tol=...)`
+  - Admit a pessimistic `dp_accounting` PMF as a `PLDRealization`.
+- `has_numba()`
+  - Whether optional Numba acceleration is active. Results are unaffected.
+
+Published library functions with more than one input argument are keyword-only.
+`dp_accounting_pmf_to_pld_realization` exposes keyword-only drift and repair
+bands for callers importing a known-noisier PMF; `subsample_pld` uses the
+defaults and does not forward them.
 
 ## Install
 

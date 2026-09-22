@@ -19,6 +19,7 @@ from PLD_accounting import (
     ConvolutionMethod,
     DenseDiscreteDist,
     Direction,
+    GridSpec,
     PLDRealization,
     PrivacyParams,
     discrete_distribution,
@@ -101,8 +102,7 @@ class TestMechanismDistributions:
     def test_count_noise_returns_directional_realizations(self):
         """The public discrete-noise helper returns valid REMOVE and ADD PLDs."""
         noise_dist = DenseDiscreteDist(
-            x_0=-2.0,
-            step=1.0,
+            grid=GridSpec(step=1.0, n=5, anchor=-2.0),
             prob_arr=np.array([0.1, 0.2, 0.4, 0.2, 0.1]),
         )
         remove, add = discrete_distribution(
@@ -153,22 +153,25 @@ class TestPLDRealizationType:
     def test_construction_with_valid_data(self):
         """Accept valid grids on non-negative losses with ``E[exp(-L)] < 1``."""
         prob_arr = np.array([0.3, 0.5, 0.2])
-        r = PLDRealization(x_0=0.1, step=0.1, prob_arr=prob_arr)
+        r = PLDRealization(grid=GridSpec(step=0.1, n=prob_arr.size, anchor=0.1), prob_arr=prob_arr)
         assert r.step == 0.1
         np.testing.assert_array_equal(r.prob_arr, prob_arr)
 
     def test_rejects_nonzero_p_min(self):
         """Reject mass at negative infinity while claiming a PLD realization."""
         with pytest.raises(ValueError):
-            PLDRealization(x_0=0.1, step=0.1, prob_arr=np.array([0.5]), p_min=0.5)
+            PLDRealization(
+                grid=GridSpec(step=0.1, n=1, anchor=0.1),
+                prob_arr=np.array([0.5]),
+                p_min=0.5,
+            )
 
     def test_rejects_sub_tolerance_nonzero_p_min(self):
         """The semantic p_min invariant is exact, not a floating-point estimate."""
         p_min = np.finfo(float).eps
         with pytest.raises(ValueError, match="requires p_min = 0"):
             PLDRealization(
-                x_0=0.1,
-                step=0.1,
+                grid=GridSpec(step=0.1, n=1, anchor=0.1),
                 prob_arr=np.array([1.0 - p_min]),
                 p_min=p_min,
             )
@@ -182,10 +185,10 @@ class TestPLDRealizationType:
         with pytest.raises(ValueError, match="read-only"):
             c.prob_arr[0] = -999.0
 
-    def test_from_linear_dist(self):
-        """Promote a dominating Gaussian grid to ``PLDRealization`` without losing mass."""
+    def test_realization_from_dominating_gaussian_grid(self):
+        """Build a ``PLDRealization`` on a dominating Gaussian grid without losing mass."""
         d = gaussian_distribution(scale=1.0, bound_type=BoundType.DOMINATES)
-        r = PLDRealization.from_linear_dist(d)
+        r = PLDRealization(grid=d.grid, prob_arr=d.prob_arr, p_min=d.p_min, p_max=d.p_max)
         assert isinstance(r, PLDRealization)
         assert abs(_total_mass(r) - 1.0) < MASS_TOL
 
@@ -242,56 +245,56 @@ class TestGaussianAllocationAPI:
     def test_epsilon_configurable_returns_positive_float(self):
         """``gaussian_allocation_epsilon_configurable`` should return a finite positive float ε."""
         params = PrivacyParams(sigma=SIGMA, num_steps=NUM_STEPS, delta=DELTA)
-        eps = gaussian_allocation_epsilon_configurable(params, COARSE_CONFIG)
+        eps = gaussian_allocation_epsilon_configurable(params=params, config=COARSE_CONFIG)
         assert isinstance(eps, float)
         assert np.isfinite(eps) and eps > 0
 
     def test_delta_configurable_returns_valid_probability(self):
         """``gaussian_allocation_delta_configurable`` must return δ strictly inside (0, 1)."""
         params = PrivacyParams(sigma=SIGMA, num_steps=NUM_STEPS, epsilon=EPSILON)
-        d = gaussian_allocation_delta_configurable(params, COARSE_CONFIG)
+        d = gaussian_allocation_delta_configurable(params=params, config=COARSE_CONFIG)
         assert isinstance(d, float)
         assert 0 < d < 1
 
     def test_pld_returns_privacy_loss_distribution(self):
         """``gaussian_allocation_pld`` should emit a standard ``dp_accounting`` PLD object."""
         params = PrivacyParams(sigma=SIGMA, num_steps=NUM_STEPS)
-        pld = gaussian_allocation_pld(params, COARSE_CONFIG)
+        pld = gaussian_allocation_pld(params=params, config=COARSE_CONFIG)
         assert isinstance(pld, privacy_loss_distribution.PrivacyLossDistribution)
 
     def test_pld_epsilon_query(self):
         """The composed PLD must answer ``get_epsilon_for_delta`` with a finite positive ε."""
         params = PrivacyParams(sigma=SIGMA, num_steps=NUM_STEPS)
-        pld = gaussian_allocation_pld(params, COARSE_CONFIG)
+        pld = gaussian_allocation_pld(params=params, config=COARSE_CONFIG)
         eps = pld.get_epsilon_for_delta(DELTA)
         assert np.isfinite(eps) and eps > 0
 
     def test_pld_delta_query(self):
         """The composed PLD must answer ``get_delta_for_epsilon`` with a valid δ in [0, 1)."""
         params = PrivacyParams(sigma=SIGMA, num_steps=NUM_STEPS)
-        pld = gaussian_allocation_pld(params, COARSE_CONFIG)
+        pld = gaussian_allocation_pld(params=params, config=COARSE_CONFIG)
         d = pld.get_delta_for_epsilon(EPSILON)
         assert 0 <= d < 1
 
     def test_epsilon_delta_round_trip(self):
         """ε→δ conversion should stay consistent with the original δ up to discretization slack."""
         params_eps = PrivacyParams(sigma=SIGMA, num_steps=NUM_STEPS, delta=DELTA)
-        eps = gaussian_allocation_epsilon_configurable(params_eps, COARSE_CONFIG)
+        eps = gaussian_allocation_epsilon_configurable(params=params_eps, config=COARSE_CONFIG)
         params_del = PrivacyParams(sigma=SIGMA, num_steps=NUM_STEPS, epsilon=eps)
-        d = gaussian_allocation_delta_configurable(params_del, COARSE_CONFIG)
+        d = gaussian_allocation_delta_configurable(params=params_del, config=COARSE_CONFIG)
         assert d <= DELTA * 1.5  # allow slack for discretization
 
     def test_dominates_geq_is_dominated(self):
         """Upper-bound (DOMINATES) ε should be no smaller than optimistic (IS_DOMINATED) ε."""
         params = PrivacyParams(sigma=SIGMA, num_steps=NUM_STEPS, delta=DELTA)
         eps_dom = gaussian_allocation_epsilon_configurable(
-            params,
-            COARSE_CONFIG,
+            params=params,
+            config=COARSE_CONFIG,
             bound_type=BoundType.DOMINATES,
         )
         eps_sub = gaussian_allocation_epsilon_configurable(
-            params,
-            COARSE_CONFIG,
+            params=params,
+            config=COARSE_CONFIG,
             bound_type=BoundType.IS_DOMINATED,
         )
         assert eps_dom >= eps_sub
@@ -300,16 +303,16 @@ class TestGaussianAllocationAPI:
         """With full participation, doubling composed steps should not shrink the reported ε."""
         p5 = PrivacyParams(sigma=SIGMA, num_steps=5, num_selected=5, delta=DELTA)
         p10 = PrivacyParams(sigma=SIGMA, num_steps=10, num_selected=10, delta=DELTA)
-        eps5 = gaussian_allocation_epsilon_configurable(p5, COARSE_CONFIG)
-        eps10 = gaussian_allocation_epsilon_configurable(p10, COARSE_CONFIG)
+        eps5 = gaussian_allocation_epsilon_configurable(params=p5, config=COARSE_CONFIG)
+        eps10 = gaussian_allocation_epsilon_configurable(params=p10, config=COARSE_CONFIG)
         assert eps10 >= eps5
 
     def test_larger_sigma_decreases_epsilon(self):
         """Increasing Gaussian noise scale should (weakly) reduce ε for an identical δ target."""
         p_lo = PrivacyParams(sigma=1.0, num_steps=NUM_STEPS, delta=DELTA)
         p_hi = PrivacyParams(sigma=3.0, num_steps=NUM_STEPS, delta=DELTA)
-        eps_lo = gaussian_allocation_epsilon_configurable(p_lo, COARSE_CONFIG)
-        eps_hi = gaussian_allocation_epsilon_configurable(p_hi, COARSE_CONFIG)
+        eps_lo = gaussian_allocation_epsilon_configurable(params=p_lo, config=COARSE_CONFIG)
+        eps_hi = gaussian_allocation_epsilon_configurable(params=p_hi, config=COARSE_CONFIG)
         assert eps_lo >= eps_hi
 
 
@@ -331,8 +334,8 @@ class TestConvolutionMethods:
         )
         params = PrivacyParams(sigma=SIGMA, num_steps=NUM_STEPS, delta=DELTA)
         eps = gaussian_allocation_epsilon_configurable(
-            params,
-            cfg,
+            params=params,
+            config=cfg,
             bound_type=BoundType.DOMINATES,
         )
         assert np.isfinite(eps) and eps > 0
@@ -350,16 +353,16 @@ class TestConvolutionMethods:
             tail_truncation=1e-6,
             convolution_method=ConvolutionMethod.FFT,
         )
-        eps_geom = gaussian_allocation_epsilon_configurable(params, cfg_geom)
-        eps_fft = gaussian_allocation_epsilon_configurable(params, cfg_fft)
+        eps_geom = gaussian_allocation_epsilon_configurable(params=params, config=cfg_geom)
+        eps_fft = gaussian_allocation_epsilon_configurable(params=params, config=cfg_fft)
         assert abs(eps_geom - eps_fft) < 0.3, f"GEOM={eps_geom:.6f}, FFT={eps_fft:.6f}"
 
     def test_geom_supports_is_dominated(self):
         """Geometric convolution must remain stable when requesting optimistic accounting."""
         params = PrivacyParams(sigma=SIGMA, num_steps=NUM_STEPS, delta=DELTA)
         eps = gaussian_allocation_epsilon_configurable(
-            params,
-            COARSE_CONFIG,
+            params=params,
+            config=COARSE_CONFIG,
             bound_type=BoundType.IS_DOMINATED,
         )
         assert np.isfinite(eps) and eps > 0
@@ -384,9 +387,9 @@ class TestConvolutionMethods:
 
         with pytest.raises(ValueError, match="supported only with ConvolutionMethod.GEOM"):
             gaussian_allocation_directional_pld(
-                params,
-                config,
-                direction,
+                params=params,
+                config=config,
+                direction=direction,
                 bound_type=BoundType.IS_DOMINATED,
             )
 
@@ -568,8 +571,8 @@ class TestCrossPathConsistency:
         """Specialized Gaussian accounting should match the general PLD pipeline within slack."""
         params = PrivacyParams(sigma=SIGMA, num_steps=NUM_STEPS, delta=DELTA)
         eps_gauss = gaussian_allocation_epsilon_configurable(
-            params,
-            COARSE_CONFIG,
+            params=params,
+            config=COARSE_CONFIG,
             bound_type=BoundType.DOMINATES,
         )
         rm, ad = _make_gaussian_realizations()
@@ -591,8 +594,8 @@ class TestCrossPathConsistency:
         """Gaussian vs realization δ queries should agree in order of magnitude."""
         params = PrivacyParams(sigma=SIGMA, num_steps=NUM_STEPS, epsilon=EPSILON)
         d_gauss = gaussian_allocation_delta_configurable(
-            params,
-            COARSE_CONFIG,
+            params=params,
+            config=COARSE_CONFIG,
             bound_type=BoundType.DOMINATES,
         )
         rm, ad = _make_gaussian_realizations()
@@ -622,48 +625,48 @@ class TestSubsampling:
     def test_realization_remove_returns_pld(self):
         """``subsample_pld_realization`` on REMOVE must return another valid ``PLDRealization``."""
         rm, _ = _make_gaussian_realizations()
-        out = subsample_pld_realization(rm, sampling_prob=0.5, direction=Direction.REMOVE)
+        out = subsample_pld_realization(base_pld=rm, sampling_prob=0.5, direction=Direction.REMOVE)
         assert isinstance(out, PLDRealization)
         assert abs(_total_mass(out) - 1.0) < MASS_TOL
 
     def test_realization_add_returns_pld(self):
         """``subsample_pld_realization`` on ADD must return another valid ``PLDRealization``."""
         _, ad = _make_gaussian_realizations()
-        out = subsample_pld_realization(ad, sampling_prob=0.5, direction=Direction.ADD)
+        out = subsample_pld_realization(base_pld=ad, sampling_prob=0.5, direction=Direction.ADD)
         assert isinstance(out, PLDRealization)
         assert abs(_total_mass(out) - 1.0) < MASS_TOL
 
     def test_realization_q1_returns_same(self):
         """Sampling probability ``1.0`` should short-circuit to the original realization object."""
         rm, _ = _make_gaussian_realizations()
-        out = subsample_pld_realization(rm, sampling_prob=1.0, direction=Direction.REMOVE)
+        out = subsample_pld_realization(base_pld=rm, sampling_prob=1.0, direction=Direction.REMOVE)
         assert out is rm
 
     def test_realization_rejects_direction_both(self):
         """Direction ``BOTH`` is invalid for the realization-level subsampling helper."""
         rm, _ = _make_gaussian_realizations()
         with pytest.raises(ValueError):
-            subsample_pld_realization(rm, sampling_prob=0.5, direction=Direction.BOTH)
+            subsample_pld_realization(base_pld=rm, sampling_prob=0.5, direction=Direction.BOTH)
 
     @pytest.mark.parametrize("bad_q", [0.0, -0.1, 1.5])
     def test_realization_rejects_invalid_prob(self, bad_q):
         """Sampling probabilities must lie strictly between zero and one."""
         rm, _ = _make_gaussian_realizations()
         with pytest.raises(ValueError):
-            subsample_pld_realization(rm, sampling_prob=bad_q, direction=Direction.REMOVE)
+            subsample_pld_realization(base_pld=rm, sampling_prob=bad_q, direction=Direction.REMOVE)
 
     def test_subsample_pld_returns_pld_type(self):
         """``subsample_pld`` must return another ``PrivacyLossDistribution`` for downstream use."""
         params = PrivacyParams(sigma=SIGMA, num_steps=NUM_STEPS)
-        pld = gaussian_allocation_pld(params, COARSE_CONFIG)
-        out = subsample_pld(pld, sampling_probability=0.5)
+        pld = gaussian_allocation_pld(params=params, config=COARSE_CONFIG)
+        out = subsample_pld(pld=pld, sampling_probability=0.5)
         assert isinstance(out, privacy_loss_distribution.PrivacyLossDistribution)
 
     def test_subsample_pld_reduces_epsilon(self):
         """Subsampling with ``q<1`` should not increase ε at a fixed δ (up to numeric slack)."""
         params = PrivacyParams(sigma=SIGMA, num_steps=NUM_STEPS)
-        pld = gaussian_allocation_pld(params, COARSE_CONFIG)
-        subsampled = subsample_pld(pld, sampling_probability=0.5)
+        pld = gaussian_allocation_pld(params=params, config=COARSE_CONFIG)
+        subsampled = subsample_pld(pld=pld, sampling_probability=0.5)
         eps_orig = pld.get_epsilon_for_delta(DELTA)
         eps_sub = subsampled.get_epsilon_for_delta(DELTA)
         assert eps_sub <= eps_orig + 0.01  # small slack for numerics
@@ -671,17 +674,17 @@ class TestSubsampling:
     def test_subsample_pld_q1_returns_same(self):
         """``sampling_probability=1`` should return the identical dp_accounting PLD object."""
         params = PrivacyParams(sigma=SIGMA, num_steps=NUM_STEPS)
-        pld = gaussian_allocation_pld(params, COARSE_CONFIG)
-        out = subsample_pld(pld, sampling_probability=1.0)
+        pld = gaussian_allocation_pld(params=params, config=COARSE_CONFIG)
+        out = subsample_pld(pld=pld, sampling_probability=1.0)
         assert out is pld
 
     @pytest.mark.parametrize("bad_q", [0.0, -0.5, 1.1])
     def test_subsample_pld_rejects_invalid_prob(self, bad_q):
         """Invalid ``sampling_probability`` values must raise before touching the PLD."""
         params = PrivacyParams(sigma=SIGMA, num_steps=NUM_STEPS)
-        pld = gaussian_allocation_pld(params, COARSE_CONFIG)
+        pld = gaussian_allocation_pld(params=params, config=COARSE_CONFIG)
         with pytest.raises(ValueError):
-            subsample_pld(pld, sampling_probability=bad_q)
+            subsample_pld(pld=pld, sampling_probability=bad_q)
 
 
 # ===================================================================
@@ -695,68 +698,59 @@ class TestInputValidation:
     @pytest.mark.parametrize("bad_sigma", [0, -1.0])
     def test_gaussian_rejects_bad_sigma(self, bad_sigma):
         """Gaussian accounting must reject non-positive noise scales."""
-        params = PrivacyParams(sigma=bad_sigma, num_steps=NUM_STEPS, delta=DELTA)
         with pytest.raises(ValueError):
-            gaussian_allocation_epsilon_configurable(params, COARSE_CONFIG)
+            PrivacyParams(sigma=bad_sigma, num_steps=NUM_STEPS, delta=DELTA)
 
     def test_gaussian_rejects_zero_num_steps(self):
         """Composition depth ``num_steps`` must be strictly positive."""
-        params = PrivacyParams(sigma=SIGMA, num_steps=0, delta=DELTA)
         with pytest.raises(ValueError):
-            gaussian_allocation_epsilon_configurable(params, COARSE_CONFIG)
+            PrivacyParams(sigma=SIGMA, num_steps=0, delta=DELTA)
 
     @pytest.mark.parametrize("bad_sigma", [np.nan, np.inf])
     def test_gaussian_rejects_nonfinite_sigma(self, bad_sigma):
         """Non-finite noise scales are rejected explicitly."""
-        params = PrivacyParams(sigma=bad_sigma, num_steps=NUM_STEPS, delta=DELTA)
         with pytest.raises(ValueError, match="finite"):
-            gaussian_allocation_epsilon_configurable(params, COARSE_CONFIG)
+            PrivacyParams(sigma=bad_sigma, num_steps=NUM_STEPS, delta=DELTA)
 
     def test_gaussian_rejects_boolean_integer_parameters(self):
         """Booleans are not accepted as composition counts."""
-        params = PrivacyParams(sigma=SIGMA, num_steps=True, delta=DELTA)
         with pytest.raises(TypeError, match="num_steps must be an integer"):
-            gaussian_allocation_epsilon_configurable(params, COARSE_CONFIG)
+            PrivacyParams(sigma=SIGMA, num_steps=True, delta=DELTA)
 
     def test_rejects_invalid_convolution_method_type(self):
         """Configuration enum fields must contain the declared enum type."""
-        config = AllocationSchemeConfig(convolution_method="fft")  # type: ignore[arg-type]
-        params = PrivacyParams(sigma=SIGMA, num_steps=NUM_STEPS, delta=DELTA)
         with pytest.raises(TypeError, match="convolution_method"):
-            gaussian_allocation_epsilon_configurable(params, config)
+            AllocationSchemeConfig(convolution_method="fft")  # type: ignore[arg-type]
 
     @pytest.mark.parametrize("bad_delta", [0.0, 1.0, -0.1])
     def test_gaussian_rejects_bad_delta(self, bad_delta):
         """δ targets must be valid probabilities strictly between zero and one."""
-        params = PrivacyParams(sigma=SIGMA, num_steps=NUM_STEPS, delta=bad_delta)
         with pytest.raises(ValueError):
-            gaussian_allocation_epsilon_configurable(params, COARSE_CONFIG)
+            PrivacyParams(sigma=SIGMA, num_steps=NUM_STEPS, delta=bad_delta)
 
     @pytest.mark.parametrize("bad_eps", [0.0, -1.0])
     def test_gaussian_rejects_bad_epsilon(self, bad_eps):
         """ε targets must be strictly positive when requesting δ via the configurable API."""
-        params = PrivacyParams(sigma=SIGMA, num_steps=NUM_STEPS, epsilon=bad_eps)
         with pytest.raises(ValueError):
-            gaussian_allocation_delta_configurable(params, COARSE_CONFIG)
+            PrivacyParams(sigma=SIGMA, num_steps=NUM_STEPS, epsilon=bad_eps)
 
     def test_num_selected_exceeds_num_steps(self):
         """``num_selected`` cannot exceed ``num_steps`` for random-allocation accounting."""
-        params = PrivacyParams(
-            sigma=SIGMA,
-            num_steps=5,
-            num_selected=10,
-            delta=DELTA,
-        )
         with pytest.raises(ValueError, match="num_selected"):
-            gaussian_allocation_epsilon_configurable(params, COARSE_CONFIG)
+            PrivacyParams(
+                sigma=SIGMA,
+                num_steps=5,
+                num_selected=10,
+                delta=DELTA,
+            )
 
     def test_bound_type_both_rejected_for_gaussian_epsilon(self):
         """``BoundType.BOTH`` is not implemented for the Gaussian ε helper."""
         params = PrivacyParams(sigma=SIGMA, num_steps=NUM_STEPS, delta=DELTA)
         with pytest.raises(ValueError):
             gaussian_allocation_epsilon_configurable(
-                params,
-                COARSE_CONFIG,
+                params=params,
+                config=COARSE_CONFIG,
                 bound_type=BoundType.BOTH,
             )
 

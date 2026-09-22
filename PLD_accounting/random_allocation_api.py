@@ -32,15 +32,18 @@ from PLD_accounting.types import (
     ConvolutionMethod,
     Direction,
     PrivacyParams,
+    require_allocation_config,
+    require_bound_type,
+    require_direction,
+    require_privacy_params,
 )
 from PLD_accounting.utils import combine_best_of_two_plds
 from PLD_accounting.validation import (
-    validate_allocation_params,
-    validate_allocation_scheme_config,
-    validate_bound_type,
-    validate_delta,
-    validate_epsilon,
-    validate_privacy_params,
+    require_allocation_counts,
+    require_finite_real,
+    require_open_unit_interval,
+    require_positive_real,
+    require_type,
 )
 
 # =============================================================================
@@ -49,6 +52,7 @@ from PLD_accounting.validation import (
 
 
 def gaussian_allocation_epsilon_range(
+    *,
     delta: float,
     sigma: float,
     num_steps: int,
@@ -64,13 +68,15 @@ def gaussian_allocation_epsilon_range(
         num_steps: Total number of random-allocation steps.
         num_selected: Number of selections per epoch.
         num_epochs: Number of epochs.
-        epsilon_accuracy: Absolute convergence target on the best upper/lower epsilon gap.
-            Negative epsilon_accuracy means ~10% of the correct epsilon value.
+        epsilon_accuracy: Nonnegative value is an absolute gap. A negative value
+            stops when ``upper / lower <= 1 + DEFAULT_RELATIVE_ACCURACY`` and is
+            reported back verbatim rather than resolved to a target.
 
     Returns:
         A tuple ``(upper_bound, lower_bound)``.
 
     """
+    require_finite_real(value=epsilon_accuracy, name="epsilon_accuracy")
     params = PrivacyParams(
         sigma=sigma,
         num_steps=num_steps,
@@ -78,7 +84,7 @@ def gaussian_allocation_epsilon_range(
         num_epochs=num_epochs,
         delta=delta,
     )
-    validate_privacy_params(params, require_delta=True)
+    params.require_delta()
 
     result = optimize_allocation_epsilon_range(
         params=params,
@@ -89,6 +95,7 @@ def gaussian_allocation_epsilon_range(
 
 
 def gaussian_allocation_epsilon_configurable(
+    *,
     params: PrivacyParams,
     config: AllocationSchemeConfig,
     bound_type: BoundType = BoundType.DOMINATES,
@@ -107,10 +114,10 @@ def gaussian_allocation_epsilon_configurable(
         The epsilon value corresponding to ``params.delta``.
 
     """
-    # Input validation
-    validate_privacy_params(params, require_delta=True)
-    validate_allocation_scheme_config(config)
-    validate_bound_type(bound_type)
+    require_privacy_params(value=params)
+    params.require_delta()
+    require_allocation_config(value=config)
+    require_bound_type(value=bound_type)
 
     full_pld = gaussian_allocation_pld(
         params=params,
@@ -121,6 +128,7 @@ def gaussian_allocation_epsilon_configurable(
 
 
 def gaussian_allocation_delta_configurable(
+    *,
     params: PrivacyParams,
     config: AllocationSchemeConfig,
     bound_type: BoundType = BoundType.DOMINATES,
@@ -139,10 +147,10 @@ def gaussian_allocation_delta_configurable(
         The delta value corresponding to ``params.epsilon``.
 
     """
-    # Input validation
-    validate_privacy_params(params, require_epsilon=True)
-    validate_allocation_scheme_config(config)
-    validate_bound_type(bound_type)
+    require_privacy_params(value=params)
+    params.require_epsilon()
+    require_allocation_config(value=config)
+    require_bound_type(value=bound_type)
 
     full_pld = gaussian_allocation_pld(
         params=params,
@@ -153,6 +161,7 @@ def gaussian_allocation_delta_configurable(
 
 
 def gaussian_allocation_directional_pld(
+    *,
     params: PrivacyParams,
     config: AllocationSchemeConfig,
     direction: Direction,
@@ -163,11 +172,10 @@ def gaussian_allocation_directional_pld(
     ``BoundType.IS_DOMINATED`` is supported only by the GEOM convolution
     method, for both directions.
     """
-    validate_privacy_params(params)
-    validate_allocation_scheme_config(config)
-    validate_bound_type(bound_type)
-    if direction not in (Direction.ADD, Direction.REMOVE):
-        raise ValueError(f"Invalid direction: {direction}")
+    require_privacy_params(value=params)
+    require_allocation_config(value=config)
+    require_bound_type(value=bound_type)
+    require_direction(value=direction)
 
     if bound_type == BoundType.IS_DOMINATED and config.convolution_method != ConvolutionMethod.GEOM:
         raise ValueError(
@@ -212,6 +220,7 @@ def gaussian_allocation_directional_pld(
 
 
 def gaussian_allocation_pld(
+    *,
     params: PrivacyParams,
     config: AllocationSchemeConfig,
     bound_type: BoundType = BoundType.DOMINATES,
@@ -231,6 +240,9 @@ def gaussian_allocation_pld(
         A ``dp_accounting`` ``PrivacyLossDistribution`` for both privacy directions.
 
     """
+    require_privacy_params(value=params)
+    require_allocation_config(value=config)
+    require_bound_type(value=bound_type)
     remove_dist = gaussian_allocation_directional_pld(
         params=params,
         config=config,
@@ -256,6 +268,7 @@ def gaussian_allocation_pld(
 
 
 def general_allocation_epsilon(
+    *,
     delta: float,
     num_steps: int,
     num_selected: int,
@@ -284,17 +297,12 @@ def general_allocation_epsilon(
         Supports only the GEOM convolution method.
 
     """
-    # Input validation
-    validate_delta(delta)
-    validate_allocation_params(num_steps, num_selected, num_epochs)
-    if not isinstance(remove_realization, PLDRealization):
-        raise TypeError(
-            f"remove_realization must be PLDRealization, got {type(remove_realization)}"
-        )
-    if not isinstance(add_realization, PLDRealization):
-        raise TypeError(f"add_realization must be PLDRealization, got {type(add_realization)}")
-    validate_allocation_scheme_config(config)
-    validate_bound_type(bound_type)
+    require_open_unit_interval(value=delta, name="delta")
+    require_allocation_counts(num_steps=num_steps, num_selected=num_selected, num_epochs=num_epochs)
+    require_type(value=remove_realization, expected_type=PLDRealization, name="remove_realization")
+    require_type(value=add_realization, expected_type=PLDRealization, name="add_realization")
+    require_allocation_config(value=config)
+    require_bound_type(value=bound_type)
 
     pld = general_allocation_pld(
         num_steps=num_steps,
@@ -309,6 +317,7 @@ def general_allocation_epsilon(
 
 
 def general_allocation_delta(
+    *,
     epsilon: float,
     num_steps: int,
     num_selected: int,
@@ -337,17 +346,12 @@ def general_allocation_delta(
         Supports only the GEOM convolution method.
 
     """
-    # Input validation
-    validate_epsilon(epsilon)
-    validate_allocation_params(num_steps, num_selected, num_epochs)
-    if not isinstance(remove_realization, PLDRealization):
-        raise TypeError(
-            f"remove_realization must be PLDRealization, got {type(remove_realization)}"
-        )
-    if not isinstance(add_realization, PLDRealization):
-        raise TypeError(f"add_realization must be PLDRealization, got {type(add_realization)}")
-    validate_allocation_scheme_config(config)
-    validate_bound_type(bound_type)
+    require_positive_real(value=epsilon, name="epsilon")
+    require_allocation_counts(num_steps=num_steps, num_selected=num_selected, num_epochs=num_epochs)
+    require_type(value=remove_realization, expected_type=PLDRealization, name="remove_realization")
+    require_type(value=add_realization, expected_type=PLDRealization, name="add_realization")
+    require_allocation_config(value=config)
+    require_bound_type(value=bound_type)
 
     pld = general_allocation_pld(
         num_steps=num_steps,
@@ -362,6 +366,7 @@ def general_allocation_delta(
 
 
 def general_allocation_pld(
+    *,
     num_steps: int,
     num_selected: int,
     num_epochs: int,
@@ -388,17 +393,11 @@ def general_allocation_pld(
         Supports only the GEOM convolution method.
 
     """
-    # Input validation
-    validate_allocation_params(num_steps, num_selected, num_epochs)
-    if not isinstance(remove_realization, PLDRealization):
-        raise TypeError(
-            f"remove_realization must be PLDRealization, got {type(remove_realization)}"
-        )
-    if not isinstance(add_realization, PLDRealization):
-        raise TypeError(f"add_realization must be PLDRealization, got {type(add_realization)}")
-    validate_allocation_scheme_config(config)
-    validate_bound_type(bound_type)
-    # Validate that geometric convolution is used for realization path
+    require_allocation_counts(num_steps=num_steps, num_selected=num_selected, num_epochs=num_epochs)
+    require_type(value=remove_realization, expected_type=PLDRealization, name="remove_realization")
+    require_type(value=add_realization, expected_type=PLDRealization, name="add_realization")
+    require_allocation_config(value=config)
+    require_bound_type(value=bound_type)
     if config.convolution_method != ConvolutionMethod.GEOM:
         raise ValueError(
             "PLD realization-based allocation requires geometric convolution. "

@@ -5,7 +5,7 @@ import math
 import numpy as np
 import pytest
 
-from PLD_accounting.discrete_dist import PLDRealization, SparseDiscreteDist
+from PLD_accounting.discrete_dist import GridSpec, PLDRealization, SparseDiscreteDist
 from PLD_accounting.subsample_pld import (
     _calc_subsampled_grid,
     _stable_subsampling_transformation,
@@ -16,8 +16,7 @@ from PLD_accounting.types import Direction
 
 def _simple_remove_dist() -> PLDRealization:
     return PLDRealization(
-        x_0=0.0,
-        step=0.5,
+        grid=GridSpec(step=0.5, n=4, anchor=0.0),
         prob_arr=np.array([0.4, 0.3, 0.2, 0.1], dtype=np.float64),
     )
 
@@ -42,7 +41,7 @@ def test_subsample_pld_realization_rejects_invalid_sampling_probability():
 def test_subsample_pld_realization_rejects_direction_both():
     """Subsample pld realization rejects direction both."""
     dist = _simple_remove_dist()
-    with pytest.raises(ValueError, match="Direction BOTH is invalid"):
+    with pytest.raises(ValueError, match="direction must be one of"):
         subsample_pld_realization(
             base_pld=dist,
             sampling_prob=0.5,
@@ -56,7 +55,7 @@ def test_subsample_pld_realization_rejects_non_realization_input():
         x_array=np.array([-1.0, -0.5, 0.0, 0.5], dtype=np.float64),
         prob_arr=np.array([0.1, 0.2, 0.3, 0.4], dtype=np.float64),
     )
-    with pytest.raises(TypeError, match="requires PLDRealization"):
+    with pytest.raises(TypeError, match="must be PLDRealization"):
         subsample_pld_realization(
             base_pld=dist,
             sampling_prob=0.5,
@@ -84,14 +83,13 @@ def test_subsample_pld_realization_returns_valid_pld_realization_remove():
         direction=Direction.REMOVE,
     )
     assert isinstance(result, PLDRealization)
-    result._validate_pld_realization()
+    result._require_pld_realization()
 
 
 def test_subsample_pld_realization_returns_valid_pld_realization_add():
     """Subsample pld realization returns valid pld realization add."""
     dist = PLDRealization(
-        x_0=0.0,
-        step=0.25,
+        grid=GridSpec(step=0.25, n=5, anchor=0.0),
         prob_arr=np.array([0.24, 0.2, 0.18, 0.16, 0.14], dtype=np.float64),
         p_max=0.08,
     )
@@ -101,7 +99,7 @@ def test_subsample_pld_realization_returns_valid_pld_realization_add():
         direction=Direction.ADD,
     )
     assert isinstance(result, PLDRealization)
-    result._validate_pld_realization()
+    result._require_pld_realization()
 
 
 def test_remove_ctd_mixes_non_pld_dual_branch_before_projecting():
@@ -112,7 +110,7 @@ def test_remove_ctd_mixes_non_pld_dual_branch_before_projecting():
         sampling_prob=0.3,
         direction=Direction.REMOVE,
     )
-    result._validate_pld_realization()
+    result._require_pld_realization()
 
 
 def test_subsample_pld_realization_add_places_positive_infinity_mass_at_max_add_loss():
@@ -121,8 +119,11 @@ def test_subsample_pld_realization_add_places_positive_infinity_mass_at_max_add_
     """Subsample pld realization add places positive infinity mass at max add loss."""
     q = 0.3708686650516492
     dist = PLDRealization(
-        x_0=-6.305102226697834,
-        step=0.02532892132180583,
+        grid=GridSpec(
+            step=0.02532892132180583,
+            n=np.full(44, 0.0018884873605871 / 44.0, dtype=np.float64).size,
+            anchor=-6.305102226697834,
+        ),
         prob_arr=np.full(44, 0.0018884873605871 / 44.0, dtype=np.float64),
         p_max=0.998111512639413,
     )
@@ -135,18 +136,17 @@ def test_subsample_pld_realization_add_places_positive_infinity_mass_at_max_add_
 
     max_add_loss = -math.log1p(-q)
     assert result.x_array[-1] >= max_add_loss
-    result._validate_pld_realization()
+    result._require_pld_realization()
 
 
 def test_calc_subsampled_grid_rejects_invalid_bucket_count():
     """Calc subsampled grid rejects invalid bucket count."""
     with pytest.raises(ValueError, match="num_buckets must be >= 2"):
         _calc_subsampled_grid(
-            min_loss=0.0,
-            discretization=0.1,
-            num_buckets=1,
+            source_grid=GridSpec(step=0.1, n=1),
             sampling_prob=0.5,
             direction=Direction.REMOVE,
+            include_right=None,
         )
 
 
@@ -154,11 +154,10 @@ def test_calc_subsampled_grid_rejects_invalid_sampling_prob():
     """Calc subsampled grid rejects invalid sampling probability."""
     with pytest.raises(ValueError, match="sampling_prob must be in"):
         _calc_subsampled_grid(
-            min_loss=0.0,
-            discretization=0.1,
-            num_buckets=10,
+            source_grid=GridSpec(step=0.1, n=10),
             sampling_prob=0.0,
             direction=Direction.REMOVE,
+            include_right=None,
         )
 
 

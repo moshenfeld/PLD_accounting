@@ -1,4 +1,4 @@
-"""Pytest configuration and fixtures for the basic (unit) test suite."""
+"""Pytest configuration and fixtures for the public ``tests`` suite."""
 
 import os
 from pathlib import Path

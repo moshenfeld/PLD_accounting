@@ -1,8 +1,16 @@
-"""Utility functions for distribution operations and numerical stability."""
+"""Distribution-level operations shared by the convolution and allocation routes.
+
+Boundary-mass algebra for sums, binary self-composition, combination of two bounds
+of one quantity, the exp/log and reflection transforms, and the canonical PLD dual.
+
+Every operation preserves or explicitly replaces its inputs' ``GridSpec``.
+``calc_pld_dual`` is the single dualization boundary, and the place where a
+reciprocal-moment deficit becomes mass at ``+inf``.
+"""
 
 from __future__ import annotations
 
-import math
+from dataclasses import replace
 from typing import Any, Callable
 
 import numpy as np
@@ -14,6 +22,9 @@ from PLD_accounting.discrete_dist import (
     Domain,
     GridSpec,
     PLDRealization,
+    require_dense_dist,
+    require_geometric_positives_dist,
+    require_linear_reals_dist,
 )
 from PLD_accounting.distribution_discretization import (
     project_dist_onto_grid_ctd,
@@ -21,10 +32,17 @@ from PLD_accounting.distribution_discretization import (
 )
 from PLD_accounting.distribution_utils import (
     enforce_mass_conservation,
+    exp_moment_terms,
     kahan_reverse_exclusive_cumsum,
-    stable_array_equal,
+    signed_unit_residual,
+    trim_mass_from_edge,
 )
-from PLD_accounting.types import BoundType, SpacingType
+from PLD_accounting.types import BoundType, require_bound_type
+from PLD_accounting.validation import (
+    require_nonnegative_real,
+    require_positive_int,
+    require_type,
+)
 
 # =============================================================================
 # Boundary-Mass Convolution Utilities
@@ -32,6 +50,7 @@ from PLD_accounting.types import BoundType, SpacingType
 
 
 def convolve_boundary_masses(
+    *,
     p_min_1: float,
     p_max_1: float,
     p_min_2: float,
@@ -65,6 +84,7 @@ def convolve_boundary_masses(
 
 
 def self_convolve_boundary_masses(
+    *,
     dist: DiscreteDistBase,
     num_convolutions: int,
 ) -> tuple[float, float]:
@@ -94,52 +114,25 @@ def binary_self_convolve(
     tail_truncation: float,
     bound_type: BoundType,
     convolve: Callable[..., DenseDiscreteDist],
-    lattice_anchor: float | None = None,
 ) -> DenseDiscreteDist:
     """Exponentiation by squaring-based self-convolution using a provided convolve function.
 
     Algorithm 3 (`self-conv`), in Appendix C of
     https://arxiv.org/abs/2602.17284.
 
-    If ``lattice_anchor`` is provided, it is carried alongside each intermediate
-    distribution and their sum is supplied to ``convolve`` as ``target_anchor``.
+    Each intermediate distribution carries its own ``GridSpec``, so ``convolve``
+    derives the output lattice from its two inputs; no lattice metadata travels
+    alongside the distributions.
     """
-    if num_convolutions < 1:
-        raise ValueError(f"num_convolutions must be >= 1, got {num_convolutions}")
+    require_dense_dist(dist=dist, name="dist")
+    require_positive_int(value=num_convolutions, name="num_convolutions")
+    require_nonnegative_real(value=tail_truncation, name="tail_truncation")
+    require_bound_type(value=bound_type)
     if num_convolutions == 1:
         return dist
 
-    def convolve_with_anchor(
-        dist_1: DenseDiscreteDist,
-        anchor_1: float | None,
-        dist_2: DenseDiscreteDist,
-        anchor_2: float | None,
-        truncation: float,
-    ) -> tuple[DenseDiscreteDist, float | None]:
-        """Convolve two distributions and sum their optional lattice anchors."""
-        # Anchors all descend from the one lattice_anchor, so they are either
-        # both set or both None; only anchored convolves accept target_anchor.
-        if anchor_1 is None or anchor_2 is None:
-            target_anchor = None
-            anchor_kwargs: dict[str, float] = {}
-        else:
-            target_anchor = anchor_1 + anchor_2
-            anchor_kwargs = {"target_anchor": target_anchor}
-        return (
-            convolve(
-                dist_1=dist_1,
-                dist_2=dist_2,
-                tail_truncation=truncation,
-                bound_type=bound_type,
-                **anchor_kwargs,
-            ),
-            target_anchor,
-        )
-
     base_dist = dist
-    base_anchor = lattice_anchor
     acc_dist = None
-    acc_anchor = lattice_anchor
     # Tail budget. Every convolve below is charged tail_truncation / num_convolutions
     # using the *current* counter, which halves each pass, so the per-call charge
     # doubles each pass and peaks at tail_truncation on the final pass. A doubling
@@ -151,23 +144,20 @@ def binary_self_convolve(
         if num_convolutions & 1:
             if acc_dist is None:
                 acc_dist = base_dist
-                acc_anchor = base_anchor
             else:
-                acc_dist, acc_anchor = convolve_with_anchor(
-                    acc_dist,
-                    acc_anchor,
-                    base_dist,
-                    base_anchor,
-                    tail_truncation / num_convolutions,
+                acc_dist = convolve(
+                    dist_1=acc_dist,
+                    dist_2=base_dist,
+                    tail_truncation=tail_truncation / num_convolutions,
+                    bound_type=bound_type,
                 )
         num_convolutions >>= 1
         if num_convolutions > 0:
-            base_dist, base_anchor = convolve_with_anchor(
-                base_dist,
-                base_anchor,
-                base_dist,
-                base_anchor,
-                tail_truncation / num_convolutions,
+            base_dist = convolve(
+                dist_1=base_dist,
+                dist_2=base_dist,
+                tail_truncation=tail_truncation / num_convolutions,
+                bound_type=bound_type,
             )
     # For a power-of-two count acc_dist is never set; return the final squared base_dist.
     return acc_dist if acc_dist is not None else base_dist
@@ -187,6 +177,9 @@ def combine_distributions(
     identical dense support grid; callers are responsible for projecting one
     distribution onto the other's grid first.
     """
+    require_dense_dist(dist=dist_1, name="dist_1")
+    require_dense_dist(dist=dist_2, name="dist_2")
+    require_bound_type(value=bound_type)
     if dist_1.domain != dist_2.domain:
         raise ValueError("combine_distributions requires matching domains")
     if dist_1.spacing_type != dist_2.spacing_type:
@@ -199,12 +192,10 @@ def combine_distributions(
     else:
         raise ValueError(f"Unknown BoundType: {bound_type}")
 
-    if not stable_array_equal(value_1=dist_1.x_array, value_2=dist_2.x_array):
+    if dist_1.grid != dist_2.grid:
         raise ValueError(
-            "combine_distributions requires identical support grids, got sizes "
-            f"{dist_1.x_array.size} and {dist_2.x_array.size} with ranges "
-            f"[{dist_1.x_array[0]}, {dist_1.x_array[-1]}] and "
-            f"[{dist_2.x_array[0]}, {dist_2.x_array[-1]}]"
+            f"combine_distributions requires identical support grids, got "
+            f"{dist_1.grid} and {dist_2.grid}"
         )
 
     ccdf_1 = _ccdf_from_pmf(dist_1)
@@ -230,12 +221,10 @@ def combine_distributions(
     )
 
     return DenseDiscreteDist(
-        x_0=dist_1.x_0,
-        step=dist_1.step,
+        grid=dist_1.grid,
         prob_arr=prob_arr,
         p_min=p_min,
         p_max=p_max,
-        spacing_type=dist_1.spacing_type,
         domain=dist_1.domain,
     )
 
@@ -257,61 +246,58 @@ def combine_best_of_two_plds(
     and never looser than the other candidate by more than one fine grid step.
     On equal steps ``dist_1`` is the anchor.
     """
-    if not (isinstance(dist_1, DenseDiscreteDist) and dist_1.spacing_type == SpacingType.LINEAR):
-        raise TypeError(
-            "dist_1: expected DenseDiscreteDist with LINEAR spacing, "
-            f"got {type(dist_1).__name__} with spacing {getattr(dist_1, 'spacing_type', '?')}"
-        )
-    if not (isinstance(dist_2, DenseDiscreteDist) and dist_2.spacing_type == SpacingType.LINEAR):
-        raise TypeError(
-            "dist_2: expected DenseDiscreteDist with LINEAR spacing, "
-            f"got {type(dist_2).__name__} with spacing {getattr(dist_2, 'spacing_type', '?')}"
-        )
-
+    require_linear_reals_dist(dist=dist_1, name="dist_1")
+    require_linear_reals_dist(dist=dist_2, name="dist_2")
+    require_bound_type(value=bound_type)
     if bound_type == BoundType.DOMINATES:
-        if dist_1.p_min != 0.0 or dist_2.p_min != 0.0:
-            raise ValueError(
-                "combine_best_of_two_plds requires canonical dominating inputs "
-                "with p_min = 0 exactly; "
-                f"dist_1.p_min={dist_1.p_min:.2e}, dist_2.p_min={dist_2.p_min:.2e}"
-            )
-    elif bound_type == BoundType.IS_DOMINATED:
-        for name, dist in (("dist_1", dist_1), ("dist_2", dist_2)):
-            if dist.p_max != 0.0:
-                raise ValueError(
-                    "combine_best_of_two_plds requires canonical dominated "
-                    f"inputs with p_max = 0 exactly; {name}.p_max={dist.p_max:.2e}"
-                )
+        boundary, label = "p_min", "dominating"
     else:
-        raise ValueError(f"Unknown BoundType: {bound_type}")
+        boundary, label = "p_max", "dominated"
+    for name, dist in (("dist_1", dist_1), ("dist_2", dist_2)):
+        value = getattr(dist, boundary)
+        if value != 0.0:
+            raise ValueError(
+                f"combine_best_of_two_plds requires canonical {label} inputs with "
+                f"{boundary} = 0 exactly; {name}.{boundary}={value:.2e}"
+            )
 
     if dist_1.step <= dist_2.step:
         anchor_dist, other_dist = dist_1, dist_2
     else:
         anchor_dist, other_dist = dist_2, dist_1
 
-    # Extend the anchor lattice (preserving its offset) to cover the other support.
-    step = anchor_dist.step
-    other_x_max = other_dist.x_0 + (other_dist.prob_arr.size - 1) * other_dist.step
-    anchor_x_max = anchor_dist.x_0 + (anchor_dist.prob_arr.size - 1) * step
-    n_left = max(0, int(np.ceil((anchor_dist.x_0 - other_dist.x_0) / step)))
-    n_right = max(0, int(np.ceil((other_x_max - anchor_x_max) / step)))
-    out_grid = GridSpec(
-        x_0=anchor_dist.x_0 - n_left * step,
-        step=step,
-        n=n_left + anchor_dist.prob_arr.size + n_right,
-        spacing_type=SpacingType.LINEAR,
-    )
+    anchor_grid = anchor_dist.grid
+    other_grid = other_dist.grid
+    step = anchor_grid.step
 
-    # Project the coarser candidate onto the shared lattice with
-    # domination-aware rounding. Boundary atoms are already canonical and are
-    # owned by the projection functions.
+    if anchor_grid.step == other_grid.step and anchor_grid.anchor == other_grid.anchor:
+        # Same lattice, different windows: the union is an integer index range and
+        # both candidates embed into it exactly, so neither needs reprojection.
+        out_index_0 = min(anchor_grid.index_0, other_grid.index_0)
+        out_n = (
+            max(anchor_grid.index_0 + anchor_grid.n, other_grid.index_0 + other_grid.n)
+            - out_index_0
+        )
+        out_grid = replace(anchor_grid, index_0=out_index_0, n=out_n)
+        return combine_distributions(
+            dist_1=_embed_on_grid(
+                dist=anchor_dist, grid=out_grid, offset=anchor_grid.index_0 - out_index_0
+            ),
+            dist_2=_embed_on_grid(
+                dist=other_dist, grid=out_grid, offset=other_grid.index_0 - out_index_0
+            ),
+            bound_type=bound_type,
+        )
+
+    # Genuinely different lattices: keep the finer candidate's own lattice, widen it by
+    # whole steps to cover the other, and reproject only the other candidate.
+    n_left = max(0, int(np.ceil((anchor_grid.x_0 - other_grid.x_0) / step)))
+    n_right = max(0, int(np.ceil((other_grid.last_point - anchor_grid.last_point) / step)))
+    out_grid = anchor_grid.pad(left=n_left, right=n_right)
+
     other_on_grid: DenseDiscreteDist
     if bound_type == BoundType.DOMINATES:
-        other_on_grid = project_dist_onto_grid_ctd(
-            dist=other_dist,
-            grid=out_grid,
-        )
+        other_on_grid = project_dist_onto_grid_ctd(dist=other_dist, grid=out_grid)
     else:
         other_on_grid = project_dist_onto_grid_stoch_dom(
             dist=other_dist,
@@ -319,17 +305,8 @@ def combine_best_of_two_plds(
             bound_type=bound_type,
         )
 
-    # Embed the anchor candidate exactly (zero padding only; no rounding).
-    anchor_prob_out = np.zeros(out_grid.n, dtype=np.float64)
-    anchor_prob_out[slice(n_left, n_left + anchor_dist.prob_arr.size)] = anchor_dist.prob_arr
     return combine_distributions(
-        dist_1=DenseDiscreteDist(
-            x_0=out_grid.x_0,
-            step=out_grid.step,
-            prob_arr=anchor_prob_out,
-            p_min=anchor_dist.p_min,
-            p_max=anchor_dist.p_max,
-        ),
+        dist_1=_embed_on_grid(dist=anchor_dist, grid=out_grid, offset=n_left),
         dist_2=other_on_grid,
         bound_type=bound_type,
     )
@@ -346,20 +323,12 @@ def exp_linear_to_geometric(dist: DenseDiscreteDist) -> DenseDiscreteDist:
     Maps REALS domain → POSITIVES domain.
     The −∞ atom (p_min in REALS) maps to the 0 atom (p_min in POSITIVES).
     """
-    if dist.spacing_type != SpacingType.LINEAR:
-        raise ValueError(
-            f"exp_linear_to_geometric requires LINEAR spacing input, got {dist.spacing_type}"
-        )
-    x_min_exp = float(np.exp(dist.x_0))
-    ratio_exp = float(np.exp(dist.step))
-
+    require_linear_reals_dist(dist=dist, name="dist")
     return DenseDiscreteDist(
-        x_0=x_min_exp,
-        step=ratio_exp,
+        grid=dist.grid.exp(),
         prob_arr=dist.prob_arr.copy(),
-        p_min=dist.p_min,  # −∞ atom → 0 atom (p_min identity preserved)
-        p_max=dist.p_max,  # +∞ atom unchanged
-        spacing_type=SpacingType.GEOMETRIC,
+        p_min=dist.p_min,
+        p_max=dist.p_max,
         domain=Domain.POSITIVES,
     )
 
@@ -370,20 +339,12 @@ def log_geometric_to_linear(dist: DenseDiscreteDist) -> DenseDiscreteDist:
     Maps POSITIVES domain → REALS domain.
     The 0 atom (p_min in POSITIVES) maps to the −∞ atom (p_min in REALS).
     """
-    if dist.spacing_type != SpacingType.GEOMETRIC:
-        raise ValueError(
-            f"log_geometric_to_linear requires GEOMETRIC spacing input, got {dist.spacing_type}"
-        )
-    x_min_log = float(np.log(dist.x_0))
-    step_log = float(np.log(dist.step))
-
+    require_geometric_positives_dist(dist=dist, name="dist")
     return DenseDiscreteDist(
-        x_0=x_min_log,
-        step=step_log,
+        grid=dist.grid.log(),
         prob_arr=dist.prob_arr.copy(),
-        p_min=dist.p_min,  # 0 atom → −∞ atom (p_min identity preserved)
+        p_min=dist.p_min,
         p_max=dist.p_max,
-        spacing_type=SpacingType.LINEAR,
         domain=Domain.REALS,
     )
 
@@ -392,10 +353,9 @@ def negate_reverse_linear_distribution(
     dist: DenseDiscreteDist,
 ) -> DenseDiscreteDist:
     """Map X -> -X, reverse PMF order, and swap boundary atoms."""
-    n = dist.prob_arr.size
+    require_linear_reals_dist(dist=dist, name="dist")
     return DenseDiscreteDist(
-        x_0=-(dist.x_0 + dist.step * (n - 1)),
-        step=dist.step,
+        grid=dist.grid.reflect(),
         prob_arr=np.flip(dist.prob_arr),
         p_min=dist.p_max,
         p_max=dist.p_min,
@@ -413,26 +373,30 @@ def calc_pld_dual(realization: PLDRealization) -> PLDRealization:
     - support reflected to ``-l``,
     - residual mass at ``+inf``.
     """
-    if not isinstance(realization, PLDRealization):
-        raise TypeError(f"calc_pld_dual requires PLDRealization, got {type(realization)}")
+    require_type(value=realization, expected_type=PLDRealization, name="realization")
 
-    dual_probs_aligned = np.zeros_like(realization.prob_arr)
-    mask = realization.prob_arr > 0
-    dual_probs_aligned[mask] = np.exp(
-        np.log(realization.prob_arr[mask]) - realization.x_array[mask]
+    dual_grid = realization.grid.reflect()
+    dual_loss = dual_grid.materialize()
+    dual_probs = exp_moment_terms(
+        prob_arr=np.flip(realization.prob_arr),
+        x_vals=-dual_loss,
     )
-    dual_probs = np.flip(dual_probs_aligned)
 
-    sum_prob = math.fsum(map(float, dual_probs))
-    if sum_prob > 1.0:
-        dual_probs *= 1.0 / sum_prob
-        sum_prob = 1.0
+    dual_residual = signed_unit_residual(values=dual_probs, lower_term=0.0, upper_term=0.0)
+    if dual_residual < 0.0:
+        # Input may sit in (1, 1 + REALIZATION_MOMENT_TOL]; trim cheapest mass to +inf.
+        # Do not classify_residual: its middle band would warn on that admitted excess.
+        dual_probs = trim_mass_from_edge(
+            prob_arr=dual_probs,
+            mass=-dual_residual,
+            from_left=True,
+        )
+        dual_residual = signed_unit_residual(values=dual_probs, lower_term=0.0, upper_term=0.0)
 
     return PLDRealization(
-        x_0=-(realization.x_0 + realization.step * (realization.prob_arr.size - 1)),
-        step=realization.step,
+        grid=dual_grid,
         prob_arr=dual_probs,
-        p_max=max(0.0, 1.0 - sum_prob),
+        p_max=max(0.0, dual_residual),
         p_min=0.0,
     )
 
@@ -440,6 +404,33 @@ def calc_pld_dual(realization: PLDRealization) -> PLDRealization:
 # =============================================================================
 # Internal Helper Functions
 # =============================================================================
+
+
+def _embed_on_grid(
+    *,
+    dist: DenseDiscreteDist,
+    grid: GridSpec,
+    offset: int,
+) -> DenseDiscreteDist:
+    """Zero-pad ``dist`` onto a wider grid it already sits on at integer ``offset``.
+
+    ``grid.slice(start=offset, n=dist.grid.n)`` reproduces the source grid exactly, so this
+    moves no mass and rounds no coordinate.
+    """
+    if grid.slice(start=offset, n=dist.grid.n) != dist.grid:
+        raise ValueError(
+            f"Cannot embed {dist.grid} into {grid} at offset {offset}: not the same lattice"
+        )
+    prob_arr = np.zeros(grid.n, dtype=np.float64)
+    end = offset + dist.grid.n
+    prob_arr[offset:end] = dist.prob_arr
+    return DenseDiscreteDist(
+        grid=grid,
+        prob_arr=prob_arr,
+        p_min=dist.p_min,
+        p_max=dist.p_max,
+        domain=dist.domain,
+    )
 
 
 def _ccdf_from_pmf(dist: DiscreteDistBase) -> NDArray[np.float64]:

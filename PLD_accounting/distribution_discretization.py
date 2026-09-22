@@ -1,9 +1,13 @@
-"""Distribution discretization utilities for PMF construction."""
+"""Continuous and discrete PMF construction with bound-preserving rounding.
+
+Connect-the-dots builds each cell's endpoint masses from local source and
+reflected-dual measures; stochastic discretization moves interval mass in the
+requested direction.
+"""
 
 from __future__ import annotations
 
 import math
-from dataclasses import replace
 from typing import Any
 
 import numpy as np
@@ -20,21 +24,75 @@ from PLD_accounting.discrete_dist import (
     PLDRealization,
 )
 from PLD_accounting.distribution_utils import (
-    PMF_MASS_TOL,
+    MAX_SAFE_EXP_ARG,
+    classify_residual,
+    compensated_segmented_sum,
     enforce_mass_conservation,
     exp_moment_terms,
-    kahan_reverse_exclusive_cumsum,
+    signed_unit_residual,
+    trim_mass_to_moment_target,
 )
 from PLD_accounting.types import (
     BoundType,
     SpacingType,
     has_numba,
     optional_njit,
+    require_bound_type,
 )
-from PLD_accounting.validation import validate_finite_array
+from PLD_accounting.validation import (
+    require_finite_array,
+    require_open_unit_interval,
+    require_positive_real,
+)
+
+# Slack allowed on the exact interval, cell and exterior inequalities before an
+# inconsistency is treated as an oracle failure rather than as rounding of the inputs.
+_ORACLE_TOL = 64.0 * float(np.finfo(np.float64).eps)
+# Safety factor on the cellwise reciprocal-moment residual bound.
+_CTD_MOMENT_REPAIR_FACTOR = 8.0
+# Continuous interval oracle only: below three interior cells a cell spans O(support) and
+# float64 CDF/SF differences fail the producer residual bound. Discrete CtD bins atoms exactly.
+_MIN_CONTINUOUS_INTERVAL_KNOTS = 4
 
 # =============================================================================
-# Public API: Continuous Distribution Discretization
+# Public API: Fixed-Gap Real-Loss Rediscretization
+# =============================================================================
+
+
+def rediscretize_dist_by_bound(
+    *,
+    dist: DiscreteDistBase,
+    tail_truncation: float,
+    loss_discretization: float,
+    bound_type: BoundType,
+) -> DenseDiscreteDist:
+    """Rediscretize a real-loss distribution using its fixed bound semantics.
+
+    Dominating fixed-gap real-loss outputs use CtD. Dominated outputs use
+    directional stochastic domination. This is structural routing by the
+    mathematical bound direction, not a configurable discretization method.
+    Semantic PLD checks do not prove domination of an external mechanism; the
+    caller remains responsible for that proof.
+    """
+    if bound_type == BoundType.DOMINATES:
+        return rediscretize_dist_ctd(
+            dist=dist,
+            tail_truncation=tail_truncation,
+            loss_discretization=loss_discretization,
+        )
+    if bound_type == BoundType.IS_DOMINATED:
+        return rediscretize_dist_stoch_dom(
+            dist=dist,
+            tail_truncation=tail_truncation,
+            loss_discretization=loss_discretization,
+            spacing_type=SpacingType.LINEAR,
+            bound_type=bound_type,
+        )
+    raise ValueError(f"Unknown BoundType: {bound_type}")
+
+
+# =============================================================================
+# Discretization Engines
 # =============================================================================
 
 
@@ -48,29 +106,42 @@ def discretize_continuous_ctd(
 ) -> PLDRealization:
     """Construct a dominating fixed-gap real-loss PLD with connect-the-dots.
 
-    Args:
-        dist: Continuous privacy-loss distribution.
-        dual_dist: Exact dual privacy-loss distribution.
-        tail_truncation: Tail probability used to define finite grid bounds.
-        step: Linear bin width.
-        align_to_multiples: Whether to align the quantile-derived bounds to integer step multiples.
+    ``dual_dist`` must be the exact PLD dual of ``dist``. The finite grid covers
+    both ``dist`` and the reflected dual, and each cell's mass and reciprocal
+    moment are read from the two laws locally: the resulting endpoint split
+    preserves the hockey-stick values at the knots and dominates between them.
+
+    A ``step`` that leaves fewer than four knots over that joint support is
+    rejected rather than clamped: float64 interval measures are not valid there.
     """
+    x_min, x_max = joint_source_dual_bounds(
+        dist=dist,
+        dual_dist=dual_dist,
+        tail_truncation=tail_truncation,
+    )
     grid = aligned_grid_params(
-        x_min=float(dist.ppf(tail_truncation)),
-        x_max=float(dist.isf(tail_truncation)),
+        x_min=x_min,
+        x_max=x_max,
         spacing_type=SpacingType.LINEAR,
         align_to_multiples=align_to_multiples,
         discretization=step,
     )
-    privacy_profile = _continuous_real_privacy_profile(
+    if grid.n < _MIN_CONTINUOUS_INTERVAL_KNOTS:
+        raise ValueError(
+            f"loss_discretization={step:.6g} is coarser than the CtD source/dual support "
+            f"[{x_min:.6g}, {x_max:.6g}] ({grid.n} knots); float64 interval measures are "
+            "not valid on a grid this coarse. Reduce loss_discretization."
+        )
+    pld_pmf, pld_dual_pmf = _continuous_ctd_cell_measures(
         pld_in=dist,
         dual_pld_in=dual_dist,
-        eps_out=grid.materialize(),
+        grid=grid,
     )
-    return _pld_from_privacy_profile_ctd(
-        privacy_profile=privacy_profile,
-        x_0_out=grid.x_0,
-        step_out=grid.step,
+    return _ctd_realization_from_cell_measures(
+        pld_pmf=pld_pmf,
+        pld_dual_pmf=pld_dual_pmf,
+        p_max_in=0.0,
+        grid=grid,
     )
 
 
@@ -83,7 +154,11 @@ def discretize_continuous_stoch_dom(
     align_to_multiples: bool,
     domain: Domain = Domain.REALS,
 ) -> DenseDiscreteDist:
-    """Discretize a continuous law with directional stochastic domination."""
+    """Discretize a continuous law with directional stochastic domination.
+
+    Quantile bounds define the finite grid. Each interval then moves to its
+    upper or lower knot according to ``bound_type``.
+    """
     grid = aligned_grid_params(
         x_min=float(dist.ppf(tail_truncation)),
         x_max=float(dist.isf(tail_truncation)),
@@ -111,23 +186,13 @@ def discretize_continuous_stoch_dom_on_grid(
     pmf_min_increment: float,
     domain: Domain = Domain.REALS,
 ) -> DenseDiscreteDist:
-    """Discretize a continuous law onto a caller-supplied grid with stochastic domination.
+    """Discretize a continuous law onto a caller-supplied grid.
 
-    Interval mass is assigned to the upper knot for ``DOMINATES`` and the
-    lower knot for ``IS_DOMINATED``; the opposite tail remains a boundary mass.
-
-    Args:
-        dist: Continuous law to discretize.
-        grid: Exact output grid; no quantile-derived range is computed here.
-        bound_type: Rounding direction for interval mass.
-        pmf_min_increment: Minimum CDF/SF increment that becomes a bin mass.
-        domain: Support-domain semantics of the result.
-
-    Returns:
-        The discretized distribution on ``grid``.
+    Interval mass moves to the upper knot for ``DOMINATES`` and the lower knot
+    for ``IS_DOMINATED``. ``pmf_min_increment`` batches smaller intervals.
     """
     x_array = grid.materialize()
-    # Compute the finite interval probabilities; tails remain separate boundary masses.
+    # Compute finite interval probabilities; the exterior tails remain separate.
     bin_probs, p_left, p_right = _compute_discrete_prob(
         dist=dist, x_array=x_array, bound_type=bound_type, pmf_min_increment=pmf_min_increment
     )
@@ -152,43 +217,12 @@ def discretize_continuous_stoch_dom_on_grid(
     else:
         raise ValueError(f"Unknown BoundType: {bound_type}")
     return DenseDiscreteDist(
-        x_0=grid.x_0,
-        step=grid.step,
+        grid=grid,
         prob_arr=prob_arr,
         p_min=p_min,
         p_max=p_max,
         domain=domain,
     )
-
-
-def rediscretize_dist_by_bound(
-    *,
-    dist: DiscreteDistBase,
-    tail_truncation: float,
-    loss_discretization: float,
-    bound_type: BoundType,
-) -> DenseDiscreteDist:
-    """Rediscretize a real-loss distribution using its fixed bound semantics.
-
-    Dominating fixed-gap real-loss outputs use CtD. Dominated outputs use
-    directional stochastic domination. This is structural routing by the
-    mathematical bound direction, not a configurable discretization method.
-    """
-    if bound_type == BoundType.DOMINATES:
-        return rediscretize_dist_ctd(
-            dist=dist,
-            tail_truncation=tail_truncation,
-            loss_discretization=loss_discretization,
-        )
-    if bound_type == BoundType.IS_DOMINATED:
-        return rediscretize_dist_stoch_dom(
-            dist=dist,
-            tail_truncation=tail_truncation,
-            loss_discretization=loss_discretization,
-            spacing_type=SpacingType.LINEAR,
-            bound_type=bound_type,
-        )
-    raise ValueError(f"Unknown BoundType: {bound_type}")
 
 
 def rediscretize_dist_ctd(
@@ -197,10 +231,12 @@ def rediscretize_dist_ctd(
     tail_truncation: float,
     loss_discretization: float,
 ) -> PLDRealization:
-    """Rediscretize a real-loss PLD onto a fixed-gap grid with CtD."""
-    # Validate before truncation so a small, invalid -inf atom cannot be
-    # consumed by the tail budget and thereby hidden from CtD validation.
-    _validate_ctd_source(dist)
+    """Rediscretize a real-loss PLD onto a fixed-gap grid with CtD.
+
+    The semantic PLD contract is checked before truncation so the tail budget
+    cannot hide an invalid ``-inf`` atom or reciprocal-moment excess.
+    """
+    _require_ctd_source(dist)
     # Account for truncated tails according to upper-bound semantics.
     trunc_dist = dist.truncate_edges(
         tail_truncation=tail_truncation / 2,
@@ -233,12 +269,11 @@ def rediscretize_dist_stoch_dom(
 ) -> DenseDiscreteDist:
     """Rediscretize a distribution with directional stochastic domination.
 
-    Remaps PMF onto a new grid with the requested spacing and discretization.
-    Implementation trims zero/tail regions, computes new grid size, then remaps
-    using domination-aware rounding (e.g., linear grids for dp_accounting output).
+    Finite atoms round upward for ``DOMINATES`` and downward for
+    ``IS_DOMINATED``; conservatively movable real-domain boundary mass is first
+    absorbed into the corresponding finite edge.
 
-    Algorithm 6 (`disc-dist`), in Appendix C
-    of https://arxiv.org/abs/2602.17284.
+    Algorithm 6 (`disc-dist`), in Appendix C of https://arxiv.org/abs/2602.17284.
     """
     # On the real line, absorb the boundary that can be moved conservatively
     # onto the finite grid for the requested stochastic bound.
@@ -256,12 +291,10 @@ def rediscretize_dist_stoch_dom(
         # A lower-bound discretization is no longer an exact realization.
         if isinstance(dist, PLDRealization):
             working_dist = DenseDiscreteDist(
-                x_0=dist.x_0,
-                step=dist.step,
+                grid=dist.grid,
                 prob_arr=dist.prob_arr,
                 p_min=dist.p_min,
                 p_max=dist.p_max,
-                spacing_type=dist.spacing_type,
                 domain=dist.domain,
             )
         if working_dist.domain == Domain.REALS and working_dist.p_max > 0.0:
@@ -275,7 +308,7 @@ def rediscretize_dist_stoch_dom(
     else:
         raise ValueError(f"Unknown BoundType: {bound_type}")
 
-    # Move truncated tail mass according to the requested bound.
+    # Route truncated tail mass according to the requested stochastic bound.
     trunc_dist = working_dist.truncate_edges(
         tail_truncation=tail_truncation / 2, bound_type=bound_type
     )
@@ -301,7 +334,7 @@ def project_dist_onto_grid_ctd(
     dist: DiscreteDistBase,
     grid: GridSpec,
 ) -> PLDRealization:
-    """CtD-project a valid real-loss PLD source onto a fixed-gap grid.
+    """CtD-project a valid real-loss PLD source onto a fixed-gap linear grid.
 
     CtD accepts any discrete source that is itself a semantically valid PLD
     realization.  This validates the source object only; callers remain
@@ -310,15 +343,16 @@ def project_dist_onto_grid_ctd(
     """
     if grid.spacing_type != SpacingType.LINEAR:
         raise ValueError("CtD projection requires a fixed-gap linear grid")
-    _validate_ctd_source(dist)
-    privacy_profile = _discrete_dist_privacy_profile(
+    _require_ctd_source(dist)
+    pld_pmf, pld_dual_pmf = _discrete_ctd_cell_measures(
         dist_in=dist,
-        eps_out=grid.materialize(),
+        loss_out=grid.materialize(),
     )
-    return _pld_from_privacy_profile_ctd(
-        privacy_profile=privacy_profile,
-        x_0_out=grid.x_0,
-        step_out=grid.step,
+    return _ctd_realization_from_cell_measures(
+        pld_pmf=pld_pmf,
+        pld_dual_pmf=pld_dual_pmf,
+        p_max_in=float(dist.p_max),
+        grid=grid,
     )
 
 
@@ -362,27 +396,45 @@ def project_dist_onto_grid_stoch_dom(
         bound_type=bound_type,
     )
 
-    if grid.spacing_type == SpacingType.LINEAR:
-        return DenseDiscreteDist(
-            x_0=grid.x_0,
-            step=grid.step,
-            prob_arr=prob_arr_out,
-            p_min=p_min,
-            p_max=p_max,
-        )
+    domain = Domain.POSITIVES if grid.spacing_type == SpacingType.GEOMETRIC else Domain.REALS
+    return DenseDiscreteDist(
+        grid=grid,
+        prob_arr=prob_arr_out,
+        p_min=p_min,
+        p_max=p_max,
+        domain=domain,
+    )
 
-    if grid.spacing_type == SpacingType.GEOMETRIC:
-        return DenseDiscreteDist(
-            x_0=grid.x_0,
-            step=grid.step,
-            prob_arr=prob_arr_out,
-            p_min=p_min,
-            p_max=p_max,
-            spacing_type=SpacingType.GEOMETRIC,
-            domain=Domain.POSITIVES,
-        )
 
-    raise ValueError(f"Invalid spacing_type: {grid.spacing_type}")
+def joint_source_dual_bounds(
+    *,
+    dist: stats.rv_continuous | rv_frozen[Any, Any],
+    dual_dist: stats.rv_continuous | rv_frozen[Any, Any] | None,
+    tail_truncation: float,
+) -> tuple[float, float]:
+    """Return finite bounds covering the source and reflected-dual laws.
+
+    With a dual, each range query uses half of ``tail_truncation``. Pass
+    ``dual_dist=None`` to retain the source-only range used by directional
+    discretization.
+    """
+    require_open_unit_interval(value=tail_truncation, name="tail_truncation")
+    range_tail = tail_truncation / 2.0 if dual_dist is not None else tail_truncation
+    candidates = [float(dist.ppf(range_tail)), float(dist.isf(range_tail))]
+    if dual_dist is not None:
+        candidates += [
+            -float(dual_dist.isf(range_tail)),
+            -float(dual_dist.ppf(range_tail)),
+        ]
+    bounds = np.asarray(candidates, dtype=np.float64)
+    require_finite_array(values=bounds, name="joint source/dual bounds")
+    x_min, x_max = float(bounds.min()), float(bounds.max())
+    if x_max <= x_min:
+        raise ValueError(
+            "Joint source/dual bounds must span a nonempty range, "
+            f"got x_min={x_min}, x_max={x_max}"
+        )
+    return x_min, x_max
 
 
 def aligned_grid_params(
@@ -393,23 +445,10 @@ def aligned_grid_params(
     align_to_multiples: bool,
     discretization: float,
 ) -> GridSpec:
-    """Return a :class:`GridSpec` covering [x_min, x_max].
+    """Return a ``GridSpec`` covering ``[x_min, x_max]``.
 
-    The returned spec is the single source of truth for a uniform grid and is
-    meant to be passed straight to grid consumers, avoiding any re-derivation
-    of the spacing from a materialized array.
-
-    Args:
-        x_min: Minimum value of the range.
-        x_max: Maximum value of the range.
-        spacing_type: Type of spacing (LINEAR or GEOMETRIC).
-        align_to_multiples: If True, align range to whole multiples of discretization.
-                           If False, use x_min and x_max directly without alignment.
-        discretization: Grid spacing parameter (step size for LINEAR, log ratio for GEOMETRIC).
-
-    Returns:
-        A ``GridSpec`` whose ``step`` is the additive bin width (LINEAR) or
-        multiplicative ratio (GEOMETRIC).
+    ``discretization`` is the linear bin width or geometric log-ratio.
+    ``align_to_multiples`` aligns the native coordinate to integer multiples.
     """
     if spacing_type not in (SpacingType.GEOMETRIC, SpacingType.LINEAR):
         raise ValueError(f"Unsupported spacing_type: {spacing_type}")
@@ -419,16 +458,26 @@ def aligned_grid_params(
         raise ValueError(
             f"Geometric spacing requires positive values, got x_min={x_min}, x_max={x_max}"
         )
-    if discretization <= 0:
-        raise ValueError("discretization must be positive")
+    require_positive_real(value=discretization, name="discretization")
 
     d = float(discretization)
     if spacing_type == SpacingType.LINEAR:
-        return _linear_grid_params(x_min, x_max, d, align_to_multiples)
-    return _geometric_grid_params(x_min, x_max, d, align_to_multiples)
+        lower, upper, unaligned_anchor = x_min, x_max, x_min
+    else:
+        lower, upper, unaligned_anchor = math.log(x_min), math.log(x_max), x_min
+    return _covering_grid(
+        lower=lower,
+        upper=upper,
+        step=d,
+        align_to_multiples=align_to_multiples,
+        spacing_type=spacing_type,
+        unaligned_anchor=unaligned_anchor,
+        cover_max=x_max,
+    )
 
 
 def rediscretize_prob(
+    *,
     x_array: NDArray[np.float64],
     prob_arr: NDArray[np.float64],
     x_array_out: NDArray[np.float64],
@@ -454,57 +503,57 @@ def _numba_rediscretize_prob(
 ) -> NDArray[np.float64]:
     """Remap PMF onto a new grid with domination-aware rounding.
 
-    Maps each probability mass to output grid position based on domination semantics.
-    Implementation: dominates=True uses ceil (pessimistic), False uses floor (optimistic).
-    Uses Kahan summation for numerical accuracy.
+    Monotone supports permit one forward output pointer. ``dominates`` selects
+    ceiling rather than floor placement; directional overflow is omitted for
+    the caller to route to a boundary. Each output bin uses Kahan accumulation.
     """
     n_out = x_array_out.size
     prob_arr_out = np.zeros(n_out)
     compensations = np.zeros(n_out)
 
-    # single pointer into x_array_out since x_array is strictly increasing
+    # One forward pointer suffices because both supports are strictly increasing.
     j = 0
 
     if dominates:
-        # ceil: bin = first index with x_array_out[j] >= z; overflow right -> p_max
+        # Ceil to the first output knot at or above each input atom.
         for i in range(x_array.size):
             z = x_array[i]
             mass = prob_arr[i]
-            # Skip only zero-mass bins, not small-mass bins
+            # Skip exactly empty bins without discarding small positive masses.
             if mass <= 0:
                 continue
 
-            # advance while x_array_out[j] < z
+            # Advance to the first output knot that bounds z from above.
             while j < n_out and x_array_out[j] < z:
                 j += 1
 
             if j >= n_out:
-                # Overflow is omitted here and accounted explicitly by the caller.
+                # The caller transfers right overflow to p_max.
                 continue
-            # include values below x_array_out[0] in the first bin (ceil behavior)
+            # Values below the first knot belong in that knot under ceiling.
             y = mass - compensations[j]
             t = prob_arr_out[j] + y
             compensations[j] = (t - prob_arr_out[j]) - y
             prob_arr_out[j] = t
 
     else:
-        # floor: bin = last index with x_array_out[j] <= z; underflow left -> p_min
+        # Floor to the last output knot at or below each input atom.
         for i in range(x_array.size):
             z = x_array[i]
             mass = prob_arr[i]
-            # Skip only zero-mass bins, not small-mass bins
+            # Skip exactly empty bins without discarding small positive masses.
             if mass <= 0:
                 continue
 
-            # advance while x_array_out[j] <= z
+            # Advance just past the last output knot that does not exceed z.
             while j < n_out and x_array_out[j] <= z:
                 j += 1
 
             idx = j - 1
             if idx < 0:
-                # Underflow is omitted here and accounted explicitly by the caller.
+                # The caller transfers left underflow to p_min.
                 continue
-            # include values above x_array_out[-1] in the last bin (floor behavior)
+            # Values above the last knot belong there under floor rounding.
             y = mass - compensations[idx]
             t = prob_arr_out[idx] + y
             compensations[idx] = (t - prob_arr_out[idx]) - y
@@ -533,291 +582,405 @@ def _numpy_rediscretize_prob(
     return prob_arr_out
 
 
-def _continuous_real_privacy_profile(
+def _continuous_ctd_cell_measures(
     *,
     pld_in: stats.rv_continuous | rv_frozen[Any, Any],
     dual_pld_in: stats.rv_continuous | rv_frozen[Any, Any],
-    eps_out: NDArray[np.float64],
-) -> NDArray[np.float64]:
-    """Evaluate ``delta(eps)`` from a PLD and its dual.
+    grid: GridSpec,
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Evaluate every CtD cell's mass and reciprocal moment from a PLD and its dual.
 
-    Atoms at ``L = eps`` contribute zero to the hockey-stick divergence. Use
-    the strict identity
-    ``delta(eps) = Pr[L > eps] - exp(eps) Pr[D(L) < -eps]``. The dual's strict
-    CDF is evaluated at the representable point immediately below ``-eps``.
+    Uses reflected left limits so a privacy-loss atom at a knot stays in the correct cell.
     """
-    eps = np.asarray(eps_out, dtype=np.float64)
-    validate_finite_array(eps, "privacy-profile epsilon")
-    pld_sf = np.asarray(pld_in.sf(eps), dtype=np.float64)
-    dual_left_limit = np.nextafter(-eps, -np.inf)
-    dual_log_cdf = np.asarray(dual_pld_in.logcdf(dual_left_limit), dtype=np.float64)
-    if np.any(~np.isfinite(pld_sf)) or np.any(np.isnan(dual_log_cdf)):
-        raise ValueError("PLD and dual CDF evaluations must not be NaN")
-    dual_cdf_eps = _safe_exp(eps + dual_log_cdf)
-    return _validate_real_privacy_profile(eps=eps, profile=pld_sf - dual_cdf_eps)
+    loss = grid.materialize()
+    require_finite_array(values=loss, name="CtD grid")
+    if loss.size < 2:
+        raise ValueError("CtD projection requires at least two finite grid knots")
+    mass, mass_below, mass_above = _partition_masses(dist=pld_in, points=loss, label="CtD source")
+    reflected, reflected_above, reflected_below = _partition_masses(
+        dist=dual_pld_in,
+        points=np.nextafter(-loss[::-1], -np.inf),
+        label="CtD reflected-dual",
+    )
+    return (
+        np.concatenate(([mass_below], mass, [mass_above])),
+        np.concatenate(([reflected_below], reflected[::-1], [reflected_above])),
+    )
 
 
-def _discrete_dist_privacy_profile(
+def _discrete_ctd_cell_measures(
     *,
     dist_in: DiscreteDistBase,
-    eps_out: NDArray[np.float64],
-) -> NDArray[np.float64]:
-    """Evaluate a PLD realization's hockey-stick profile."""
-    eps = np.asarray(eps_out, dtype=np.float64)
-    validate_finite_array(eps, "privacy-profile epsilon")
-    # Include the positive-infinity boundary atom locally so the tail sums use
-    # one representation for both finite and boundary mass.
-    losses = np.concatenate((dist_in.x_array, np.array([np.inf])))
-    masses = np.concatenate((dist_in.prob_arr, np.array([dist_in.p_max])))
-    reciprocal_moment = exp_moment_terms(prob_arr=masses, x_vals=losses)
-    reciprocal_moment_total = math.fsum(map(float, reciprocal_moment))
+    loss_out: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Aggregate atoms into per-cell mass and reciprocal moment via right-closed bins.
 
-    tail_mass = kahan_reverse_exclusive_cumsum(np.concatenate(([0.0], masses)))
-    tail_moment = kahan_reverse_exclusive_cumsum(np.concatenate(([0.0], reciprocal_moment)))
-    indices = np.asarray(np.searchsorted(losses, eps, side="right"), dtype=np.intp)
-
-    selected_moment = tail_moment[indices]
-    log_selected_moment = np.full_like(selected_moment, -np.inf)
-    positive = selected_moment > 0.0
-    log_selected_moment[positive] = np.log(selected_moment[positive])
-    profile = tail_mass[indices] - _safe_exp(eps + log_selected_moment)
-    return _validate_real_privacy_profile(
-        eps=eps,
-        profile=profile,
-        reciprocal_moment=reciprocal_moment_total,
+    Cell 0 is ``(-inf, loss[0]]``, interior cell ``j`` is ``(loss[j-1], loss[j]]``, and
+    the final cell is ``(loss[-1], +inf)``, matching ``np.searchsorted(..., side="left")``.
+    """
+    loss = np.asarray(loss_out, dtype=np.float64)
+    if loss.size < 2:
+        raise ValueError("CtD projection requires at least two finite grid knots")
+    masses = np.asarray(dist_in.prob_arr, dtype=np.float64)
+    cell = np.searchsorted(loss, np.asarray(dist_in.x_array, dtype=np.float64), side="left")
+    moments = exp_moment_terms(prob_arr=masses, x_vals=dist_in.x_array)
+    return (
+        compensated_segmented_sum(
+            bin_index=cell,
+            weights=masses,
+            num_bins=loss.size + 1,
+        ),
+        compensated_segmented_sum(
+            bin_index=cell,
+            weights=moments,
+            num_bins=loss.size + 1,
+        ),
     )
 
 
-def _pld_from_privacy_profile_ctd(
+def _ctd_realization_from_cell_measures(
     *,
-    privacy_profile: NDArray[np.float64],
-    x_0_out: float,
-    step_out: float,
+    pld_pmf: NDArray[np.float64],
+    pld_dual_pmf: NDArray[np.float64],
+    p_max_in: float,
+    grid: GridSpec,
 ) -> PLDRealization:
-    """PLD-validating inversion on output knots ``x_0_out + k * step_out``."""
-    delta = np.asarray(privacy_profile, dtype=np.float64)
-    if step_out <= 0.0:
-        raise ValueError("CtD output step must be positive")
-    if delta.size < 2:
-        raise ValueError("CtD profile inversion requires at least two values")
-    validate_finite_array(delta, "CtD privacy profile")
-    if np.any(delta < 0.0) or np.any(delta > 1.0):
-        raise ValueError("CtD privacy profile must be finite and lie in [0, 1]")
-    # Privacy profiles are non-increasing in epsilon. Evaluators can violate
-    # this by a few ULPs in extreme tails; remove only that numerical noise
-    # before the fixed-gap CtD inversion, and reject material violations.
-    increases = np.diff(delta)
-    if np.any(increases > PMF_MASS_TOL):
+    """Build the CtD realization from per-cell source and dual measures (n+1 cells)."""
+    if grid.spacing_type != SpacingType.LINEAR:
+        raise ValueError("CtD output grid must be linear")
+    loss = grid.materialize()
+    if max(float(loss[-1]), -float(loss[0])) > MAX_SAFE_EXP_ARG:
         raise ValueError(
-            "privacy profile is not convex/monotone enough for fixed-gap CtD inversion"
+            f"CtD grid [{float(loss[0]):.6e}, {float(loss[-1]):.6e}] leaves the range where "
+            "exp(x) is representable; the cells' moment factors cannot be formed"
         )
-    delta = np.minimum.accumulate(delta)
-
-    exp_step = math.exp(-step_out)
-    denominator = -math.expm1(-step_out)
-    diff = np.diff(delta)
-    prob = np.empty_like(delta)
-    prob[0] = 1.0 - delta[0] + exp_step * diff[0] / denominator
-    prob[1:-1] = (exp_step * diff[1:] - diff[:-1]) / denominator
-    prob[-1] = -diff[-1] / denominator
-    # The division by ``denominator`` amplifies cancellation noise in the
-    # delta differences by 1/(1 - exp(-step)), so test convexity in delta
-    # space (numerator scale) rather than on the amplified probabilities.
-    if np.min(prob) < -PMF_MASS_TOL / denominator:
-        raise ValueError("privacy profile is not convex enough for fixed-gap CtD inversion")
-    # Remove negative inversion noise before restoring total numerical mass.
-    prob = np.maximum(prob, 0.0)
-    # delta[-1] is the CtD profile's semantic +inf atom.
-    prob, p_min, p_max = enforce_mass_conservation(
-        prob_arr=prob,
-        expected_p_min=0.0,
-        expected_p_max=float(delta[-1]),
-        bound_type=BoundType.DOMINATES,
+    contribution_left, contribution_right = _ctd_cell_endpoint_masses(
+        pld_pmf=pld_pmf[1:-1],
+        pld_dual_pmf=pld_dual_pmf[1:-1],
+        left=loss[:-1],
+        width=np.full(loss.size - 1, grid.step, dtype=np.float64),
     )
+    prob = np.zeros(loss.size, dtype=np.float64)
+    prob[:-1] += contribution_left
+    prob[1:] += contribution_right
+    lower_at_knot, upper_at_knot, p_max_out, lower_semantic_dual_mass = _ctd_exterior_policy(
+        lower_mass=float(pld_pmf[0]),
+        lower_reflected_mass=float(pld_dual_pmf[0]),
+        upper_mass=float(pld_pmf[-1]),
+        upper_reflected_mass=float(pld_dual_pmf[-1]),
+        first_knot=float(loss[0]),
+        last_knot=float(loss[-1]),
+        p_max_in=p_max_in,
+    )
+    prob[0] += lower_at_knot
+    prob[-1] += upper_at_knot
+    # The endpoint split preserves each cell's mass exactly but only its reciprocal
+    # moment up to rounding, so that is the one invariant repaired here.
+    prob, p_max_out = _repair_ctd_reciprocal_moment(
+        prob=prob,
+        loss=loss,
+        p_max=p_max_out,
+        step=grid.step,
+    )
+    residual = signed_unit_residual(
+        values=exp_moment_terms(prob_arr=prob, x_vals=loss), lower_term=0.0, upper_term=0.0
+    )
+    if residual < 0.0:
+        # The repair above drains to a zero target, so this is a post-repair
+        # inconsistency in the moment ledger, not an admissible excess.
+        raise ValueError(
+            "CtD reciprocal-moment repair left E[exp(-L)] above one by "
+            f"{-residual:.3e}; the realization is invalid"
+        )
+    if lower_semantic_dual_mass > 0.0 and residual < lower_semantic_dual_mass:
+        prob, p_max_out = trim_mass_to_moment_target(
+            prob_arr=prob,
+            loss=loss,
+            p_max=p_max_out,
+            target_residual=lower_semantic_dual_mass,
+            context="CtD lower semantic dual mass repair",
+        )
     return PLDRealization(
-        x_0=float(x_0_out),
-        step=float(step_out),
+        grid=grid,
         prob_arr=prob,
-        p_min=p_min,
-        p_max=p_max,
+        p_min=0.0,
+        p_max=p_max_out,
     )
 
 
-def _validate_real_privacy_profile(
-    *,
-    eps: NDArray[np.float64],
-    profile: NDArray[np.float64],
-    reciprocal_moment: float | None = None,
-) -> NDArray[np.float64]:
-    """Validate universal range and negative-epsilon PLD constraints."""
-    profile = np.asarray(profile, dtype=np.float64)
-    validate_finite_array(profile, "privacy profile")
-    if profile.shape != eps.shape:
-        raise ValueError("privacy profile shape must match epsilon shape")
-    if np.any(profile < -PMF_MASS_TOL) or np.any(profile > 1.0 + PMF_MASS_TOL):
-        raise ValueError("privacy profile must lie in [0, 1]")
-    profile = np.clip(profile, 0.0, 1.0)
-    negative = eps < 0.0
-    moment_for_floor = (
-        1.0 + REALIZATION_MOMENT_TOL
-        if reciprocal_moment is None
-        else min(reciprocal_moment, 1.0 + REALIZATION_MOMENT_TOL)
-    )
-    pld_floor = 1.0 - np.exp(eps[negative]) * moment_for_floor
-    if np.any(profile[negative] < pld_floor - PMF_MASS_TOL):
-        raise ValueError("privacy profile violates the PLD lower bound for negative epsilon")
-    return profile
-
-
-def _validate_ctd_source(dist: DiscreteDistBase) -> None:
-    """Validate the semantic PLD-realization contract required by CtD."""
+def _require_ctd_source(dist: DiscreteDistBase) -> None:
+    """Require the semantic PLD-realization contract CtD depends on."""
     if dist.domain != Domain.REALS:
         raise ValueError("CtD projection requires a real-domain source")
     if dist.p_min != 0.0:
         raise ValueError(f"CtD projection requires p_min = 0 exactly, got {dist.p_min:.2e}")
     support = np.asarray(dist.x_array, dtype=np.float64)
-    validate_finite_array(support, "CtD source support")
+    require_finite_array(values=support, name="CtD source support")
     if support.size == 0 or np.any(np.diff(support) <= 0.0):
         raise ValueError("CtD projection requires finite, strictly increasing support")
     moment_terms = exp_moment_terms(prob_arr=dist.prob_arr, x_vals=support)
     if np.any(~np.isfinite(moment_terms)):
         raise ValueError("CtD source reciprocal moment must be finite")
-    reciprocal_moment = math.fsum(map(float, moment_terms))
-    if reciprocal_moment > 1.0 + REALIZATION_MOMENT_TOL:
+    # Neither boundary atom carries reciprocal moment: p_min is 0 by the check above, and
+    # p_max sits at L = +inf where exp(-L) is 0, so the finite terms are the whole moment.
+    moment_residual = signed_unit_residual(values=moment_terms, lower_term=0.0, upper_term=0.0)
+    if moment_residual < -REALIZATION_MOMENT_TOL:
         raise ValueError(
             "CtD source reciprocal-moment violates E[exp(-L)] <= 1 under the "
             "PLD invariant tolerance"
         )
 
 
-def _safe_exp(log_values_in: NDArray[np.float64]) -> NDArray[np.float64]:
-    """Exponentiate log-values, flushing underflow to 0 and clamping overflow.
+def _ctd_exterior_policy(
+    *,
+    lower_mass: float,
+    lower_reflected_mass: float,
+    upper_mass: float,
+    upper_reflected_mass: float,
+    first_knot: float,
+    last_knot: float,
+    p_max_in: float,
+) -> tuple[float, float, float, float]:
+    """Return finite-boundary and ``+inf`` masses for the CtD truncation policy.
 
-    Privacy-profile terms routinely underflow in deep tails, where the exact
-    value is indistinguishable from zero; clamping the upper end keeps a single
-    ``inf`` from poisoning an otherwise finite profile.
+    The lower tail collapses onto the first knot. The upper tail is split between the
+    last knot and ``+inf`` so as to preserve reflected-dual mass. Returns first-knot
+    mass, last-knot mass, ``+inf`` mass, and ``eta = R_minus - exp(-x_0) M_minus``.
     """
-    out = np.zeros_like(log_values_in, dtype=np.float64)
-    active = log_values_in > math.log(np.finfo(float).tiny)
-    out[active] = np.exp(np.minimum(log_values_in[active], math.log(np.finfo(float).max)))
-    return out
+    upper_at_knot = math.exp(last_knot) * upper_reflected_mass
+    if upper_at_knot > upper_mass * (1.0 + _ORACLE_TOL):
+        raise ValueError(
+            "CtD upper exterior cell violates exp(x_N) R_plus <= M_plus: "
+            f"{upper_at_knot:.3e} > {upper_mass:.3e}"
+        )
+    upper_at_knot = min(upper_at_knot, upper_mass)
+
+    retained_lower_dual = math.exp(-first_knot) * lower_mass
+    lower_semantic_dual_mass = lower_reflected_mass - retained_lower_dual
+    if lower_semantic_dual_mass < -_ORACLE_TOL * max(lower_reflected_mass, 1.0):
+        raise ValueError(
+            "CtD lower exterior cell violates R_minus >= exp(-x_0) M_minus: "
+            f"{lower_reflected_mass:.3e} < {retained_lower_dual:.3e}"
+        )
+    return (
+        lower_mass,
+        upper_at_knot,
+        p_max_in + upper_mass - upper_at_knot,
+        max(0.0, lower_semantic_dual_mass),
+    )
 
 
-def _linear_grid_params(x_min: float, x_max: float, d: float, align_to_multiples: bool) -> GridSpec:
-    """Return a ``GridSpec`` for a uniformly-spaced linear grid covering [x_min, x_max]."""
-    if align_to_multiples:
-        k_lo = int(np.floor(x_min / d))
-        k_hi = int(np.ceil(x_max / d))
-        # It is possible that `ceil(x/d)*d < x` in float64 due to floating numerics
-        if d * k_lo > x_min:
-            k_lo -= 1
-        if d * k_hi < x_max:
-            k_hi += 1
-        x0 = d * k_lo
-        n = k_hi - k_lo + 1
-    else:
-        x0 = x_min
-        n = int(np.ceil((x_max - x_min) / d)) + 1
-    return _cover_x_max(GridSpec(x_0=x0, step=d, n=n, spacing_type=SpacingType.LINEAR), x_max)
+def _partition_masses(
+    *,
+    dist: stats.rv_continuous | rv_frozen[Any, Any],
+    points: NDArray[np.float64],
+    label: str,
+) -> tuple[NDArray[np.float64], float, float]:
+    """Split unit mass over increasing ``points`` into cells and the two outer tails.
+
+    Returns ``mass[i] = Pr[points[i] < X <= points[i+1]]`` plus ``Pr[X <= points[0]]`` and
+    ``Pr[X > points[-1]]``; see ``_stable_cell_interval_masses`` for how the cells stay
+    accurate in the tails.
+    """
+    cdf, sf = _stable_cdf_and_sf(dist=dist, x_array=points)
+    if not np.all(np.isfinite(cdf)) or not np.all(np.isfinite(sf)):
+        raise ValueError(f"{label} CDF and survival evaluations must be finite")
+    mass = _stable_cell_interval_masses(cdf=cdf, sf=sf, label=label)
+    return mass, float(cdf[0]), float(sf[-1])
 
 
-def _geometric_grid_params(
-    x_min: float, x_max: float, d: float, align_to_multiples: bool
+def _ctd_cell_endpoint_masses(
+    *,
+    pld_pmf: NDArray[np.float64],
+    pld_dual_pmf: NDArray[np.float64],
+    left: NDArray[np.float64],
+    width: NDArray[np.float64],
+) -> tuple[NDArray[np.float64], NDArray[np.float64]]:
+    """Split each cell's mass between its two endpoint knots.
+
+    For a cell ``(a, b]`` with mass ``M``, rescaled reciprocal moment ``S = exp(a) R``,
+    ``r = exp(a - b)`` and ``d = 1 - r``, CtD places ``(S - r M)/d`` at ``a`` and
+    ``(M - S)/d`` at ``b``. ``r M <= S <= M`` holds exactly inside the cell.
+    """
+    pld_pmf = np.asarray(pld_pmf, dtype=np.float64)
+    pld_dual_pmf = np.asarray(pld_dual_pmf, dtype=np.float64)
+    if pld_pmf.shape != pld_dual_pmf.shape:
+        raise ValueError("CtD source and reflected-dual cell arrays must have the same shape")
+    if np.any(~np.isfinite(pld_pmf)) or np.any(~np.isfinite(pld_dual_pmf)):
+        raise ValueError("CtD source and reflected-dual cell measures must be finite")
+    if np.any(pld_pmf < 0.0) or np.any(pld_dual_pmf < 0.0):
+        raise ValueError("CtD source and reflected-dual cell measures must be nonnegative")
+
+    source_zero = pld_pmf == 0.0
+    dual_zero = pld_dual_pmf == 0.0
+    if np.any(source_zero != dual_zero):
+        raise ValueError(
+            "CtD source/dual interval measures are inconsistent: source and reflected-dual "
+            "cell masses must either both be zero or both be positive"
+        )
+    active = ~source_zero
+    denominator = -np.expm1(-width)
+    fraction = np.zeros_like(pld_pmf)
+    fraction[active] = (
+        (pld_pmf[active] - np.exp(left[active]) * pld_dual_pmf[active])
+        / denominator[active]
+        / pld_pmf[active]
+    )
+    if np.any(np.abs(fraction - 0.5) > 0.5 + _ORACLE_TOL / denominator):
+        raise ValueError(
+            "CtD source/dual interval measures violate r*M <= exp(a)*R <= M: endpoint "
+            f"fraction range [{float(fraction.min()):.3e}, {float(fraction.max()):.3e}] "
+            "outside [0, 1]"
+        )
+    fraction = np.clip(fraction, 0.0, 1.0)
+    weight_right = np.where(
+        fraction <= 0.5, pld_pmf * fraction, pld_pmf - pld_pmf * (1.0 - fraction)
+    )
+    return pld_pmf - weight_right, weight_right
+
+
+def _repair_ctd_reciprocal_moment(
+    *,
+    prob: NDArray[np.float64],
+    loss: NDArray[np.float64],
+    p_max: float,
+    step: float,
+) -> tuple[NDArray[np.float64], float]:
+    """Conservatively repair a bounded arithmetic moment excess by moving mass to +inf."""
+    contributions = exp_moment_terms(prob_arr=prob, x_vals=loss)
+    residual = signed_unit_residual(values=contributions, lower_term=0.0, upper_term=0.0)
+    if residual >= 0.0:
+        return prob, p_max
+
+    repair_tol = _ctd_moment_repair_tol(
+        max_abs_loss=float(np.max(np.abs(loss))),
+        step=step,
+    )
+    classify_residual(
+        residual=-residual,
+        drift_tol=min(REALIZATION_MOMENT_TOL, repair_tol),
+        repair_tol=repair_tol,
+        context="CtD reciprocal-moment repair",
+        repair="moving the cheapest mass to +inf",
+    )
+    return trim_mass_to_moment_target(
+        prob_arr=prob,
+        loss=loss,
+        p_max=p_max,
+        target_residual=0.0,
+        context="CtD reciprocal-moment repair",
+    )
+
+
+def _ctd_moment_repair_tol(*, max_abs_loss: float, step: float) -> float:
+    """Producer bound on a CtD reciprocal-moment residual: about ``eps |a| / (1-exp(-step))``."""
+    denominator = -math.expm1(-abs(step)) if step != 0.0 else 1.0
+    amplification = max(1.0, abs(max_abs_loss)) / max(denominator, float(np.finfo(np.float64).tiny))
+    return _CTD_MOMENT_REPAIR_FACTOR * amplification * float(np.finfo(np.float64).eps)
+
+
+def _covering_int_range(*, lower: float, upper: float, step: float) -> tuple[int, int]:
+    """Return integer indices whose multiples of ``step`` cover ``[lower, upper]``."""
+    k_lo = int(np.floor(lower / step))
+    k_hi = int(np.ceil(upper / step))
+    if step * k_lo > lower:
+        k_lo -= 1
+    if step * k_hi < upper:
+        k_hi += 1
+    return k_lo, k_hi
+
+
+def _covering_grid(
+    *,
+    lower: float,
+    upper: float,
+    step: float,
+    align_to_multiples: bool,
+    spacing_type: SpacingType,
+    unaligned_anchor: float,
+    cover_max: float,
 ) -> GridSpec:
-    """Return a geometric ``GridSpec`` covering [x_min, x_max].
-
-    ``d`` is the log-ratio per step.
-    """
-    step = float(np.exp(d))
+    """Cover ``[lower, upper]`` in the lattice's native coordinate, then grow to ``cover_max``."""
     if align_to_multiples:
-        k_lo = int(np.floor(np.log(x_min) / d))
-        k_hi = int(np.ceil(np.log(x_max) / d))
-        # It is possible that `ceil(x/d)*d < x` in float64 due to floating numerics
-        if np.exp(d * k_lo) > x_min:
-            k_lo -= 1
-        if np.exp(d * k_hi) < x_max:
-            k_hi += 1
-        x0 = float(np.exp(d * k_lo))
-        n = k_hi - k_lo + 1
+        k_lo, k_hi = _covering_int_range(lower=lower, upper=upper, step=step)
+        grid = GridSpec(
+            step=step,
+            n=k_hi - k_lo + 1,
+            spacing_type=spacing_type,
+            anchor=1.0 if spacing_type == SpacingType.GEOMETRIC else 0.0,
+            index_0=k_lo,
+        )
     else:
-        x0 = x_min
-        n = int(np.ceil(np.log(x_max / x_min) / d)) + 1
-    return _cover_x_max(GridSpec(x_0=x0, step=step, n=n, spacing_type=SpacingType.GEOMETRIC), x_max)
+        grid = GridSpec(
+            step=step,
+            n=int(np.ceil((upper - lower) / step)) + 1,
+            spacing_type=spacing_type,
+            anchor=unaligned_anchor,
+        )
+    return _cover_x_max(grid=grid, x_max=cover_max)
 
 
-def _cover_x_max(grid: GridSpec, x_max: float) -> GridSpec:
+def _cover_x_max(*, grid: GridSpec, x_max: float) -> GridSpec:
     """Grow ``n`` until the materialized endpoint covers ``x_max`` after float rounding."""
-    n = grid.n
     candidate = grid
-    while candidate.last_point() < x_max:
-        n += 1
-        candidate = replace(grid, n=n)
+    while candidate.last_point < x_max:
+        candidate = candidate.with_n(candidate.n + 1)
     return candidate
 
 
 @optional_njit()
-def _adaptive_bins_from_cdf(
+def _adaptive_bins_from_masses(
+    *,
+    masses: NDArray[np.float64],
+    tail_truncation: float,
+    from_left: bool,
+) -> NDArray[np.float64]:
+    """Batch already-formed cell masses until each bin reaches ``tail_truncation``.
+
+    ``from_left`` accumulates upward so mass lands on each interval's upper knot;
+    otherwise the scan runs downward and mass lands on the lower knot. Reversing the
+    ends rather than the loop keeps the scan contiguous. The sub-threshold remainder
+    stays in the last bin the scan reaches, so no mass is lost.
+    """
+    ordered = masses if from_left else masses[::-1]
+    bin_probs = np.zeros(ordered.size, dtype=np.float64)
+    accumulated_mass = 0.0
+    for i in range(ordered.size):
+        accumulated_mass += ordered[i]
+        if accumulated_mass >= tail_truncation:
+            bin_probs[i] = accumulated_mass
+            accumulated_mass = 0.0
+    if accumulated_mass > 0.0:
+        bin_probs[ordered.size - 1] += accumulated_mass
+    return bin_probs if from_left else bin_probs[::-1]
+
+
+def _stable_cell_interval_masses(
     *,
     cdf: NDArray[np.float64],
-    tail_truncation: float,
-) -> NDArray[np.float64]:
-    """Adaptive binning from CDF with mass accumulation.
-
-    Accumulates mass from CDF increments until threshold is reached, then assigns
-    accumulated mass to current bin. All mass is conserved - no mass is discarded.
-    """
-    n = cdf.size
-    bin_probs = np.zeros(n - 1, dtype=np.float64)
-    accumulated_mass = 0.0
-
-    for i in range(n - 1):
-        # Current increment in CDF
-        current_increment = cdf[i + 1] - cdf[i]
-        accumulated_mass += current_increment
-
-        if accumulated_mass >= tail_truncation:
-            # Assign accumulated mass to this bin
-            bin_probs[i] = accumulated_mass
-            accumulated_mass = 0.0
-
-    # Assign any remaining accumulated mass to the last bin
-    if accumulated_mass > 0.0:
-        bin_probs[n - 2] += accumulated_mass
-
-    return bin_probs
-
-
-@optional_njit()
-def _adaptive_bins_from_sf(
-    *,
     sf: NDArray[np.float64],
-    tail_truncation: float,
+    label: str,
 ) -> NDArray[np.float64]:
-    """Adaptive binning from survival function with mass accumulation.
+    """Return nonnegative ``Pr[x_i < X <= x_{i+1}]`` without catastrophic cancellation.
 
-    Accumulates mass from SF increments until threshold is reached, then assigns
-    accumulated mass to current bin. All mass is conserved - no mass is discarded.
-    Processes from right to left (high to low x values).
+    ``cdf[i+1] - cdf[i]`` zeroes far upper-tail cells once both values round to nearly 1,
+    silently weakening an upper bound. Each side of the median crossing therefore reads
+    whichever cumulative is the small quantity there.
+
+    A cumulative that is monotone in exact arithmetic need not be monotone in binary64, so
+    a cell may come back a few ULP negative. That much is clipped; more is an oracle
+    failure, because clipping it would manufacture mass in a bound.
     """
-    n = sf.size
-    bin_probs = np.zeros(n - 1, dtype=np.float64)
-    accumulated_mass = 0.0
-
-    for i in range(n - 2, -1, -1):
-        # Current increment in SF (going backwards)
-        current_increment = sf[i] - sf[i + 1]
-        accumulated_mass += current_increment
-
-        if accumulated_mass >= tail_truncation:
-            # Assign accumulated mass to this bin
-            bin_probs[i] = accumulated_mass
-            accumulated_mass = 0.0
-
-    # Assign any remaining accumulated mass to the first bin
-    if accumulated_mass > 0.0:
-        bin_probs[0] += accumulated_mass
-
-    return bin_probs
+    pivot = min(max(int(np.searchsorted(cdf, 0.5)), 1), cdf.size - 1)
+    mass = np.empty(cdf.size - 1, dtype=np.float64)
+    mass[:pivot] = np.diff(cdf[: pivot + 1])
+    mass[pivot:] = -np.diff(sf[pivot:])
+    if np.any(mass < -_ORACLE_TOL):
+        raise ValueError(
+            f"{label} interval oracle returned a negative probability: "
+            f"most negative cell {float(mass.min()):.3e}"
+        )
+    return np.maximum(mass, 0.0)
 
 
 def _stable_cdf_and_sf(
@@ -832,6 +995,12 @@ def _stable_cdf_and_sf(
     variants so the small side keeps full relative precision instead of being
     formed as ``1 - (nearly 1)``.
     """
+    missing = [name for name in ("logcdf", "logsf", "median") if not hasattr(dist, name)]
+    if missing:
+        raise TypeError(
+            f"{getattr(dist, 'name', type(dist).__name__)} lacks {', '.join(missing)}; "
+            "interval measures require log primitives to stay accurate in the tails"
+        )
     median = dist.median()
     cdf = np.empty_like(x_array, dtype=np.float64)
     sf = np.empty_like(x_array, dtype=np.float64)
@@ -860,34 +1029,18 @@ def _compute_discrete_prob(
     bound_type: BoundType,
     pmf_min_increment: float,
 ) -> tuple[NDArray[np.float64], float, float]:
-    """Compute bin probabilities using adaptive CDF/SF increments with logcdf/logsf stability.
+    """Compute bin probabilities from cancellation-free interval masses.
 
-    pmf_min_increment controls the minimum CDF/SF increment that becomes a bin mass.
-
+    ``pmf_min_increment`` is the minimum interval mass that becomes a bin of its own.
     """
-    cdf, sf = _stable_cdf_and_sf(
-        dist=dist,
-        x_array=x_array,
+    bound_type = require_bound_type(value=bound_type)
+    cdf, sf = _stable_cdf_and_sf(dist=dist, x_array=x_array)
+    cell_masses = _stable_cell_interval_masses(cdf=cdf, sf=sf, label="directional source")
+    # Direction only picks the scan: a dominating bin lands on each interval's upper knot,
+    # a dominated one on the lower. Both orientations bin the same cell masses.
+    bin_probs = _adaptive_bins_from_masses(
+        masses=cell_masses,
+        tail_truncation=max(0.0, pmf_min_increment),
+        from_left=bound_type == BoundType.DOMINATES,
     )
-    p_left = cdf[0]
-    p_right = sf[-1]
-    pmf_min_increment = max(0.0, pmf_min_increment)
-
-    if bound_type == BoundType.DOMINATES:
-        # A dominating bin mass accumulates upward from the CDF, so mass lands on
-        # the upper knot of each interval.
-        bin_probs = _adaptive_bins_from_cdf(
-            cdf=cdf,
-            tail_truncation=pmf_min_increment,
-        )
-    elif bound_type == BoundType.IS_DOMINATED:
-        # A dominated bin mass accumulates downward from the survival function,
-        # so mass lands on the lower knot of each interval.
-        bin_probs = _adaptive_bins_from_sf(
-            sf=sf,
-            tail_truncation=pmf_min_increment,
-        )
-    else:
-        raise ValueError(f"Unknown BoundType: {bound_type}")
-
-    return bin_probs, p_left, p_right
+    return bin_probs, float(cdf[0]), float(sf[-1])

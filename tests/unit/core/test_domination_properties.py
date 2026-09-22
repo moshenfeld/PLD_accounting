@@ -10,11 +10,16 @@ import numpy as np
 import pytest
 from scipy import stats
 
-from PLD_accounting.discrete_dist import DenseDiscreteDist, Domain, SparseDiscreteDist
+from PLD_accounting.discrete_dist import (
+    DenseDiscreteDist,
+    Domain,
+    GridSpec,
+    SparseDiscreteDist,
+)
 from PLD_accounting.distribution_discretization import (
     discretize_continuous_stoch_dom,
+    rediscretize_dist_by_bound,
 )
-from PLD_accounting.distribution_utils import compute_bin_width
 from PLD_accounting.geometric_convolution import (
     geometric_convolve,
 )
@@ -176,26 +181,22 @@ class TestDominationUnderConvolution:
     def test_convolution_preserves_domination_constraint(self):
         """Test that convolution preserves infinity mass constraints."""
         # Use geometric grids with same ratio for geometric kernel
-        x1 = np.geomspace(1.0, 4.0, 3)
         pmf1 = np.array([0.3, 0.5, 0.2], dtype=np.float64)
         # DOMINATES: p_min= 0
-        dist1 = DenseDiscreteDist.from_x_array(
-            x_array=x1,
+        dist1 = DenseDiscreteDist(
+            grid=GridSpec(step=math.log(2.0), n=3, spacing_type=SpacingType.GEOMETRIC, anchor=1.0),
             prob_arr=pmf1,
             p_min=0.0,
             p_max=0.0,
-            spacing_type=SpacingType.GEOMETRIC,
             domain=Domain.POSITIVES,
         )
 
-        x2 = np.geomspace(0.5, 1.0, 2)
         pmf2 = np.array([0.6, 0.4], dtype=np.float64)
-        dist2 = DenseDiscreteDist.from_x_array(
-            x_array=x2,
+        dist2 = DenseDiscreteDist(
+            grid=GridSpec(step=math.log(2.0), n=2, spacing_type=SpacingType.GEOMETRIC, anchor=0.5),
             prob_arr=pmf2,
             p_min=0.0,
             p_max=0.0,
-            spacing_type=SpacingType.GEOMETRIC,
             domain=Domain.POSITIVES,
         )
 
@@ -221,12 +222,10 @@ class TestRoundingBehavior:
     def test_dominates_rounds_up(self):
         """Test that DOMINATES mode rounds values up to next grid point."""
         # Create distribution with geometric grid for geometric kernel
-        x_in = np.geomspace(1.0, 4.0, 3)
         pmf_in = np.array([0.3, 0.4, 0.3], dtype=np.float64)
-        dist_in = DenseDiscreteDist.from_x_array(
-            x_array=x_in,
+        dist_in = DenseDiscreteDist(
+            grid=GridSpec(step=math.log(2.0), n=3, spacing_type=SpacingType.GEOMETRIC, anchor=1.0),
             prob_arr=pmf_in,
-            spacing_type=SpacingType.GEOMETRIC,
             domain=Domain.POSITIVES,
         )
 
@@ -242,13 +241,11 @@ class TestRoundingBehavior:
     def test_is_dominated_rounds_down(self):
         """Test that IS_DOMINATED mode rounds values down to previous grid point."""
         # Create distribution with geometric grid for geometric kernel
-        x_in = np.geomspace(1.0, 4.0, 3)
         pmf_in = np.array([0.3, 0.4, 0.3], dtype=np.float64)
-        dist_in = DenseDiscreteDist.from_x_array(
-            x_array=x_in,
+        dist_in = DenseDiscreteDist(
+            grid=GridSpec(step=math.log(2.0), n=3, spacing_type=SpacingType.GEOMETRIC, anchor=1.0),
             prob_arr=pmf_in,
             p_max=0.0,
-            spacing_type=SpacingType.GEOMETRIC,
             domain=Domain.POSITIVES,
         )
 
@@ -294,7 +291,7 @@ class TestExponentialDistribution:
 def _valid_subsampling_pair():
     """Return a PLD realization and its transformed exact dual branch."""
     base = gaussian_distribution(
-        2.0,
+        scale=2.0,
         value_discretization=0.5,
         tail_truncation=1e-8,
     )
@@ -316,6 +313,7 @@ class TestSubsampleDistMix:
             neg_dual_pld=ref_dist,
             sampling_prob=sampling_prob,
             direction=direction,
+            target_grid=None,
         )
 
         base_endpoints = _stable_subsampling_transformation(
@@ -339,20 +337,19 @@ class TestSubsampleDistMix:
             -math.log1p(-sampling_prob),
         )
 
-        assert result.x_array[0] <= expected_lower + TOL.SPACING_ATOL
-        assert result.x_array[-1] >= expected_upper - TOL.SPACING_ATOL
+        assert result.x_array[0] <= expected_lower + TOL.GRID_ATOL
+        assert result.x_array[-1] >= expected_upper - TOL.GRID_ATOL
 
     def test_uses_provided_grid(self):
-        """With ``target_x_array`` set, the mixture must use that lattice exactly."""
+        """With ``target_grid`` set, the mixture must use that lattice exactly."""
         sampling_prob = 0.25
         direction = Direction.REMOVE
         base_dist, ref_dist = _valid_subsampling_pair()
         target_grid = _calc_subsampled_grid(
-            min_loss=base_dist.x_array[0],
-            discretization=compute_bin_width(base_dist.x_array),
-            num_buckets=int(base_dist.x_array.size),
+            source_grid=base_dist.grid,
             sampling_prob=sampling_prob,
             direction=direction,
+            include_right=None,
         )
 
         result = _subsample_dist_mix(
@@ -360,13 +357,29 @@ class TestSubsampleDistMix:
             neg_dual_pld=ref_dist,
             sampling_prob=sampling_prob,
             direction=direction,
-            target_x_array=target_grid,
+            target_grid=target_grid,
         )
 
-        # Same lattice can differ by a few ULP when materialized on different paths.
-        np.testing.assert_allclose(
-            result.x_array,
-            target_grid,
-            rtol=0.0,
-            atol=1e-12,
-        )
+        # The GridSpec travels intact, so the lattice is identical, not merely close.
+        assert result.grid == target_grid
+
+
+def test_pld_contract_checks_are_not_a_domination_proof() -> None:
+    """Semantic PLD checks accept a valid object without proving mechanism domination.
+
+    The caller remains responsible for proving that a source dominates the
+    mechanism it represents. Discretization and CtD do not prove that
+    relationship.
+    """
+    source = gaussian_distribution(scale=2.0, bound_type=BoundType.DOMINATES)
+    result = rediscretize_dist_by_bound(
+        dist=source,
+        tail_truncation=1e-6,
+        loss_discretization=0.1,
+        bound_type=BoundType.DOMINATES,
+    )
+    assert result.p_min == 0.0
+    docstring = rediscretize_dist_by_bound.__doc__
+    assert docstring is not None
+    assert "caller remains responsible" in docstring
+    assert "do not prove domination" in docstring

@@ -96,12 +96,21 @@ class TestTolerances:
     """Fine discretization."""
 
     # ========================================================================
-    # GRID / SPACING (aligned with PLD_accounting.distribution_utils; defined here
-    # so tests do not import spacing tolerances from production code.)
+    # TIGHT ABSOLUTE BANDS (test-side only)
     # ========================================================================
 
-    SPACING_ATOL = 1e-12
-    SPACING_RTOL = 1e-6
+    GRID_ATOL = 1e-12
+    """Absolute band for grid coordinates: steps, origins, support endpoints.
+
+    Compares lattice quantities, which carry the magnitude of a loss value.
+    """
+
+    PROBABILITY_ATOL = 1e-12
+    """Absolute band for probability masses: totals against 1.0, p_min, p_max, PMFs.
+
+    Tighter than ``MASS_CONSERVATION`` (1e-10), which covers end-to-end analytic
+    accuracy; this one covers round-trips that should lose almost nothing.
+    """
 
     # ========================================================================
     # TIGHT ARRAY & COUPLED-DISTRIBUTION CHECKS
