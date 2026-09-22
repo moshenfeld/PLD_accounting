@@ -4,13 +4,6 @@
 
 > Vitaly Feldman and Moshe Shenfeld. *[Efficient Privacy Loss Accounting for Subsampling and Random Allocation](https://arxiv.org/abs/2602.17284).* International Conference on Machine Learning (ICML), 2026.
 
-## Paper version
-
-The [`PLD-paper`](https://github.com/moshenfeld/PLD_accounting/tree/PLD-paper)
-branch preserves the code snapshot corresponding to the paper. Refer to that
-branch for a stable paper-version reference; the default branch continues to
-receive subsequent development changes.
-
 ## Purpose
 
 - Compute tight upper/lower DP bounds for random allocation.
