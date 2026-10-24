@@ -4,12 +4,16 @@
 
 > Vitaly Feldman and Moshe Shenfeld. *[Efficient Privacy Loss Accounting for Subsampling and Random Allocation](https://arxiv.org/abs/2602.17284).* International Conference on Machine Learning (ICML), 2026.
 
-## Paper version
+## Paper versions
 
-The [`PLD-paper`](https://github.com/moshenfeld/PLD_accounting/tree/PLD-paper)
-branch preserves the code snapshot corresponding to the paper. Refer to that
-branch for a stable paper-version reference; the default branch continues to
+Two branches preserve the code snapshots corresponding to the papers. Refer to
+them for a stable paper-version reference; the default branch continues to
 receive subsequent development changes.
+
+- [`PLD-paper`](https://github.com/moshenfeld/PLD_accounting/tree/PLD-paper):
+  *Efficient Privacy Loss Accounting for Subsampling and Random Allocation*.
+- [`MS-FFT-paper`](https://github.com/moshenfeld/PLD_accounting/tree/MS-FFT-paper):
+  *Fast Privacy Loss Accounting for Random Allocation via Multiscale FFT*.
 
 ## Purpose
 
