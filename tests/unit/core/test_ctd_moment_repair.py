@@ -11,19 +11,18 @@ import math
 import numpy as np
 import pytest
 
-from PLD_accounting.discrete_dist import GridSpec
-from PLD_accounting.distribution_discretization import (
+from PLD_accounting.projections_ctd import (
     _ctd_moment_repair_tol,
-    _ctd_realization_from_cell_measures,
+    _ctd_masses_from_cell_measures,
     _repair_ctd_reciprocal_moment,
 )
+from PLD_accounting.discrete_dist import GridSpec
 from PLD_accounting.distribution_utils import exp_moment_terms, signed_unit_residual
 
 
 def _residual(prob: np.ndarray, loss: np.ndarray) -> float:
-    return signed_unit_residual(
-        values=exp_moment_terms(prob_arr=prob, x_vals=loss), lower_term=0.0, upper_term=0.0
-    )
+    moment_terms = exp_moment_terms(prob_arr=prob, x_vals=loss)
+    return signed_unit_residual(values=moment_terms, lower_term=0.0, upper_term=0.0)
 
 
 def _flat_ctd_cell_measures(
@@ -79,20 +78,22 @@ def test_semantic_repair_surrenders_only_the_moment_still_due() -> None:
     loss = grid.materialize()
 
     exact_pmf, exact_dual_pmf = _flat_ctd_cell_measures(loss=loss, semantic_dual_mass=0.0)
-    baseline = _ctd_realization_from_cell_measures(
-        pld_pmf=exact_pmf, pld_dual_pmf=exact_dual_pmf, p_max_in=0.0, grid=grid
+    width = np.full(loss.size - 1, grid.step)
+    baseline_prob, _ = _ctd_masses_from_cell_measures(
+        pld_pmf=exact_pmf, pld_dual_pmf=exact_dual_pmf, p_max_in=0.0, loss=loss, width=width
     )
-    residual = _residual(baseline.prob_arr, loss)
+    residual = _residual(baseline_prob, loss)
     assert residual > 0.0
 
     semantic_dual_mass = residual + 1e-16
     pld_pmf, pld_dual_pmf = _flat_ctd_cell_measures(
         loss=loss, semantic_dual_mass=semantic_dual_mass
     )
-    result = _ctd_realization_from_cell_measures(
-        pld_pmf=pld_pmf, pld_dual_pmf=pld_dual_pmf, p_max_in=0.0, grid=grid
+    result_prob, result_p_max = _ctd_masses_from_cell_measures(
+        pld_pmf=pld_pmf, pld_dual_pmf=pld_dual_pmf, p_max_in=0.0, loss=loss, width=width
     )
 
     still_due = semantic_dual_mass - residual
-    assert result.p_max == pytest.approx(still_due, rel=1e-3)
-    assert _residual(result.prob_arr, loss) >= semantic_dual_mass
+    assert result_p_max == pytest.approx(still_due, rel=1e-3)
+    # The library reconstructs the target from two rounded quantities, so it may sit one ulp lower.
+    assert _residual(result_prob, loss) >= semantic_dual_mass - np.spacing(semantic_dual_mass)

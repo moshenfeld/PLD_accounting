@@ -8,7 +8,9 @@ mass-correction policy.
 """
 
 import math
+import operator
 import warnings
+from unittest.mock import Mock
 
 import numpy as np
 import pytest
@@ -29,10 +31,8 @@ TAIL_TRUNCATION = 0.01
 
 def _bernoulli_pld() -> DenseDiscreteDist:
     """Loss 0 with probability ``1 - q`` and loss 1 with probability ``q``."""
-    return DenseDiscreteDist(
-        grid=GridSpec(step=1.0, n=2, anchor=0.0, index_0=0),
-        prob_arr=np.array([1.0 - BERNOULLI_Q, BERNOULLI_Q]),
-    )
+    grid = GridSpec(step=1.0, n=2, anchor=0.0, index_0=0)
+    return DenseDiscreteDist(grid=grid, prob_arr=np.array([1.0 - BERNOULLI_Q, BERNOULLI_Q]))
 
 
 def _hockey_stick(dist: DenseDiscreteDist, epsilon: float) -> float:
@@ -68,8 +68,9 @@ def _exact_hockey_stick(epsilon: float) -> float:
 def _direct(bound_type: BoundType) -> DenseDiscreteDist:
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", RuntimeWarning)
+        dist = _bernoulli_pld()
         return fft_self_convolve(
-            dist=_bernoulli_pld(),
+            dist=dist,
             num_convolutions=COMPOSITION_DEPTH,
             tail_truncation=TAIL_TRUNCATION,
             bound_type=bound_type,
@@ -111,10 +112,7 @@ def test_declared_alias_shift_is_the_window_allowance_in_output_mass_units() -> 
 
 @pytest.mark.parametrize(
     "bound_type,is_conservative",
-    [
-        (BoundType.DOMINATES, lambda produced, exact: produced >= exact),
-        (BoundType.IS_DOMINATED, lambda produced, exact: produced <= exact),
-    ],
+    [(BoundType.DOMINATES, operator.ge), (BoundType.IS_DOMINATED, operator.le)],
 )
 def test_direct_self_convolve_respects_its_direction_against_an_exact_oracle(
     bound_type: BoundType, is_conservative
@@ -153,8 +151,9 @@ def test_direct_self_convolve_applies_the_declared_shift_silently(
     """
     with warnings.catch_warnings():
         warnings.simplefilter("error", RuntimeWarning)
+        dist = _bernoulli_pld()
         fft_self_convolve(
-            dist=_bernoulli_pld(),
+            dist=dist,
             num_convolutions=COMPOSITION_DEPTH,
             tail_truncation=tail_truncation,
             bound_type=bound_type,
@@ -177,13 +176,11 @@ def _run_direct_with_fixed_bands(
     monkeypatch: pytest.MonkeyPatch, *, drift_tol: float, repair_tol: float
 ) -> None:
     """Pin the numerical bands so the band offset, not the FFT size, is under test."""
-    monkeypatch.setattr(
-        fft_convolution_module,
-        "_fft_mass_tolerances",
-        lambda **_kwargs: (drift_tol, repair_tol),
-    )
+    fixed_bands = Mock(return_value=(drift_tol, repair_tol))
+    monkeypatch.setattr(fft_convolution_module, "transform_mass_tolerances", fixed_bands)
+    dist = _bernoulli_pld()
     fft_self_convolve(
-        dist=_bernoulli_pld(),
+        dist=dist,
         num_convolutions=COMPOSITION_DEPTH,
         tail_truncation=TAIL_TRUNCATION,
         bound_type=BoundType.DOMINATES,
@@ -213,10 +210,13 @@ def test_direct_self_convolve_rejects_an_unfundable_declared_shift(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A declared shift the finite ledger cannot cover must fail rather than renormalize."""
-    monkeypatch.setattr(fft_convolution_module, "_declared_alias_shift", lambda **_kwargs: 1.5)
+
+    unfundable_shift = Mock(return_value=1.5)
+    monkeypatch.setattr(fft_convolution_module, "_declared_alias_shift", unfundable_shift)
+    dist = _bernoulli_pld()
     with pytest.raises(ValueError):
         fft_self_convolve(
-            dist=_bernoulli_pld(),
+            dist=dist,
             num_convolutions=COMPOSITION_DEPTH,
             tail_truncation=TAIL_TRUNCATION,
             bound_type=BoundType.DOMINATES,

@@ -18,18 +18,14 @@ import math
 import numpy as np
 import pytest
 
-from PLD_accounting.discrete_dist import (
-    DenseDiscreteDist,
-    Domain,
-    GridSpec,
-    PLDRealization,
-)
+from PLD_accounting.discrete_dist import DenseDiscreteDist, Domain, GridSpec, PLDRealization
+from PLD_accounting.projections_stoch_dom import truncate_edges_stoch_dom
 from PLD_accounting.types import BoundType, SpacingType
 from PLD_accounting.utils import (
     calc_pld_dual,
     exp_linear_to_geometric,
     log_geometric_to_linear,
-    negate_reverse_linear_distribution,
+    negate_reverse_distribution,
 )
 
 
@@ -90,13 +86,16 @@ def test_affine_slice_retains_points_bitwise(anchor: float) -> None:
 
 def test_double_reflection_is_the_identity() -> None:
     """Reflecting twice returns the same lattice, not an approximation of it."""
+    smallest_positive = float(np.nextafter(0.0, 1.0))
     for grid in (
         _zero_anchored(2e-4, 33, -17),
         GridSpec(step=0.25, n=9, anchor=1e-300),
-        GridSpec(step=1.0, n=4, anchor=float(np.nextafter(0.0, 1.0))),
+        GridSpec(step=1.0, n=4, anchor=smallest_positive),
     ):
         assert grid.reflect().reflect() == grid
-        np.testing.assert_array_equal(grid.reflect().materialize(), -grid.materialize()[::-1])
+        reflected_points = grid.reflect().materialize()
+        points = grid.materialize()
+        np.testing.assert_array_equal(reflected_points, -points[::-1])
 
 
 @pytest.mark.parametrize("step", [2e-4, 1e-3, 1e-5, 0.05, 0.5])
@@ -113,7 +112,9 @@ def test_exp_log_round_trip_is_exact_in_step_and_coordinates(step: float) -> Non
     back = exp_grid.log()
     assert back == grid  # structural identity, not just anchor and index
     assert back.step == grid.step
-    np.testing.assert_array_equal(back.materialize(), grid.materialize())
+    back_points = back.materialize()
+    points = grid.materialize()
+    np.testing.assert_array_equal(back_points, points)
 
 
 def test_exp_grid_materializes_as_the_exponential_of_the_linear_grid() -> None:
@@ -132,7 +133,7 @@ def test_affine_exp_keeps_the_step_but_not_coordinate_identity() -> None:
 
 @pytest.mark.parametrize("index_0", [-30, -1, 0, 5])
 def test_geometric_slice_keeps_exponents_not_origins(index_0: int) -> None:
-    """The legacy geometric truncation regression: [2, 6, 18, 54][1:3] is [6, 18]."""
+    """A geometric slice keeps the exponents of its points: [2, 6, 18, 54][1:3] is [6, 18]."""
     grid = _geometric(3.0, 4, 2.0, index_0)
     points = grid.materialize()
     sliced = grid.slice(start=1, n=2)
@@ -143,8 +144,9 @@ def test_geometric_slice_keeps_exponents_not_origins(index_0: int) -> None:
 def test_geometric_slice_regression_exact_values() -> None:
     """Spelled out: slicing [2, 6, 18, 54] at index 1 never yields [5, 15]."""
     grid = _geometric(3.0, 4, 2.0, 0)
-    np.testing.assert_allclose(grid.materialize(), [2.0, 6.0, 18.0, 54.0], rtol=1e-14)
-    np.testing.assert_array_equal(grid.slice(start=1, n=2).materialize(), grid.materialize()[1:3])
+    points = grid.materialize()
+    np.testing.assert_allclose(points, [2.0, 6.0, 18.0, 54.0], rtol=1e-14)
+    np.testing.assert_array_equal(grid.slice(start=1, n=2).materialize(), points[1:3])
 
 
 def test_convolution_indices_add_algebraically() -> None:
@@ -209,10 +211,13 @@ def test_truncation_through_the_public_route_is_an_index_slice() -> None:
     prob[40:160] = 1.0 / 120
     realization = PLDRealization(grid=grid, prob_arr=prob)
 
-    truncated = realization.truncate_edges(tail_truncation=0.0, bound_type=BoundType.DOMINATES)
+    truncated = truncate_edges_stoch_dom(
+        dist=realization, tail_truncation=0.0, bound_type=BoundType.DOMINATES
+    )
 
     assert truncated.grid == grid.slice(start=40, n=120)
-    np.testing.assert_array_equal(truncated.x_array, grid.materialize()[40:160])
+    points = grid.materialize()
+    np.testing.assert_array_equal(truncated.x_array, points[40:160])
 
 
 def test_dual_and_reflection_round_trip_preserves_the_loss_grid() -> None:
@@ -222,10 +227,11 @@ def test_dual_and_reflection_round_trip_preserves_the_loss_grid() -> None:
     prob = np.full(101, 1.0 / 101)
     realization = PLDRealization(grid=grid, prob_arr=prob)
 
-    reflected_dual = negate_reverse_linear_distribution(calc_pld_dual(realization))
+    reflected_dual = negate_reverse_distribution(calc_pld_dual(realization))
 
     assert reflected_dual.grid == grid
-    np.testing.assert_array_equal(reflected_dual.x_array, grid.materialize())
+    points = grid.materialize()
+    np.testing.assert_array_equal(reflected_dual.x_array, points)
 
 
 def test_geometric_transform_round_trip_through_distributions() -> None:
@@ -280,7 +286,8 @@ def test_dense_support_is_exactly_the_grid_it_was_built_from() -> None:
     """
     grid = GridSpec(step=0.25, n=5, index_0=-2)
     dist = DenseDiscreteDist(grid=grid, prob_arr=np.full(5, 0.2))
-    np.testing.assert_array_equal(dist.x_array, grid.materialize())
+    points = grid.materialize()
+    np.testing.assert_array_equal(dist.x_array, points)
     assert dist.grid == grid
 
 

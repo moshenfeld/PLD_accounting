@@ -6,17 +6,16 @@ from PLD_accounting.discrete_dist import (
     GridSpec,
     PLDRealization,
 )
-from PLD_accounting.distribution_discretization import rediscretize_dist_by_bound
 from PLD_accounting.dp_accounting_support import dp_accounting_pmf_to_pld_realization
 from PLD_accounting.mechanisms import (
     discrete_distribution,
     gaussian_distribution,
     laplace_distribution,
 )
+from PLD_accounting.projections import project_discrete_dist
 from PLD_accounting.random_allocation_accounting import compose_full_pld
 from PLD_accounting.random_allocation_api import (
     gaussian_allocation_delta_configurable,
-    gaussian_allocation_directional_pld,
     gaussian_allocation_epsilon_configurable,
     gaussian_allocation_epsilon_range,
     gaussian_allocation_pld,
@@ -35,6 +34,7 @@ from PLD_accounting.types import (
     BoundType,
     ConvolutionMethod,
     Direction,
+    ProjectionMethod,
     PrivacyParams,
     SpacingType,
     has_numba,
@@ -51,13 +51,13 @@ __all__ = [
     "DEFAULT_LOSS_DISCRETIZATION",
     "DEFAULT_TAIL_TRUNCATION",
     "Direction",
+    "ProjectionMethod",
     "PrivacyParams",
     "SpacingType",
     "has_numba",
     "compose_full_pld",
     "discrete_distribution",
     "dp_accounting_pmf_to_pld_realization",
-    "gaussian_allocation_directional_pld",
     "gaussian_allocation_pld",
     "gaussian_allocation_delta_configurable",
     "gaussian_allocation_epsilon_configurable",
@@ -67,7 +67,7 @@ __all__ = [
     "general_allocation_delta",
     "general_allocation_epsilon",
     "laplace_distribution",
-    "rediscretize_dist_by_bound",
+    "project_discrete_dist",
     "subsample_pld",
     "subsample_pld_realization",
 ]

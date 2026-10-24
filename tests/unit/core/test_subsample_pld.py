@@ -7,46 +7,41 @@ import pytest
 from dp_accounting.pld import privacy_loss_distribution as dp_pld
 from dp_accounting.pld.pld_pmf import DensePLDPmf
 
-from PLD_accounting.discrete_dist import GridSpec, PLDRealization
+from PLD_accounting.discrete_dist import GridSpec, PLDRealization, SparseDiscreteDist
 from PLD_accounting.dp_accounting_support import (
     DP_ACCOUNTING_MASS_REPAIR_TOL,
     dp_accounting_pmf_to_pld_realization,
     linear_dist_to_dp_accounting_pmf,
 )
-from PLD_accounting.subsample_pld import subsample_pld
-from PLD_accounting.types import BoundType
+from PLD_accounting.projections import project_discrete_dist
+from PLD_accounting.random_allocation_accounting import compose_full_pld
+from PLD_accounting.subsample_pld import (
+    _calc_subsampled_grid,
+    _subsample_dist_mix,
+    subsample_pld,
+    subsample_pld_realization,
+)
+from PLD_accounting.types import BoundType, Direction
+from PLD_accounting.utils import calc_pld_dual, negate_reverse_distribution
 
 
 def _make_pld_remove_only() -> dp_pld.PrivacyLossDistribution:
     """Build a PLD with only the REMOVE direction."""
-    dist = PLDRealization(
-        grid=GridSpec(
-            step=0.5,
-            n=4,
-            anchor=0.0,
-        ),
-        prob_arr=np.array([0.4, 0.3, 0.2, 0.1], dtype=np.float64),
-    )
+    grid = GridSpec(step=0.5, n=4, anchor=0.0)
+    dist = PLDRealization(grid=grid, prob_arr=np.array([0.4, 0.3, 0.2, 0.1], dtype=np.float64))
     pmf = linear_dist_to_dp_accounting_pmf(dist=dist, bound_type=BoundType.DOMINATES)
     return dp_pld.PrivacyLossDistribution(pmf_remove=pmf)
 
 
 def _make_pld_both_directions() -> dp_pld.PrivacyLossDistribution:
     """Build a PLD with both REMOVE and ADD directions."""
+    remove_grid = GridSpec(step=0.5, n=4, anchor=0.0)
     remove_dist = PLDRealization(
-        grid=GridSpec(
-            step=0.5,
-            n=4,
-            anchor=0.0,
-        ),
-        prob_arr=np.array([0.4, 0.3, 0.2, 0.1], dtype=np.float64),
+        grid=remove_grid, prob_arr=np.array([0.4, 0.3, 0.2, 0.1], dtype=np.float64)
     )
+    add_grid = GridSpec(step=0.25, n=5, anchor=0.0)
     add_dist = PLDRealization(
-        grid=GridSpec(
-            step=0.25,
-            n=5,
-            anchor=0.0,
-        ),
+        grid=add_grid,
         prob_arr=np.array([0.24, 0.2, 0.18, 0.16, 0.14], dtype=np.float64),
         p_max=0.08,
     )
@@ -78,10 +73,8 @@ def test_subsample_pld_q1_returns_same_object():
 
 def test_subsample_pld_rejects_optimistic_remove_pmf() -> None:
     """Optimistic REMOVE PMFs are rejected for both the shortcut and the full path."""
-    dist = PLDRealization(
-        grid=GridSpec(step=0.5, n=4, anchor=0.0),
-        prob_arr=np.array([0.4, 0.3, 0.2, 0.1], dtype=np.float64),
-    )
+    grid = GridSpec(step=0.5, n=4, anchor=0.0)
+    dist = PLDRealization(grid=grid, prob_arr=np.array([0.4, 0.3, 0.2, 0.1], dtype=np.float64))
     pmf = linear_dist_to_dp_accounting_pmf(dist=dist, bound_type=BoundType.IS_DOMINATED)
     pld = dp_pld.PrivacyLossDistribution(pmf_remove=pmf)
     with pytest.raises(ValueError, match="optimistic dp_accounting PMF does not map"):
@@ -93,8 +86,9 @@ def test_subsample_pld_rejects_optimistic_remove_pmf() -> None:
 def test_subsample_pld_rejects_optimistic_add_pmf_on_q1_shortcut() -> None:
     """The q==1 identity return still validates an optional ADD PMF."""
     pld = _make_pld_both_directions()
+    add_grid = GridSpec(step=0.25, n=5, anchor=0.0)
     add_dist = PLDRealization(
-        grid=GridSpec(step=0.25, n=5, anchor=0.0),
+        grid=add_grid,
         prob_arr=np.array([0.24, 0.2, 0.18, 0.16, 0.14], dtype=np.float64),
         p_max=0.08,
     )
@@ -216,8 +210,63 @@ def test_composed_pmf_imports_when_the_caller_raises_the_ceiling() -> None:
     """Raising the ceiling admits a composed source; it does not silence the repair."""
     depth = 1_000
     with pytest.warns(RuntimeWarning, match="dp_accounting import mass"):
+        pmf = _pmf_with_mass_residual(1.0e-5)
         realization = dp_accounting_pmf_to_pld_realization(
-            pmf=_pmf_with_mass_residual(1.0e-5),
-            mass_repair_tol=DP_ACCOUNTING_MASS_REPAIR_TOL * depth,
+            pmf=pmf, mass_repair_tol=DP_ACCOUNTING_MASS_REPAIR_TOL * depth
         )
     assert realization.prob_arr.size == 4
+
+
+def test_remove_subsampling_grid_covers_the_image_of_the_dual_atom_at_minus_inf():
+    """REMOVE maps the negated dual's atom at ``-inf`` to ``log(1-q)``, which the grid covers.
+
+    Collapsing that atom onto the first knot is valid but loose once the PLD is composed;
+    covering it keeps the result above a fine projection of the exact atoms.
+    """
+    # E[exp(-L)] < 1, so the negated dual carries mass at -inf.
+    base = PLDRealization(grid=GridSpec(step=0.5, n=2, index_0=1), prob_arr=np.array([0.5, 0.5]))
+    sampling_prob = 0.3
+    subsampled = subsample_pld_realization(
+        base_pld=base, sampling_prob=sampling_prob, direction=Direction.REMOVE
+    )
+    assert subsampled.x_array[0] <= np.log1p(-sampling_prob)
+
+    # The exact remove-direction mixture: atoms of L under P and of -D(L) under Q.
+    losses = np.log1p(sampling_prob * np.expm1(np.array([0.5, 1.0])))
+    exact = SparseDiscreteDist(
+        x_array=np.concatenate(([np.log1p(-sampling_prob)], losses)),
+        prob_arr=np.concatenate(
+            (
+                [(1.0 - sampling_prob) * (1.0 - 0.5 * (np.exp(-0.5) + np.exp(-1.0)))],
+                sampling_prob * 0.5 + (1.0 - sampling_prob) * 0.5 * np.exp(-np.array([0.5, 1.0])),
+            )
+        ),
+    )
+    reference = project_discrete_dist(
+        dist=exact, tail_truncation=0.0, loss_discretization=1e-4, bound_type=BoundType.DOMINATES
+    )
+    # The grid of the base branch alone, which leaves log(1-q) below its first knot.
+    base_only_grid = _calc_subsampled_grid(
+        source_grid=base.grid,
+        sampling_prob=sampling_prob,
+        direction=Direction.REMOVE,
+        include_right=None,
+    )
+    assert base_only_grid.x_0 > np.log1p(-sampling_prob)
+    collapsed = _subsample_dist_mix(
+        base_pld=base,
+        neg_dual_pld=negate_reverse_distribution(calc_pld_dual(base)),
+        sampling_prob=sampling_prob,
+        direction=Direction.REMOVE,
+        target_grid=base_only_grid,
+    )
+    for epsilon in (0.5, 1.0, 2.0):
+        covered, exact_delta, collapsed_delta = (
+            compose_full_pld(remove_dist=dist, add_dist=None, bound_type=BoundType.DOMINATES)
+            .self_compose(5)
+            .get_delta_for_epsilon(epsilon)
+            for dist in (subsampled, reference, collapsed)
+        )
+        assert exact_delta * (1.0 - 1e-9) <= covered <= collapsed_delta
+        if epsilon < 2.0:
+            assert covered < 0.6 * collapsed_delta

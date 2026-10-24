@@ -4,11 +4,12 @@ Discretizes the REMOVE-direction (one record removed) continuous PLD onto a
 linear grid. With ``bound_type=DOMINATES`` (default), returns a validated
 :class:`PLDRealization`. With ``bound_type=IS_DOMINATED``, returns a plain
 :class:`DenseDiscreteDist` (no PLD validation — the lower-bound grid can have
-mass at negative infinity loss).
+mass at negative infinity loss). That lower-bound object is not a PLD realization,
+so the general allocation APIs, which require ``PLDRealization`` inputs, reject it.
 
-For Laplace with sampling probability 1, ADD and REMOVE PLDs coincide; callers
-may use ``copy.deepcopy(dist)`` on a :class:`PLDRealization` for the ADD slot
-when a second object is required.
+The Gaussian and Laplace PLDs are symmetric: ADD and REMOVE coincide, so one
+realization can be passed for both directions. Distributions are immutable, so no
+copy is needed.
 
 The Gaussian and Laplace helpers use sensitivity 1 (L2 and L1, respectively).
 
@@ -36,11 +37,8 @@ from PLD_accounting.discrete_dist import (
     PLDRealization,
     SparseDiscreteDist,
 )
-from PLD_accounting.distribution_discretization import (
-    discretize_continuous_ctd,
-    discretize_continuous_stoch_dom,
-    rediscretize_dist_by_bound,
-)
+from PLD_accounting.distribution_utils import exact_sum
+from PLD_accounting.projections import project_continuous_dist, project_discrete_dist
 from PLD_accounting.types import (
     DEFAULT_LOSS_DISCRETIZATION,
     DEFAULT_TAIL_TRUNCATION,
@@ -72,8 +70,10 @@ def gaussian_distribution(
     Args:
         scale: Noise standard deviation of the Gaussian mechanism.
         value_discretization: Target step size for the linear grid.
-        tail_truncation: Tail probability budget; quantiles ``ppf``/``isf`` at
-            this level define the grid range.
+        tail_truncation: Tail probability budget that sets the grid range. For
+            ``DOMINATES`` the range covers the law and its reflected dual, each
+            beyond its ``tail_truncation / 2`` quantiles on both sides; for
+            ``IS_DOMINATED`` it is the law's own ``tail_truncation`` quantiles.
         bound_type: Rounding semantics for mapping continuous mass to grid points.
             ``DOMINATES`` for an upper bound and ``IS_DOMINATED`` for a lower bound.
 
@@ -86,10 +86,7 @@ def gaussian_distribution(
         value=[scale, value_discretization], name=["scale", "value_discretization"]
     )
     require_open_unit_interval(value=tail_truncation, name="tail_truncation")
-    scale_f = float(scale)
-    mu = 1.0 / (2.0 * scale_f**2)
-    sd = 1.0 / scale_f
-    dist = stats.norm(loc=mu, scale=sd)
+    dist = gaussian_loss_law(scale)
     return _continuous_mechanism_distribution(
         dist=dist,
         dual_dist=dist,
@@ -97,6 +94,16 @@ def gaussian_distribution(
         tail_truncation=tail_truncation,
         bound_type=bound_type,
     )
+
+
+def gaussian_loss_law(sigma: float) -> rv_frozen[Any, Any]:
+    """Return the privacy-loss law of the Gaussian mechanism with noise scale ``sigma``.
+
+    The law is ``N(1 / (2 * sigma**2), 1 / sigma**2)`` (L2 sensitivity 1), and it is
+    its own PLD dual.
+    """
+    require_positive_real(value=sigma, name="sigma")
+    return stats.norm(loc=1.0 / (2.0 * sigma**2), scale=1.0 / sigma)
 
 
 def laplace_distribution(
@@ -109,10 +116,12 @@ def laplace_distribution(
     """Discretized Laplace mechanism PLD (L1 sensitivity 1) on a linear grid.
 
     Args:
-        scale: Laplace noise scale
+        scale: Laplace noise scale parameter ``b``.
         value_discretization: Target step size for the linear grid.
-        tail_truncation: Tail probability budget; quantiles ``ppf``/``isf`` at
-            this level define the grid range.
+        tail_truncation: Tail probability budget that sets the grid range. For
+            ``DOMINATES`` the range covers the law and its reflected dual, each
+            beyond its ``tail_truncation / 2`` quantiles on both sides; for
+            ``IS_DOMINATED`` it is the law's own ``tail_truncation`` quantiles.
         bound_type: Rounding semantics for mapping continuous mass to grid points.
             ``DOMINATES`` for an upper bound and ``IS_DOMINATED`` for a lower bound.
 
@@ -224,16 +233,6 @@ class _LaplacePLD(stats.rv_continuous):
         self.lam = 1.0 / float(sigma)
         super().__init__(a=-self.lam, b=self.lam, name="laplace_pld")
 
-    def _cdf(self, x: Any, *args: Any) -> Any:
-        del args
-        x_arr = np.asarray(x)
-        lam = self.lam
-        out = np.zeros_like(x_arr, dtype=float)
-        mid = (-lam <= x_arr) & (x_arr < lam)
-        out[mid] = 0.5 * np.exp((x_arr[mid] - lam) / 2.0)
-        out[x_arr >= lam] = 1.0
-        return out
-
     def cdf(self, x: Any, *args: Any, **kwds: Any) -> Any:
         """Return the full mixed CDF, including atoms at equality."""
         del args, kwds
@@ -256,7 +255,19 @@ class _LaplacePLD(stats.rv_continuous):
         with np.errstate(divide="ignore"):
             return np.log1p(-self._cdf(x))
 
+    def _cdf(self, x: Any, *args: Any) -> Any:
+        """Evaluate the mixed CDF, including each boundary atom at equality."""
+        del args
+        x_arr = np.asarray(x)
+        lam = self.lam
+        out = np.zeros_like(x_arr, dtype=float)
+        mid = (-lam <= x_arr) & (x_arr < lam)
+        out[mid] = 0.5 * np.exp((x_arr[mid] - lam) / 2.0)
+        out[x_arr >= lam] = 1.0
+        return out
+
     def _ppf(self, q: Any, *args: Any) -> Any:
+        """Invert the mixed CDF, placing each boundary atom's quantiles at its loss."""
         del args
         q_arr = np.asarray(q)
         lam = self.lam
@@ -283,23 +294,13 @@ def _continuous_mechanism_distribution(
 
     Upper bounds use CtD and lower bounds use stochastic domination.
     """
-    linear_dist: DenseDiscreteDist
-    if bound_type == BoundType.DOMINATES:
-        linear_dist = discretize_continuous_ctd(
-            dist=dist,
-            dual_dist=dual_dist,
-            tail_truncation=tail_truncation,
-            step=value_discretization,
-            align_to_multiples=True,
-        )
-    else:
-        linear_dist = discretize_continuous_stoch_dom(
-            dist=dist,
-            tail_truncation=tail_truncation,
-            bound_type=bound_type,
-            step=value_discretization,
-            align_to_multiples=True,
-        )
+    linear_dist = project_continuous_dist(
+        dist=dist,
+        dual_dist=dual_dist,
+        tail_truncation=tail_truncation,
+        step=value_discretization,
+        bound_type=bound_type,
+    )
     if not (
         isinstance(linear_dist, DenseDiscreteDist)
         and linear_dist.spacing_type == SpacingType.LINEAR
@@ -339,30 +340,28 @@ def _count_noise_direction_pld(
             shifted[shift:] = probs[: probs.size - shift]
     finite = (probs > 0.0) & (shifted > 0.0)
     losses = np.log(probs[finite]) - np.log(shifted[finite])
-    finite_probs = probs[finite]
     infinite_loss_mass = math.fsum(
         (
             noise_dist.p_min,
             noise_dist.p_max,
-            math.fsum(map(float, probs[~finite])),
+            exact_sum(probs[~finite]),
         )
     )
-    if finite_probs.size == 0:
+    if not finite.any():
+        empty_grid = GridSpec(step=float(loss_discretization), n=2, anchor=0.0)
         return PLDRealization(
-            grid=GridSpec(step=float(loss_discretization), n=2, anchor=0.0),
-            prob_arr=np.zeros(2, dtype=np.float64),
-            p_max=infinite_loss_mass,
+            grid=empty_grid, prob_arr=np.zeros(2, dtype=np.float64), p_max=infinite_loss_mass
         )
 
     losses, groups = np.unique(losses, return_inverse=True)
     probs_grouped = np.zeros_like(losses)
-    np.add.at(probs_grouped, groups, finite_probs)
+    np.add.at(probs_grouped, groups, probs[finite])
     sparse_dist = SparseDiscreteDist(
         x_array=losses,
         prob_arr=probs_grouped,
         p_max=infinite_loss_mass,
     )
-    result = rediscretize_dist_by_bound(
+    result = project_discrete_dist(
         dist=sparse_dist,
         tail_truncation=tail_truncation,
         loss_discretization=loss_discretization,

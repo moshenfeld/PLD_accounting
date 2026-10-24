@@ -10,27 +10,18 @@ import numpy as np
 import pytest
 from scipy import stats
 
-from PLD_accounting.discrete_dist import (
-    DenseDiscreteDist,
-    Domain,
-    GridSpec,
-    SparseDiscreteDist,
-)
-from PLD_accounting.distribution_discretization import (
-    discretize_continuous_stoch_dom,
-    rediscretize_dist_by_bound,
-)
-from PLD_accounting.geometric_convolution import (
-    geometric_convolve,
-)
+from PLD_accounting.discrete_dist import DenseDiscreteDist, Domain, GridSpec, SparseDiscreteDist
+from PLD_accounting.geometric_convolution import geometric_convolve
 from PLD_accounting.mechanisms import gaussian_distribution
+from PLD_accounting.projections import project_discrete_dist
+from PLD_accounting.projections_stoch_dom import project_continuous_dist_stoch_dom
 from PLD_accounting.subsample_pld import (
     _calc_subsampled_grid,
     _stable_subsampling_transformation,
     _subsample_dist_mix,
 )
 from PLD_accounting.types import BoundType, Direction, SpacingType
-from PLD_accounting.utils import calc_pld_dual, negate_reverse_linear_distribution
+from PLD_accounting.utils import calc_pld_dual, negate_reverse_distribution
 from tests.test_tolerances import TestTolerances as TOL
 
 
@@ -51,10 +42,10 @@ class TestDominationSemantics:
     def test_dominates_has_no_neg_inf_mass(self):
         """Test that DOMINATES mode sets p_min= 0."""
         dist = stats.norm(loc=0.0, scale=1.0)
-        result = discretize_continuous_stoch_dom(
+        step = _linear_step_for_tail_truncation(dist, 0.01, 100)
+        result = project_continuous_dist_stoch_dom(
             dist=dist,
-            step=_linear_step_for_tail_truncation(dist, 0.01, 100),
-            align_to_multiples=True,
+            step=step,
             tail_truncation=0.01,
             bound_type=BoundType.DOMINATES,
         )
@@ -64,10 +55,10 @@ class TestDominationSemantics:
     def test_is_dominated_has_no_pos_inf_mass(self):
         """Test that IS_DOMINATED mode sets p_max= 0."""
         dist = stats.norm(loc=0.0, scale=1.0)
-        result = discretize_continuous_stoch_dom(
+        step = _linear_step_for_tail_truncation(dist, 0.01, 100)
+        result = project_continuous_dist_stoch_dom(
             dist=dist,
-            step=_linear_step_for_tail_truncation(dist, 0.01, 100),
-            align_to_multiples=True,
+            step=step,
             tail_truncation=0.01,
             bound_type=BoundType.IS_DOMINATED,
         )
@@ -77,10 +68,10 @@ class TestDominationSemantics:
     def test_dominates_captures_left_tail(self):
         """Test that DOMINATES mode captures left tail in first bin."""
         dist = stats.norm(loc=0.0, scale=1.0)
-        result = discretize_continuous_stoch_dom(
+        step = _linear_step_for_tail_truncation(dist, 0.01, 100)
+        result = project_continuous_dist_stoch_dom(
             dist=dist,
-            step=_linear_step_for_tail_truncation(dist, 0.01, 100),
-            align_to_multiples=True,
+            step=step,
             tail_truncation=0.01,
             bound_type=BoundType.DOMINATES,
         )
@@ -93,10 +84,10 @@ class TestDominationSemantics:
     def test_is_dominated_sends_left_tail_to_neg_inf(self):
         """Test that IS_DOMINATED mode sends left tail to -∞."""
         dist = stats.norm(loc=0.0, scale=1.0)
-        result = discretize_continuous_stoch_dom(
+        step = _linear_step_for_tail_truncation(dist, 0.01, 100)
+        result = project_continuous_dist_stoch_dom(
             dist=dist,
-            step=_linear_step_for_tail_truncation(dist, 0.01, 100),
-            align_to_multiples=True,
+            step=step,
             tail_truncation=0.01,
             bound_type=BoundType.IS_DOMINATED,
         )
@@ -112,19 +103,18 @@ class TestStochasticDominance:
     def test_expected_value_ordering(self):
         """Test that E[upper] >= E[lower] (first-order stochastic dominance)."""
         dist = stats.norm(loc=0.0, scale=1.0)
+        step = _linear_step_for_tail_truncation(dist, 0.001, 200)
 
-        upper = discretize_continuous_stoch_dom(
+        upper = project_continuous_dist_stoch_dom(
             dist=dist,
-            step=_linear_step_for_tail_truncation(dist, 0.001, 200),
-            align_to_multiples=True,
+            step=step,
             tail_truncation=0.001,
             bound_type=BoundType.DOMINATES,
         )
 
-        lower = discretize_continuous_stoch_dom(
+        lower = project_continuous_dist_stoch_dom(
             dist=dist,
-            step=_linear_step_for_tail_truncation(dist, 0.001, 200),
-            align_to_multiples=True,
+            step=step,
             tail_truncation=0.001,
             bound_type=BoundType.IS_DOMINATED,
         )
@@ -142,19 +132,18 @@ class TestStochasticDominance:
     def test_variance_ordering_reasonable(self):
         """Test that variance relationship is reasonable."""
         dist = stats.norm(loc=0.0, scale=1.0)
+        step = _linear_step_for_tail_truncation(dist, 0.001, 200)
 
-        upper = discretize_continuous_stoch_dom(
+        upper = project_continuous_dist_stoch_dom(
             dist=dist,
-            step=_linear_step_for_tail_truncation(dist, 0.001, 200),
-            align_to_multiples=True,
+            step=step,
             tail_truncation=0.001,
             bound_type=BoundType.DOMINATES,
         )
 
-        lower = discretize_continuous_stoch_dom(
+        lower = project_continuous_dist_stoch_dom(
             dist=dist,
-            step=_linear_step_for_tail_truncation(dist, 0.001, 200),
-            align_to_multiples=True,
+            step=step,
             tail_truncation=0.001,
             bound_type=BoundType.IS_DOMINATED,
         )
@@ -182,9 +171,11 @@ class TestDominationUnderConvolution:
         """Test that convolution preserves infinity mass constraints."""
         # Use geometric grids with same ratio for geometric kernel
         pmf1 = np.array([0.3, 0.5, 0.2], dtype=np.float64)
+        log_ratio = math.log(2.0)
+        grid1 = GridSpec(step=log_ratio, n=3, spacing_type=SpacingType.GEOMETRIC, anchor=1.0)
         # DOMINATES: p_min= 0
         dist1 = DenseDiscreteDist(
-            grid=GridSpec(step=math.log(2.0), n=3, spacing_type=SpacingType.GEOMETRIC, anchor=1.0),
+            grid=grid1,
             prob_arr=pmf1,
             p_min=0.0,
             p_max=0.0,
@@ -192,8 +183,9 @@ class TestDominationUnderConvolution:
         )
 
         pmf2 = np.array([0.6, 0.4], dtype=np.float64)
+        grid2 = GridSpec(step=log_ratio, n=2, spacing_type=SpacingType.GEOMETRIC, anchor=0.5)
         dist2 = DenseDiscreteDist(
-            grid=GridSpec(step=math.log(2.0), n=2, spacing_type=SpacingType.GEOMETRIC, anchor=0.5),
+            grid=grid2,
             prob_arr=pmf2,
             p_min=0.0,
             p_max=0.0,
@@ -223,8 +215,9 @@ class TestRoundingBehavior:
         """Test that DOMINATES mode rounds values up to next grid point."""
         # Create distribution with geometric grid for geometric kernel
         pmf_in = np.array([0.3, 0.4, 0.3], dtype=np.float64)
+        grid = GridSpec(step=math.log(2.0), n=3, spacing_type=SpacingType.GEOMETRIC, anchor=1.0)
         dist_in = DenseDiscreteDist(
-            grid=GridSpec(step=math.log(2.0), n=3, spacing_type=SpacingType.GEOMETRIC, anchor=1.0),
+            grid=grid,
             prob_arr=pmf_in,
             domain=Domain.POSITIVES,
         )
@@ -242,8 +235,9 @@ class TestRoundingBehavior:
         """Test that IS_DOMINATED mode rounds values down to previous grid point."""
         # Create distribution with geometric grid for geometric kernel
         pmf_in = np.array([0.3, 0.4, 0.3], dtype=np.float64)
+        grid = GridSpec(step=math.log(2.0), n=3, spacing_type=SpacingType.GEOMETRIC, anchor=1.0)
         dist_in = DenseDiscreteDist(
-            grid=GridSpec(step=math.log(2.0), n=3, spacing_type=SpacingType.GEOMETRIC, anchor=1.0),
+            grid=grid,
             prob_arr=pmf_in,
             p_max=0.0,
             domain=Domain.POSITIVES,
@@ -263,10 +257,10 @@ class TestExponentialDistribution:
     def test_exponential_dominates_minimal_left_tail(self):
         """Test that exponential with DOMINATES has minimal left tail."""
         dist = stats.expon(scale=1.0)
-        result = discretize_continuous_stoch_dom(
+        step = _linear_step_for_tail_truncation(dist, 0.01, 100)
+        result = project_continuous_dist_stoch_dom(
             dist=dist,
-            step=_linear_step_for_tail_truncation(dist, 0.01, 100),
-            align_to_multiples=True,
+            step=step,
             tail_truncation=0.01,
             bound_type=BoundType.DOMINATES,
         )
@@ -277,10 +271,10 @@ class TestExponentialDistribution:
     def test_exponential_is_dominated_no_pos_inf(self):
         """Test that exponential with IS_DOMINATED has no +∞ mass."""
         dist = stats.expon(scale=1.0)
-        result = discretize_continuous_stoch_dom(
+        step = _linear_step_for_tail_truncation(dist, 0.05, 100)
+        result = project_continuous_dist_stoch_dom(
             dist=dist,
-            step=_linear_step_for_tail_truncation(dist, 0.05, 100),
-            align_to_multiples=True,
+            step=step,
             tail_truncation=0.05,
             bound_type=BoundType.IS_DOMINATED,
         )
@@ -295,7 +289,7 @@ def _valid_subsampling_pair():
         value_discretization=0.5,
         tail_truncation=1e-8,
     )
-    neg_dual = negate_reverse_linear_distribution(calc_pld_dual(base))
+    neg_dual = negate_reverse_distribution(calc_pld_dual(base))
     return base, neg_dual
 
 
@@ -326,16 +320,8 @@ class TestSubsampleDistMix:
             sampling_prob=sampling_prob,
             direction=direction,
         )
-        expected_lower = min(
-            base_endpoints[0],
-            ref_endpoints[0],
-            math.log1p(-sampling_prob),
-        )
-        expected_upper = max(
-            base_endpoints[1],
-            ref_endpoints[1],
-            -math.log1p(-sampling_prob),
-        )
+        expected_lower = min(base_endpoints[0], ref_endpoints[0], math.log1p(-sampling_prob))
+        expected_upper = max(base_endpoints[1], ref_endpoints[1], -math.log1p(-sampling_prob))
 
         assert result.x_array[0] <= expected_lower + TOL.GRID_ATOL
         assert result.x_array[-1] >= expected_upper - TOL.GRID_ATOL
@@ -372,14 +358,14 @@ def test_pld_contract_checks_are_not_a_domination_proof() -> None:
     relationship.
     """
     source = gaussian_distribution(scale=2.0, bound_type=BoundType.DOMINATES)
-    result = rediscretize_dist_by_bound(
+    result = project_discrete_dist(
         dist=source,
         tail_truncation=1e-6,
         loss_discretization=0.1,
         bound_type=BoundType.DOMINATES,
     )
     assert result.p_min == 0.0
-    docstring = rediscretize_dist_by_bound.__doc__
+    docstring = project_discrete_dist.__doc__
     assert docstring is not None
     assert "caller remains responsible" in docstring
     assert "do not prove domination" in docstring

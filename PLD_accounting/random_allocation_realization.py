@@ -1,181 +1,251 @@
-"""Realization-specific random-allocation accounting."""
+"""One-step random-allocation factors from the privacy-loss realization of each direction."""
 
 from __future__ import annotations
 
-from PLD_accounting.discrete_dist import DenseDiscreteDist, PLDRealization
-from PLD_accounting.distribution_discretization import (
-    rediscretize_dist_by_bound,
+import math
+import warnings
+from functools import partial
+from typing import Callable
+
+import numpy as np
+from numpy.typing import NDArray
+
+from PLD_accounting.discrete_dist import LossFactor, PLDRealization, SparseDiscreteDist
+from PLD_accounting.distribution_utils import exact_sum, exp_moment_terms
+from PLD_accounting.multiscale_fft_convolution import (
+    MAX_DYADIC_REACH,
+    dyadic_cells_per_band,
+    dyadic_range_points,
 )
-from PLD_accounting.types import BoundType, SpacingType, require_bound_type
-from PLD_accounting.utils import calc_pld_dual, negate_reverse_linear_distribution
+from PLD_accounting.projections import project_discrete_dist, project_discrete_dist_on_points
+from PLD_accounting.types import BoundType, ConvolutionMethod, Direction, require_bound_type
+from PLD_accounting.utils import (
+    calc_pld_dual,
+    grid_step_for_point_cap,
+    negate_reverse_distribution,
+)
 from PLD_accounting.validation import (
     require_integer,
     require_nonnegative_real,
     require_positive_real,
-    require_type,
 )
 
+_Projection = Callable[..., LossFactor]
 
-def realization_remove_base_distributions(
+
+# =============================================================================
+# Public API
+# =============================================================================
+
+
+def realization_base_distributions(
     *,
-    realization: PLDRealization,
-    loss_discretization: float,
+    remove_realization: PLDRealization,
+    add_realization: PLDRealization,
+    loss_discretizations: tuple[float, float],
     tail_truncation: float,
     bound_type: BoundType,
-    max_grid_mult: int = -1,
-) -> tuple[DenseDiscreteDist, DenseDiscreteDist]:
-    """Prepare remove-direction factors from a loss-space realization.
+    convolution_method: ConvolutionMethod,
+    max_grid_mult: int,
+    max_cells_per_band: int,
+) -> tuple[tuple[LossFactor, LossFactor], LossFactor]:
+    """Prepare the one-step factors of both directions from the realization of each direction.
 
-    Algorithm 1 (`rand-alloc-rem`), with the dominating-path refinement in the
-    "Connect-the-dots rediscretization" remark following Algorithm 6, in
-    Appendix C of https://arxiv.org/abs/2602.17284.
+    Algorithms 1 and 2 (`rand-alloc-rem`, `rand-alloc-add`), with the dominating-path
+    refinement in the "Connect-the-dots rediscretization" remark following
+    Algorithm 6, in Appendix C of https://arxiv.org/abs/2602.17284.
 
-    Args:
-        realization: REMOVE-direction realization in linear loss space.
-        loss_discretization: Target linear-grid spacing.
-        tail_truncation: Tail truncation budget for regridding.
-        bound_type: Bound direction.
-        max_grid_mult: Upper bound on the number of base-factor grid points
-            (``<= 0`` disables the cap); coarsens the effective step when the
-            target spacing would exceed it.
-
-    Returns:
-        Tuple ``(base, dual_base)`` with the requested linear-grid spacing.
-
+    Budgets are ordered ``(remove, add)``; ``tail_truncation`` is the budget of one
+    projection. Returns the remove loss factors ``(base, neg_dual_base)`` and the add
+    loss factor ``base`` on the loss points of ``convolution_method``. ``GEOM`` takes
+    a fixed-gap grid of at most ``max_grid_mult`` points (``<= 0`` disables the cap),
+    as ``DenseDiscreteDist``. ``MS_FFT`` takes the logarithms of the dyadic points of
+    a range of likelihood ratios, with at most ``max_cells_per_band`` points per
+    octave, negated for the add factor, as ``SparseDiscreteDist``.
     """
-    require_type(value=realization, expected_type=PLDRealization, name="realization")
-    require_positive_real(value=loss_discretization, name="loss_discretization")
-    require_nonnegative_real(value=tail_truncation, name="tail_truncation")
     require_bound_type(value=bound_type)
-    require_integer(value=max_grid_mult, name="max_grid_mult")
-    # Since dual can be derived only from a PLD realization, discretization can
-    # come first for DOMINATES, but dual derivation must come first for IS_DOMINATED.
-    # As described in the paper's CtD implementation remark, the DOMINATES path
-    # discretizes first and takes the exact dual of the discretized base, avoiding
-    # a second discretization of the dual while preserving a valid upper bound.
-    effective_disc = _realization_geom_loss_discretization(
-        realization=realization,
-        loss_discretization=loss_discretization,
+    remove_projection = _loss_projection(
+        realization=remove_realization,
+        loss_discretization=loss_discretizations[0],
+        tail_truncation=tail_truncation,
+        convolution_method=convolution_method,
         max_grid_mult=max_grid_mult,
+        max_cells_per_band=max_cells_per_band,
+        direction=Direction.REMOVE,
+    )
+    add_projection = _loss_projection(
+        realization=add_realization,
+        loss_discretization=loss_discretizations[1],
+        tail_truncation=tail_truncation,
+        convolution_method=convolution_method,
+        max_grid_mult=max_grid_mult,
+        max_cells_per_band=max_cells_per_band,
+        direction=Direction.ADD,
     )
 
+    # The dual can be derived only from a PLD realization. An upper bound discretizes
+    # first and takes the exact dual of the discretized base, which avoids a second
+    # discretization of the dual and keeps the bound valid. A lower-bound projection
+    # is no longer a realization, so its dual is derived first and the two laws are
+    # rounded down separately.
     if bound_type == BoundType.DOMINATES:
-        base_realization = rediscretize_dist_by_bound(
-            dist=realization,
-            tail_truncation=tail_truncation,
-            loss_discretization=effective_disc,
-            bound_type=bound_type,
-        )
-        if not isinstance(base_realization, PLDRealization):
-            raise TypeError("Dominating linear rediscretization must return PLDRealization")
-        neg_dual_dist = negate_reverse_linear_distribution(calc_pld_dual(base_realization))
-        return base_realization, neg_dual_dist
-
-    # Lower-bound truncation can move left-tail mass into p_min and must consume
-    # any +inf mass before exp-space composition, so keep the lower path on the
-    # plain DenseDiscreteDist rediscretization route unconditionally.
-    dual_realization = calc_pld_dual(realization)
-    neg_dual_linear = negate_reverse_linear_distribution(dual_realization)
-    # Type downgrade only: the same GridSpec carries over, so the rediscretization
-    # below bins against the identical coordinates the realization already had.
-    lower_realization_input = DenseDiscreteDist(
-        grid=realization.grid,
-        prob_arr=realization.prob_arr.copy(),
-        p_min=realization.p_min,
-        p_max=realization.p_max,
-    )
-    lower_base_dist = rediscretize_dist_by_bound(
-        dist=lower_realization_input,
-        tail_truncation=tail_truncation,
-        loss_discretization=effective_disc,
-        bound_type=bound_type,
-    )
-    neg_dual_dist = rediscretize_dist_by_bound(
-        dist=neg_dual_linear,
-        tail_truncation=tail_truncation,
-        loss_discretization=effective_disc,
-        bound_type=bound_type,
-    )
-    if not (
-        isinstance(neg_dual_dist, DenseDiscreteDist)
-        and neg_dual_dist.spacing_type == SpacingType.LINEAR
-    ):
-        _st = getattr(neg_dual_dist, "spacing_type", "?")
-        raise TypeError(
-            "Expected DenseDiscreteDist with LINEAR spacing, "
-            f"got {type(neg_dual_dist).__name__} with spacing {_st}"
-        )
-    return lower_base_dist, neg_dual_dist
+        base = remove_projection(dist=remove_realization, bound_type=bound_type)
+        if not isinstance(base, (PLDRealization, SparseDiscreteDist)):
+            raise TypeError(f"dominating projection must return a PLD, got {type(base).__name__}")
+        neg_dual_base = negate_reverse_distribution(calc_pld_dual(base))
+    else:
+        neg_dual_realization = negate_reverse_distribution(calc_pld_dual(remove_realization))
+        base = remove_projection(dist=remove_realization, bound_type=bound_type)
+        neg_dual_base = remove_projection(dist=neg_dual_realization, bound_type=bound_type)
+    add_base = add_projection(dist=add_realization, bound_type=bound_type)
+    return (base, neg_dual_base), add_base
 
 
-def realization_add_base_distribution(
+# =============================================================================
+# Helper Functions
+# =============================================================================
+
+
+def _loss_projection(
     *,
     realization: PLDRealization,
     loss_discretization: float,
     tail_truncation: float,
-    bound_type: BoundType,
-    max_grid_mult: int = -1,
-) -> DenseDiscreteDist:
-    """Prepare add-direction factors from a loss-space realization.
+    convolution_method: ConvolutionMethod,
+    max_grid_mult: int,
+    max_cells_per_band: int,
+    direction: Direction,
+) -> _Projection:
+    """Return the projection of one direction onto the loss points of a convolution method.
 
-    Algorithm 2 (`rand-alloc-add`), in Appendix C of https://arxiv.org/abs/2602.17284.
-
-    Args:
-        realization: ADD-direction realization in linear loss space.
-        loss_discretization: Target linear-grid spacing.
-        tail_truncation: Tail truncation budget for regridding.
-        bound_type: Bound direction.
-        max_grid_mult: Upper bound on the number of base-factor grid points
-            (``<= 0`` disables the cap); coarsens the effective step when the
-            target spacing would exceed it.
-
-    Returns:
-        One ADD loss factor aligned to the requested linear grid.
-
+    ``GEOM`` projects onto a fixed-gap grid. Its step is the loss budget, never finer
+    than the grid of the realization (a coarser realization warns), and coarsened
+    when that grid would exceed ``max_grid_mult`` points (``<= 0`` disables the cap).
+    ``MS_FFT`` projects onto the logarithms of dyadic points, with the points per
+    octave that the loss budget gives, up to ``max_cells_per_band``; the realization's
+    grid sets no floor there. The add ratio is ``exp(-L)``, so the add
+    factor is on the negated points. A lower bound on points lowers the mass at
+    ``+inf`` to the last finite loss, so a sum of ratios carries no factor at infinity.
     """
-    require_type(value=realization, expected_type=PLDRealization, name="realization")
-    require_positive_real(value=loss_discretization, name="loss_discretization")
-    require_nonnegative_real(value=tail_truncation, name="tail_truncation")
-    require_bound_type(value=bound_type)
-    require_integer(value=max_grid_mult, name="max_grid_mult")
-    # Avoid inflating the grid when the target is finer than the original one.
-    effective_disc = _realization_geom_loss_discretization(
-        realization=realization,
-        loss_discretization=loss_discretization,
-        max_grid_mult=max_grid_mult,
-    )
-    coarsened = rediscretize_dist_by_bound(
-        dist=realization,
-        tail_truncation=tail_truncation,
-        loss_discretization=effective_disc,
-        bound_type=bound_type,
-    )
-    if not (
-        isinstance(coarsened, DenseDiscreteDist) and coarsened.spacing_type == SpacingType.LINEAR
-    ):
-        _st = getattr(coarsened, "spacing_type", "?")
-        raise TypeError(
-            "Expected DenseDiscreteDist with LINEAR spacing, "
-            f"got {type(coarsened).__name__} with spacing {_st}"
+    if convolution_method == ConvolutionMethod.GEOM:
+        require_nonnegative_real(value=tail_truncation, name="tail_truncation")
+        require_integer(value=max_grid_mult, name="max_grid_mult")
+        step = _geometric_step(
+            realization=realization,
+            loss_discretization=loss_discretization,
+            max_grid_mult=max_grid_mult,
+            direction=direction,
         )
-    return coarsened
+        return partial(
+            project_discrete_dist, tail_truncation=tail_truncation, loss_discretization=step
+        )
+    if convolution_method == ConvolutionMethod.MS_FFT:
+        cells_per_band = dyadic_cells_per_band(
+            loss_step=loss_discretization, max_cells_per_band=max_cells_per_band
+        )
+        loss_points = _dyadic_loss_points(
+            realization=realization, cells_per_band=cells_per_band, tail_truncation=tail_truncation
+        )
+        if direction == Direction.ADD:
+            loss_points = -loss_points[::-1]
+        return partial(project_discrete_dist_on_points, loss_points=loss_points)
+    raise ValueError(f"Unknown ConvolutionMethod: {convolution_method}")
 
 
-def _realization_geom_loss_discretization(
+def _geometric_step(
     *,
     realization: PLDRealization,
     loss_discretization: float,
     max_grid_mult: int,
+    direction: Direction,
 ) -> float:
-    """Return the realization GEOM loss step for the configured grid cap."""
-    grid_size = realization.prob_arr.size
-    # Reserve two points for outward alignment when a finite cap is enabled.
-    target_grid_size = min(max_grid_mult - 2, grid_size) if max_grid_mult > 0 else grid_size
-    if target_grid_size <= 1:
+    """Return the fixed-gap step of one realization under the grid cap.
+
+    The step is never finer than the realization's own grid. When that grid is
+    coarser than ``loss_discretization``, its step is used and a warning reports it.
+    The cap is applied over the realization's support as it is for a continuous law.
+    """
+    require_positive_real(value=loss_discretization, name="loss_discretization")
+    if realization.prob_arr.size < 2:
         raise ValueError(
-            "realization and max_grid_mult must leave at least two finite grid points, "
-            f"got grid_size={grid_size}, max_grid_mult={max_grid_mult}"
+            "realization must have at least two finite grid points, "
+            f"got grid_size={realization.prob_arr.size}"
         )
-    # N support points span N-1 intervals.
-    grid_size_rescaling = (grid_size - 1) / (target_grid_size - 1)
-    return float(max(loss_discretization, realization.step * grid_size_rescaling))
+    if realization.step > loss_discretization:
+        warnings.warn(
+            f"general allocation: the {direction.value} realization's grid step "
+            f"{realization.step:.6e} is coarser than the loss step {loss_discretization:.6e} "
+            "requested for its one-step factor, so the realization's step is used. The bound "
+            "stays valid and is looser than loss_discretization requests; discretize the "
+            f"realization with a step of at most {loss_discretization:.6e} to meet it.",
+            # The caller of general_allocation_pld.
+            stacklevel=8,
+        )
+    return grid_step_for_point_cap(
+        x_min=realization.x_0,
+        x_max=realization.grid.last_point,
+        requested_step=max(loss_discretization, realization.step),
+        max_grid_points=max_grid_mult,
+    )
+
+
+def _dyadic_loss_points(
+    *,
+    realization: PLDRealization,
+    cells_per_band: int,
+    tail_truncation: float,
+) -> NDArray[np.float64]:
+    """Return the logarithms of the dyadic points of the range that the tail budget allows.
+
+    The range is the smallest ``[2**-r, 2**r]`` outside which each tail of the
+    realization and of its dual is at most ``tail_truncation / 4``.
+    """
+    require_positive_real(value=tail_truncation, name="tail_truncation")
+    loss = realization.x_array
+    dual_masses = exp_moment_terms(prob_arr=realization.prob_arr, x_vals=loss)
+    # The tails shrink as the range grows, so the smallest range that fits is found by
+    # bisection, each probe an exact sum of the atoms outside the range.
+    low, high = 1, MAX_DYADIC_REACH - 1
+    if not _tails_fit(
+        realization=realization,
+        dual_masses=dual_masses,
+        reach=high,
+        tail_truncation=tail_truncation,
+    ):
+        raise ValueError(
+            f"tail_truncation={tail_truncation:.3e} per factor needs likelihood ratios beyond "
+            f"2**{MAX_DYADIC_REACH}, outside the float range; raise tail_truncation"
+        )
+    while low < high:
+        middle = (low + high) // 2
+        if _tails_fit(
+            realization=realization,
+            dual_masses=dual_masses,
+            reach=middle,
+            tail_truncation=tail_truncation,
+        ):
+            high = middle
+        else:
+            low = middle + 1
+    return np.log(dyadic_range_points(reach=low, cells_per_band=cells_per_band))
+
+
+def _tails_fit(
+    *,
+    realization: PLDRealization,
+    dual_masses: NDArray[np.float64],
+    reach: int,
+    tail_truncation: float,
+) -> bool:
+    """Whether the tails of the realization and of its dual beyond ``reach`` octaves fit."""
+    loss = realization.x_array
+    bound = reach * math.log(2.0)
+    below = int(np.searchsorted(loss, -bound, side="left"))
+    above = int(np.searchsorted(loss, bound, side="right"))
+    largest_tail = max(
+        exact_sum(realization.prob_arr[:below]),
+        exact_sum(dual_masses[:below]),
+        exact_sum(realization.prob_arr[above:]),
+        exact_sum(dual_masses[above:]),
+    )
+    return largest_tail <= tail_truncation / 4

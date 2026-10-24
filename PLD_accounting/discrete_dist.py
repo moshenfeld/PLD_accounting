@@ -13,6 +13,7 @@ import math
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
 from enum import Enum
+from functools import cached_property
 
 import numpy as np
 from numpy.typing import NDArray
@@ -20,17 +21,18 @@ from typing_extensions import Self
 
 from PLD_accounting.distribution_utils import (
     PMF_TOLERATED_MASS_TOL,
-    compute_truncation,
+    exact_sum,
     exp_moment_terms,
     signed_unit_residual,
 )
-from PLD_accounting.types import BoundType, SpacingType
+from PLD_accounting.types import SpacingType
 from PLD_accounting.validation import (
     require_finite_array,
     require_finite_real,
     require_integer,
     require_nonnegative_int,
     require_nonnegative_masses,
+    require_nonnegative_real,
     require_positive_int,
     require_positive_real,
 )
@@ -312,27 +314,6 @@ class DiscreteDistBase(ABC):
     def x_array(self) -> NDArray[np.float64]:
         """Materialized support."""
 
-    def truncate_edges(self, *, tail_truncation: float, bound_type: BoundType) -> Self:
-        """Return a copy with up to ``tail_truncation`` mass removed from each edge.
-
-        Removed mass moves to whichever boundary the bound direction makes
-        conservative, so the result still bounds the same quantity.
-        """
-        new_prob_arr, new_p_min, new_p_max, min_ind, max_ind = compute_truncation(
-            prob_arr=self.prob_arr,
-            p_min=self.p_min,
-            p_max=self.p_max,
-            tail_truncation=tail_truncation,
-            bound_type=bound_type,
-        )
-        return self._rebuild_on_range(
-            new_prob_arr=new_prob_arr,
-            new_p_min=new_p_min,
-            new_p_max=new_p_max,
-            min_ind=min_ind,
-            max_ind=max_ind,
-        )
-
     def with_probabilities(
         self,
         *,
@@ -348,7 +329,7 @@ class DiscreteDistBase(ABC):
         prob_arr = np.asarray(prob_arr, dtype=np.float64)
         if prob_arr.shape != self.prob_arr.shape:
             raise ValueError(f"{prob_arr.shape} does not match support shape {self.prob_arr.shape}")
-        return self._rebuild_on_range(
+        return self.rebuild_on_range(
             new_prob_arr=prob_arr,
             new_p_min=float(p_min),
             new_p_max=float(p_max),
@@ -356,34 +337,8 @@ class DiscreteDistBase(ABC):
             max_ind=prob_arr.size - 1,
         )
 
-    def _require_unit_mass(self) -> None:
-        """Reject masses that do not total one, or a REALS law with mass at both boundaries."""
-        mass_error = abs(
-            signed_unit_residual(
-                values=self.prob_arr,
-                lower_term=self.p_min,
-                upper_term=self.p_max,
-            )
-        )
-        if mass_error > PMF_TOLERATED_MASS_TOL:
-            pmf_sum = math.fsum(map(float, self.prob_arr))
-            raise ValueError(
-                f"PMF mass does not total 1: error={mass_error:.2e} "
-                f"(tolerance={PMF_TOLERATED_MASS_TOL:.2e}), PMF sum={pmf_sum:.15f}, "
-                f"min={self.p_min:.2e}, max={self.p_max:.2e}, "
-                f"total mass={pmf_sum + self.p_min + self.p_max:.15f}"
-            )
-
-        # Opposing infinite atoms would make later real-domain sums encounter ``-inf + inf``.
-        if (
-            self.domain == Domain.REALS
-            and self.p_min > PMF_TOLERATED_MASS_TOL
-            and self.p_max > PMF_TOLERATED_MASS_TOL
-        ):
-            raise ValueError("REALS domain: p_min and p_max cannot both be non-zero")
-
     @abstractmethod
-    def _rebuild_on_range(
+    def rebuild_on_range(
         self,
         *,
         new_prob_arr: NDArray[np.float64],
@@ -399,6 +354,32 @@ class DiscreteDistBase(ABC):
         survived: empty edge cells are always dropped, tail truncation may drop more,
         and a caller replacing masses in place passes the full range.
         """
+
+    def _require_unit_mass(self) -> None:
+        """Reject masses that do not total one, or a REALS law with mass at both boundaries."""
+        mass_error = abs(
+            signed_unit_residual(
+                values=self.prob_arr,
+                lower_term=self.p_min,
+                upper_term=self.p_max,
+            )
+        )
+        if mass_error > PMF_TOLERATED_MASS_TOL:
+            pmf_sum = exact_sum(self.prob_arr)
+            raise ValueError(
+                f"PMF mass does not total 1: error={mass_error:.2e} "
+                f"(tolerance={PMF_TOLERATED_MASS_TOL:.2e}), PMF sum={pmf_sum:.15f}, "
+                f"min={self.p_min:.2e}, max={self.p_max:.2e}, "
+                f"total mass={pmf_sum + self.p_min + self.p_max:.15f}"
+            )
+
+        # Opposing infinite atoms would make later real-domain sums encounter ``-inf + inf``.
+        if (
+            self.domain == Domain.REALS
+            and self.p_min > PMF_TOLERATED_MASS_TOL
+            and self.p_max > PMF_TOLERATED_MASS_TOL
+        ):
+            raise ValueError("REALS domain: p_min and p_max cannot both be non-zero")
 
 
 # =============================================================================
@@ -429,7 +410,7 @@ class SparseDiscreteDist(DiscreteDistBase):
         """Return materialized support points."""
         return self._x_arr
 
-    def _rebuild_on_range(
+    def rebuild_on_range(
         self,
         *,
         new_prob_arr: NDArray[np.float64],
@@ -507,16 +488,7 @@ class DenseDiscreteDist(DiscreteDistBase):
         """Return materialized support points."""
         return self._grid.materialize()
 
-    def _require_grid(self) -> None:
-        """Reject grid/domain pairings the package does not define.
-
-        A geometric lattice is positive, so it can only carry POSITIVES semantics.
-        """
-        if self.spacing_type == SpacingType.GEOMETRIC and self.domain != Domain.POSITIVES:
-            raise ValueError("Geometric spacing requires domain=Domain.POSITIVES")
-        require_finite_real(value=self._grid.last_point, name="dense grid last point")
-
-    def _rebuild_on_range(
+    def rebuild_on_range(
         self,
         *,
         new_prob_arr: NDArray[np.float64],
@@ -534,6 +506,15 @@ class DenseDiscreteDist(DiscreteDistBase):
             p_max=new_p_max,
             domain=self.domain,
         )
+
+    def _require_grid(self) -> None:
+        """Reject grid/domain pairings the package does not define.
+
+        A geometric lattice is positive, so it can only carry POSITIVES semantics.
+        """
+        if self.spacing_type == SpacingType.GEOMETRIC and self.domain != Domain.POSITIVES:
+            raise ValueError("Geometric spacing requires domain=Domain.POSITIVES")
+        require_finite_real(value=self._grid.last_point, name="dense grid last point")
 
 
 # =============================================================================
@@ -571,24 +552,6 @@ class PLDRealization(DenseDiscreteDist):
         )
         self._require_pld_realization()
 
-    def truncate_edges(  # type: ignore[override]
-        self, *, tail_truncation: float, bound_type: BoundType
-    ) -> DenseDiscreteDist:
-        """Trim edge mass, returning a plain dense distribution when needed.
-
-        ``IS_DOMINATED`` truncation can move mass into ``p_min``, which violates
-        the PLD-realization invariant ``p_min == 0``. In that case the result is
-        intentionally downgraded to ``DenseDiscreteDist``.
-        """
-        if bound_type == BoundType.IS_DOMINATED:
-            return DenseDiscreteDist(
-                grid=self._grid,
-                prob_arr=self.prob_arr.copy(),
-                p_min=self.p_min,
-                p_max=self.p_max,
-            ).truncate_edges(tail_truncation=tail_truncation, bound_type=bound_type)
-        return super().truncate_edges(tail_truncation=tail_truncation, bound_type=bound_type)
-
     def _require_pld_realization(self) -> None:
         """Require ``p_min = 0`` and ``E[exp(-L)] <= 1``."""
         if self.p_min != 0.0:
@@ -609,14 +572,127 @@ class PLDRealization(DenseDiscreteDist):
             )
 
 
-def require_dense_dist(
+# =============================================================================
+# Allocation Loss Factors and Dyadic-Grid Measure
+# =============================================================================
+
+
+LossFactor = DenseDiscreteDist | SparseDiscreteDist
+
+
+@dataclass(frozen=True, kw_only=True, eq=False)
+class DyadicDist:
+    """Nonnegative measure on the dyadic grid, with its two boundary atoms.
+
+    ``prob_arr`` has shape ``(num_bands, cells_per_band)``; entry ``(i, r)`` is the
+    mass at ``2**(first_band + i) * (1 + r / cells_per_band)``. Empty leading or
+    trailing octaves are allowed, so a merge can widen the support by one octave
+    without reindexing.
+
+    This is a measure, not a ``DiscreteDistBase``: the sum of a merge tree misses
+    unit mass by the rounding of its transforms, and that drift is repaired once,
+    where the sum becomes a loss distribution.
+
+    Attributes:
+        first_band: Octave exponent of row zero.
+        prob_arr: Per-octave masses, ``cells_per_band`` of them per octave;
+            copied at construction and stored read-only.
+        p_min: Mass of the atom at zero.
+        p_max: Absorbing mass at infinity.
+    """
+
+    first_band: int
+    prob_arr: NDArray[np.float64]
+    p_min: float = 0.0
+    p_max: float = 0.0
+
+    def __post_init__(self) -> None:
+        """Reject an array shape or mass that cannot describe a dyadic-grid measure."""
+        require_integer(value=self.first_band, name="first_band")
+        if self.prob_arr.ndim != 2 or self.prob_arr.shape[0] < 1:
+            raise ValueError(
+                "prob_arr must have shape (num_bands >= 1, cells_per_band), got "
+                f"{self.prob_arr.shape}"
+            )
+        require_positive_int(value=self.prob_arr.shape[1], name="cells_per_band")
+        require_finite_array(values=self.prob_arr, name="prob_arr")
+        if np.any(self.prob_arr < 0.0):
+            raise ValueError("prob_arr must be nonnegative")
+        require_nonnegative_real(value=[self.p_min, self.p_max], name=["p_min", "p_max"])
+        # Cached totals require masses that neither the caller nor a returned view can change.
+        masses = np.array(self.prob_arr, dtype=np.float64, copy=True)
+        masses.setflags(write=False)
+        object.__setattr__(self, "prob_arr", masses)
+
+    def __deepcopy__(self, memo: dict[int, object]) -> Self:
+        """Copy the measure with independent, read-only masses and fresh cached totals."""
+        result = type(self)(
+            first_band=self.first_band,
+            prob_arr=self.prob_arr,
+            p_min=self.p_min,
+            p_max=self.p_max,
+        )
+        memo[id(self)] = result
+        return result
+
+    @property
+    def cells_per_band(self) -> int:
+        """Grid points per octave."""
+        return int(self.prob_arr.shape[1])
+
+    @property
+    def num_bands(self) -> int:
+        """Number of stored octaves."""
+        return int(self.prob_arr.shape[0])
+
+    def support(self) -> NDArray[np.float64]:
+        """Return every stored positive grid point, in increasing order."""
+        size = self.cells_per_band
+        bands = self.first_band + np.arange(self.num_bands, dtype=np.int64)
+        points = np.ldexp(1.0, bands)[:, None] * (
+            1.0 + np.arange(size, dtype=np.float64)[None, :] / size
+        )
+        return points.ravel()
+
+    def masses(self) -> NDArray[np.float64]:
+        """Return the masses of the positive grid points in the order of ``support``."""
+        return self.prob_arr.ravel()
+
+    def total_mass(self) -> float:
+        """Return the represented mass, both boundary atoms included, by an exact sum."""
+        return self._total_mass
+
+    def finite_mass(self) -> float:
+        """Return the mass that is not at infinity, by an exact sum."""
+        return self._finite_mass
+
+    def first_moment(self) -> float:
+        """Return the first moment over the positive grid points, by an exact sum."""
+        return self._first_moment
+
+    # A measure is not modified after construction, so each exact sum over the grid
+    # is computed once; a merge reads them from both of its operands.
+    @cached_property
+    def _total_mass(self) -> float:
+        return exact_sum(np.append(self.masses(), (self.p_min, self.p_max)))
+
+    @cached_property
+    def _finite_mass(self) -> float:
+        return exact_sum(np.append(self.masses(), self.p_min))
+
+    @cached_property
+    def _first_moment(self) -> float:
+        return exact_sum(self.masses() * self.support())
+
+
+def cast_dense_dist(
     *,
     dist: object,
     name: str,
     spacing: SpacingType | None = None,
     domain: Domain | None = None,
 ) -> DenseDiscreteDist:
-    """Require a dense distribution, optionally of one spacing and domain."""
+    """Check the dense representation, spacing and domain, and return the original object."""
     if not isinstance(dist, DenseDiscreteDist):
         spacing_note = f" with {spacing.name} spacing" if spacing is not None else ""
         raise TypeError(
@@ -632,12 +708,31 @@ def require_dense_dist(
     return dist
 
 
-def require_linear_reals_dist(*, dist: object, name: str) -> DenseDiscreteDist:
+def cast_linear_reals_dist(*, dist: object, name: str) -> DenseDiscreteDist:
+    """Check for a linear-grid real-domain dense distribution and return the original object."""
+    return cast_dense_dist(dist=dist, name=name, spacing=SpacingType.LINEAR, domain=Domain.REALS)
+
+
+def require_linear_reals_dist(*, dist: object, name: str) -> None:
     """Require a linear-grid real-domain dense distribution."""
-    return require_dense_dist(dist=dist, name=name, spacing=SpacingType.LINEAR, domain=Domain.REALS)
+    cast_linear_reals_dist(dist=dist, name=name)
 
 
-def require_zero_anchor(*, grid: GridSpec, name: str) -> GridSpec:
+def require_pld_realization(*, dist: object, name: str) -> None:
+    """Require a ``PLDRealization``.
+
+    A lower-bound discretization of a mechanism is a ``DenseDiscreteDist`` that may
+    carry mass at ``-inf``; it is not a PLD and is rejected here rather than accepted
+    by a builder that derives a dual from its input.
+    """
+    if not isinstance(dist, PLDRealization):
+        raise TypeError(
+            f"{name} must be PLDRealization, got {type(dist).__name__}; a lower-bound "
+            "(BoundType.IS_DOMINATED) mechanism discretization is not a PLD realization"
+        )
+
+
+def require_zero_anchor(*, grid: GridSpec, name: str) -> None:
     """Require a linear lattice on whole multiples of its step, i.e. ``anchor == 0``.
 
     A loss lattice is ``k * step``; the offset of its first point belongs in ``index_0``.
@@ -651,11 +746,15 @@ def require_zero_anchor(*, grid: GridSpec, name: str) -> GridSpec:
             f"{name} must lie on whole multiples of its step (anchor == 0), got "
             f"anchor={grid.anchor!r}, step={grid.step!r}; carry the offset in index_0"
         )
-    return grid
 
 
-def require_geometric_positives_dist(*, dist: object, name: str) -> DenseDiscreteDist:
-    """Require a geometric-grid positive-domain dense distribution."""
-    return require_dense_dist(
+def cast_geometric_positives_dist(*, dist: object, name: str) -> DenseDiscreteDist:
+    """Check for a geometric-grid positive-domain distribution and return the original object."""
+    return cast_dense_dist(
         dist=dist, name=name, spacing=SpacingType.GEOMETRIC, domain=Domain.POSITIVES
     )
+
+
+def require_geometric_positives_dist(*, dist: object, name: str) -> None:
+    """Require a geometric-grid positive-domain dense distribution."""
+    cast_geometric_positives_dist(dist=dist, name=name)

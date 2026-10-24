@@ -8,6 +8,7 @@ mass conservation, and a few monotonicity or consistency relationships.
 from __future__ import annotations
 
 import copy
+import warnings
 
 import numpy as np
 import pytest
@@ -22,9 +23,9 @@ from PLD_accounting import (
     GridSpec,
     PLDRealization,
     PrivacyParams,
+    ProjectionMethod,
     discrete_distribution,
     gaussian_allocation_delta_configurable,
-    gaussian_allocation_directional_pld,
     gaussian_allocation_epsilon_configurable,
     gaussian_allocation_epsilon_range,
     gaussian_allocation_pld,
@@ -33,14 +34,16 @@ from PLD_accounting import (
     general_allocation_epsilon,
     general_allocation_pld,
     laplace_distribution,
-    rediscretize_dist_by_bound,
+    project_discrete_dist,
     subsample_pld,
     subsample_pld_realization,
 )
+from PLD_accounting.projections_stoch_dom import truncate_edges_stoch_dom
+from PLD_accounting.types import resolve_projection_method
 
-# ---------------------------------------------------------------------------
+# =============================================================================
 # Shared constants — deliberately coarse for speed
-# ---------------------------------------------------------------------------
+# =============================================================================
 
 SIGMA = 2.0
 NUM_STEPS = 5
@@ -55,6 +58,7 @@ COARSE_CONFIG = AllocationSchemeConfig(
     tail_truncation=1e-6,
     convolution_method=ConvolutionMethod.GEOM,
 )
+CONVOLUTION_METHODS = list(ConvolutionMethod)
 
 
 def _total_mass(dist):
@@ -62,7 +66,7 @@ def _total_mass(dist):
     return float(np.sum(dist.prob_arr)) + dist.p_min + dist.p_max
 
 
-def _make_gaussian_realizations(sigma: float = SIGMA):
+def _make_gaussian_realizations(sigma: float):
     """Return (remove_pld, add_pld) PLDRealizations from a Gaussian mechanism."""
     remove = gaussian_distribution(scale=sigma, bound_type=BoundType.DOMINATES)
     add = gaussian_distribution(scale=sigma, bound_type=BoundType.DOMINATES)
@@ -101,10 +105,8 @@ class TestMechanismDistributions:
 
     def test_count_noise_returns_directional_realizations(self):
         """The public discrete-noise helper returns valid REMOVE and ADD PLDs."""
-        noise_dist = DenseDiscreteDist(
-            grid=GridSpec(step=1.0, n=5, anchor=-2.0),
-            prob_arr=np.array([0.1, 0.2, 0.4, 0.2, 0.1]),
-        )
+        grid = GridSpec(step=1.0, n=5, anchor=-2.0)
+        noise_dist = DenseDiscreteDist(grid=grid, prob_arr=np.array([0.1, 0.2, 0.4, 0.2, 0.1]))
         remove, add = discrete_distribution(
             noise_dist=noise_dist,
             loss_discretization=0.05,
@@ -153,28 +155,25 @@ class TestPLDRealizationType:
     def test_construction_with_valid_data(self):
         """Accept valid grids on non-negative losses with ``E[exp(-L)] < 1``."""
         prob_arr = np.array([0.3, 0.5, 0.2])
-        r = PLDRealization(grid=GridSpec(step=0.1, n=prob_arr.size, anchor=0.1), prob_arr=prob_arr)
+        grid = GridSpec(step=0.1, n=prob_arr.size, anchor=0.1)
+        r = PLDRealization(grid=grid, prob_arr=prob_arr)
         assert r.step == 0.1
         np.testing.assert_array_equal(r.prob_arr, prob_arr)
 
     def test_rejects_nonzero_p_min(self):
         """Reject mass at negative infinity while claiming a PLD realization."""
+        grid = GridSpec(step=0.1, n=1, anchor=0.1)
+        prob_arr = np.array([0.5])
         with pytest.raises(ValueError):
-            PLDRealization(
-                grid=GridSpec(step=0.1, n=1, anchor=0.1),
-                prob_arr=np.array([0.5]),
-                p_min=0.5,
-            )
+            PLDRealization(grid=grid, prob_arr=prob_arr, p_min=0.5)
 
     def test_rejects_sub_tolerance_nonzero_p_min(self):
         """The semantic p_min invariant is exact, not a floating-point estimate."""
         p_min = np.finfo(float).eps
+        grid = GridSpec(step=0.1, n=1, anchor=0.1)
+        prob_arr = np.array([1.0 - p_min])
         with pytest.raises(ValueError, match="requires p_min = 0"):
-            PLDRealization(
-                grid=GridSpec(step=0.1, n=1, anchor=0.1),
-                prob_arr=np.array([1.0 - p_min]),
-                p_min=p_min,
-            )
+            PLDRealization(grid=grid, prob_arr=prob_arr, p_min=p_min)
 
     def test_deepcopy_is_independent(self):
         """``copy.deepcopy`` must detach arrays and preserve immutability."""
@@ -196,7 +195,7 @@ class TestPLDRealizationType:
         """Tail truncation should shrink support, keep the realization type, and conserve mass."""
         d = gaussian_distribution(scale=1.0)
         orig_len = len(d.prob_arr)
-        t = d.truncate_edges(tail_truncation=0.05, bound_type=BoundType.DOMINATES)
+        t = truncate_edges_stoch_dom(dist=d, tail_truncation=0.05, bound_type=BoundType.DOMINATES)
         assert isinstance(t, PLDRealization)
         assert len(t.prob_arr) <= orig_len
         assert abs(_total_mass(t) - 1.0) < MASS_TOL
@@ -211,7 +210,7 @@ class TestPLDRealizationType:
     def test_public_linear_rediscretization_routes_by_bound(self, bound_type, expected_type):
         """The public router fixes CtD/stochastic selection from bound semantics."""
         source = gaussian_distribution(scale=2.0, value_discretization=0.05)
-        result = rediscretize_dist_by_bound(
+        result = project_discrete_dist(
             dist=source,
             tail_truncation=0.0,
             loss_discretization=0.1,
@@ -324,7 +323,7 @@ class TestGaussianAllocationAPI:
 class TestConvolutionMethods:
     """Convolution backends selected via ``AllocationSchemeConfig`` should stay numerically sane."""
 
-    @pytest.mark.parametrize("method", list(ConvolutionMethod))
+    @pytest.mark.parametrize("method", CONVOLUTION_METHODS)
     def test_all_methods_produce_finite_epsilon(self, method):
         """Every convolution method enum should still yield a finite ε under coarse settings."""
         cfg = AllocationSchemeConfig(
@@ -340,23 +339,6 @@ class TestConvolutionMethods:
         )
         assert np.isfinite(eps) and eps > 0
 
-    def test_geom_and_fft_epsilon_close(self):
-        """GEOM vs FFT ε should agree within a loose tolerance for identical settings."""
-        params = PrivacyParams(sigma=SIGMA, num_steps=NUM_STEPS, delta=DELTA)
-        cfg_geom = AllocationSchemeConfig(
-            loss_discretization=0.05,
-            tail_truncation=1e-6,
-            convolution_method=ConvolutionMethod.GEOM,
-        )
-        cfg_fft = AllocationSchemeConfig(
-            loss_discretization=0.05,
-            tail_truncation=1e-6,
-            convolution_method=ConvolutionMethod.FFT,
-        )
-        eps_geom = gaussian_allocation_epsilon_configurable(params=params, config=cfg_geom)
-        eps_fft = gaussian_allocation_epsilon_configurable(params=params, config=cfg_fft)
-        assert abs(eps_geom - eps_fft) < 0.3, f"GEOM={eps_geom:.6f}, FFT={eps_fft:.6f}"
-
     def test_geom_supports_is_dominated(self):
         """Geometric convolution must remain stable when requesting optimistic accounting."""
         params = PrivacyParams(sigma=SIGMA, num_steps=NUM_STEPS, delta=DELTA)
@@ -367,31 +349,68 @@ class TestConvolutionMethods:
         )
         assert np.isfinite(eps) and eps > 0
 
-    @pytest.mark.parametrize(
-        "method",
-        [
-            ConvolutionMethod.FFT,
-            ConvolutionMethod.COMBINED,
-            ConvolutionMethod.BEST_OF_TWO,
-        ],
-    )
-    @pytest.mark.parametrize("direction", [Direction.ADD, Direction.REMOVE])
-    def test_is_dominated_rejects_non_geom_method(self, method, direction):
-        """Lower bounds are supported only by GEOM, in either direction."""
-        params = PrivacyParams(sigma=SIGMA, num_steps=NUM_STEPS, delta=DELTA)
+
+class TestProjectionMethods:
+    """The projection at the merges, selected via ``AllocationSchemeConfig``."""
+
+    # Every combination of grid, configured projection and bound: the projection that
+    # runs, or None where the combination is not supported.
+    _GEOM, _MS_FFT = ConvolutionMethod.GEOM, ConvolutionMethod.MS_FFT
+    _SUPPORTED = [
+        (_GEOM, None, BoundType.DOMINATES, ProjectionMethod.STOCH_DOM),
+        (_GEOM, None, BoundType.IS_DOMINATED, ProjectionMethod.STOCH_DOM),
+        (_GEOM, ProjectionMethod.STOCH_DOM, BoundType.DOMINATES, ProjectionMethod.STOCH_DOM),
+        (_GEOM, ProjectionMethod.STOCH_DOM, BoundType.IS_DOMINATED, ProjectionMethod.STOCH_DOM),
+        (_GEOM, ProjectionMethod.CTD, BoundType.DOMINATES, ProjectionMethod.CTD),
+        (_GEOM, ProjectionMethod.CTD, BoundType.IS_DOMINATED, None),
+        (_MS_FFT, None, BoundType.DOMINATES, ProjectionMethod.CTD),
+        (_MS_FFT, None, BoundType.IS_DOMINATED, None),
+        (_MS_FFT, ProjectionMethod.STOCH_DOM, BoundType.DOMINATES, ProjectionMethod.STOCH_DOM),
+        (_MS_FFT, ProjectionMethod.STOCH_DOM, BoundType.IS_DOMINATED, ProjectionMethod.STOCH_DOM),
+        (_MS_FFT, ProjectionMethod.CTD, BoundType.DOMINATES, ProjectionMethod.CTD),
+        (_MS_FFT, ProjectionMethod.CTD, BoundType.IS_DOMINATED, None),
+    ]
+
+    @pytest.mark.parametrize("grid, configured, bound_type, resolved", _SUPPORTED)
+    def test_resolved_projection_for_every_configuration_and_bound(
+        self, grid, configured, bound_type, resolved
+    ):
+        """Each grid has its own default; rounding gives both bounds, connect-the-dots upper."""
+        config = AllocationSchemeConfig(convolution_method=grid, projection_method=configured)
+        if resolved is None:
+            with pytest.raises(ValueError, match="DOMINATES only"):
+                resolve_projection_method(config=config, bound_type=bound_type)
+        else:
+            assert resolve_projection_method(config=config, bound_type=bound_type) == resolved
+
+    @pytest.mark.parametrize("grid, configured, bound_type, resolved", _SUPPORTED)
+    def test_allocation_supports_exactly_the_resolved_combinations(
+        self, grid, configured, bound_type, resolved
+    ):
+        """The allocation API computes every supported combination and rejects the others."""
         config = AllocationSchemeConfig(
             loss_discretization=0.05,
             tail_truncation=1e-6,
-            convolution_method=method,
+            convolution_method=grid,
+            projection_method=configured,
         )
-
-        with pytest.raises(ValueError, match="supported only with ConvolutionMethod.GEOM"):
-            gaussian_allocation_directional_pld(
-                params=params,
-                config=config,
-                direction=direction,
-                bound_type=BoundType.IS_DOMINATED,
+        params = PrivacyParams(sigma=SIGMA, num_steps=NUM_STEPS, delta=DELTA)
+        if resolved is None:
+            with pytest.raises(ValueError, match="DOMINATES only"):
+                gaussian_allocation_epsilon_configurable(
+                    params=params, config=config, bound_type=bound_type
+                )
+        else:
+            eps = gaussian_allocation_epsilon_configurable(
+                params=params, config=config, bound_type=bound_type
             )
+            assert np.isfinite(eps) and eps > 0
+
+    def test_resolver_rejects_bound_type_both(self):
+        """The projection is resolved for one bound orientation."""
+        config = AllocationSchemeConfig()
+        with pytest.raises(ValueError):
+            resolve_projection_method(config=config, bound_type=BoundType.BOTH)
 
 
 # ===================================================================
@@ -404,7 +423,7 @@ class TestGeneralAllocationAPI:
 
     def test_epsilon_returns_positive_float(self):
         """``general_allocation_epsilon`` must return a finite positive ε for valid PLD inputs."""
-        rm, ad = _make_gaussian_realizations()
+        rm, ad = _make_gaussian_realizations(sigma=SIGMA)
         eps = general_allocation_epsilon(
             delta=DELTA,
             num_steps=NUM_STEPS,
@@ -418,7 +437,7 @@ class TestGeneralAllocationAPI:
 
     def test_delta_returns_valid_probability(self):
         """``general_allocation_delta`` must return δ strictly between zero and one."""
-        rm, ad = _make_gaussian_realizations()
+        rm, ad = _make_gaussian_realizations(sigma=SIGMA)
         d = general_allocation_delta(
             epsilon=EPSILON,
             num_steps=NUM_STEPS,
@@ -432,7 +451,7 @@ class TestGeneralAllocationAPI:
 
     def test_pld_returns_privacy_loss_distribution(self):
         """``general_allocation_pld`` should emit a reusable ``PrivacyLossDistribution`` object."""
-        rm, ad = _make_gaussian_realizations()
+        rm, ad = _make_gaussian_realizations(sigma=SIGMA)
         pld = general_allocation_pld(
             num_steps=NUM_STEPS,
             num_selected=NUM_SELECTED,
@@ -445,7 +464,7 @@ class TestGeneralAllocationAPI:
 
     def test_epsilon_delta_round_trip(self):
         """ε→δ round trip for the realization API should stay near the requested δ budget."""
-        rm, ad = _make_gaussian_realizations()
+        rm, ad = _make_gaussian_realizations(sigma=SIGMA)
         eps = general_allocation_epsilon(
             delta=DELTA,
             num_steps=NUM_STEPS,
@@ -468,7 +487,7 @@ class TestGeneralAllocationAPI:
 
     def test_dominates_geq_is_dominated(self):
         """Dominating compositions should report ε no smaller than optimistic compositions."""
-        rm, ad = _make_gaussian_realizations()
+        rm, ad = _make_gaussian_realizations(sigma=SIGMA)
         eps_dom = general_allocation_epsilon(
             delta=DELTA,
             num_steps=NUM_STEPS,
@@ -491,53 +510,80 @@ class TestGeneralAllocationAPI:
         )
         assert eps_dom >= eps_sub
 
+    @pytest.mark.parametrize("bound_type", [BoundType.DOMINATES, BoundType.IS_DOMINATED])
+    @pytest.mark.parametrize("slot", ["remove_realization", "add_realization"])
     @pytest.mark.parametrize(
-        "method",
+        "api, query",
         [
-            ConvolutionMethod.FFT,
-            ConvolutionMethod.COMBINED,
-            ConvolutionMethod.BEST_OF_TWO,
+            (general_allocation_pld, {}),
+            (general_allocation_epsilon, {"delta": DELTA}),
+            (general_allocation_delta, {"epsilon": EPSILON}),
         ],
+        ids=["pld", "epsilon", "delta"],
     )
-    def test_rejects_non_geom_convolution(self, method):
-        """The realization API currently requires geometric inner convolutions."""
-        rm, ad = _make_gaussian_realizations()
-        bad_cfg = AllocationSchemeConfig(
-            loss_discretization=0.05,
-            tail_truncation=1e-6,
-            convolution_method=method,
-        )
-        with pytest.raises(ValueError, match="geometric convolution"):
-            general_allocation_epsilon(
-                delta=DELTA,
-                num_steps=NUM_STEPS,
-                num_selected=NUM_SELECTED,
-                num_epochs=NUM_EPOCHS,
-                remove_realization=rm,
-                add_realization=ad,
-                config=bad_cfg,
-            )
+    def test_rejects_an_input_that_is_not_a_pld_realization(self, api, query, slot, bound_type):
+        """A lower-bound mechanism discretization is not a PLD and is rejected up front."""
+        rm, ad = _make_gaussian_realizations(sigma=SIGMA)
+        lower = gaussian_distribution(scale=SIGMA, bound_type=BoundType.IS_DOMINATED)
+        assert isinstance(lower, DenseDiscreteDist)
+        assert not isinstance(lower, PLDRealization)
+        kwargs = {
+            "num_steps": NUM_STEPS,
+            "num_selected": NUM_SELECTED,
+            "num_epochs": NUM_EPOCHS,
+            "remove_realization": rm,
+            "add_realization": ad,
+            "config": COARSE_CONFIG,
+            "bound_type": bound_type,
+            **query,
+        }
+        kwargs[slot] = lower
+        with pytest.raises(TypeError, match=f"{slot} must be PLDRealization"):
+            api(**kwargs)
 
-    def test_rejects_non_pld_realization_input(self):
-        """Reject dense grids that are not ``PLDRealization`` for add/remove builders."""
-        rm, _ = _make_gaussian_realizations()
-        bad_add = gaussian_distribution(scale=SIGMA, bound_type=BoundType.IS_DOMINATED)
-        assert isinstance(bad_add, DenseDiscreteDist)
-        assert not isinstance(bad_add, PLDRealization)
-        with pytest.raises(TypeError):
-            general_allocation_epsilon(
-                delta=DELTA,
+    def test_warns_when_a_realization_is_coarser_than_the_loss_budget(self):
+        """On GEOM the realization's step floors the one-step factor's, and that is reported."""
+        coarse = gaussian_distribution(scale=SIGMA, value_discretization=0.05)
+        with pytest.warns(UserWarning, match="realization's grid step 5.000000e-02 is coarser"):
+            general_allocation_pld(
                 num_steps=NUM_STEPS,
                 num_selected=NUM_SELECTED,
                 num_epochs=NUM_EPOCHS,
-                remove_realization=rm,
-                add_realization=bad_add,
+                remove_realization=coarse,
+                add_realization=coarse,
                 config=COARSE_CONFIG,
             )
 
+    @pytest.mark.parametrize(
+        "convolution_method, value_discretization",
+        [(ConvolutionMethod.GEOM, 1e-3), (ConvolutionMethod.MS_FFT, 0.05)],
+        ids=["geom-fine-realization", "ms-fft-coarse-realization"],
+    )
+    def test_no_step_floor_warning_when_the_grid_is_not_floored(
+        self, convolution_method, value_discretization
+    ):
+        """A fine realization on GEOM, or any realization on MS_FFT, sets no floor."""
+        realization = gaussian_distribution(scale=SIGMA, value_discretization=value_discretization)
+        config = AllocationSchemeConfig(
+            loss_discretization=COARSE_CONFIG.loss_discretization,
+            tail_truncation=COARSE_CONFIG.tail_truncation,
+            convolution_method=convolution_method,
+        )
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            general_allocation_pld(
+                num_steps=NUM_STEPS,
+                num_selected=NUM_SELECTED,
+                num_epochs=NUM_EPOCHS,
+                remove_realization=realization,
+                add_realization=realization,
+                config=config,
+            )
+        assert not [w for w in caught if "realization's grid step" in str(w.message)]
+
     def test_more_epochs_increases_epsilon(self):
         """Repeating the allocation schedule across more epochs cannot shrink the ε estimate."""
-        rm, ad = _make_gaussian_realizations()
+        rm, ad = _make_gaussian_realizations(sigma=SIGMA)
         eps1 = general_allocation_epsilon(
             delta=DELTA,
             num_steps=NUM_STEPS,
@@ -575,7 +621,7 @@ class TestCrossPathConsistency:
             config=COARSE_CONFIG,
             bound_type=BoundType.DOMINATES,
         )
-        rm, ad = _make_gaussian_realizations()
+        rm, ad = _make_gaussian_realizations(sigma=SIGMA)
         eps_general = general_allocation_epsilon(
             delta=DELTA,
             num_steps=NUM_STEPS,
@@ -598,7 +644,7 @@ class TestCrossPathConsistency:
             config=COARSE_CONFIG,
             bound_type=BoundType.DOMINATES,
         )
-        rm, ad = _make_gaussian_realizations()
+        rm, ad = _make_gaussian_realizations(sigma=SIGMA)
         d_general = general_allocation_delta(
             epsilon=EPSILON,
             num_steps=NUM_STEPS,
@@ -624,34 +670,34 @@ class TestSubsampling:
 
     def test_realization_remove_returns_pld(self):
         """``subsample_pld_realization`` on REMOVE must return another valid ``PLDRealization``."""
-        rm, _ = _make_gaussian_realizations()
+        rm, _ = _make_gaussian_realizations(sigma=SIGMA)
         out = subsample_pld_realization(base_pld=rm, sampling_prob=0.5, direction=Direction.REMOVE)
         assert isinstance(out, PLDRealization)
         assert abs(_total_mass(out) - 1.0) < MASS_TOL
 
     def test_realization_add_returns_pld(self):
         """``subsample_pld_realization`` on ADD must return another valid ``PLDRealization``."""
-        _, ad = _make_gaussian_realizations()
+        _, ad = _make_gaussian_realizations(sigma=SIGMA)
         out = subsample_pld_realization(base_pld=ad, sampling_prob=0.5, direction=Direction.ADD)
         assert isinstance(out, PLDRealization)
         assert abs(_total_mass(out) - 1.0) < MASS_TOL
 
     def test_realization_q1_returns_same(self):
         """Sampling probability ``1.0`` should short-circuit to the original realization object."""
-        rm, _ = _make_gaussian_realizations()
+        rm, _ = _make_gaussian_realizations(sigma=SIGMA)
         out = subsample_pld_realization(base_pld=rm, sampling_prob=1.0, direction=Direction.REMOVE)
         assert out is rm
 
     def test_realization_rejects_direction_both(self):
         """Direction ``BOTH`` is invalid for the realization-level subsampling helper."""
-        rm, _ = _make_gaussian_realizations()
+        rm, _ = _make_gaussian_realizations(sigma=SIGMA)
         with pytest.raises(ValueError):
             subsample_pld_realization(base_pld=rm, sampling_prob=0.5, direction=Direction.BOTH)
 
     @pytest.mark.parametrize("bad_q", [0.0, -0.1, 1.5])
     def test_realization_rejects_invalid_prob(self, bad_q):
         """Sampling probabilities must lie strictly between zero and one."""
-        rm, _ = _make_gaussian_realizations()
+        rm, _ = _make_gaussian_realizations(sigma=SIGMA)
         with pytest.raises(ValueError):
             subsample_pld_realization(base_pld=rm, sampling_prob=bad_q, direction=Direction.REMOVE)
 
@@ -722,6 +768,29 @@ class TestInputValidation:
         with pytest.raises(TypeError, match="convolution_method"):
             AllocationSchemeConfig(convolution_method="fft")  # type: ignore[arg-type]
 
+    def test_rejects_invalid_projection_method_type(self):
+        """The projection field holds a ``ProjectionMethod`` or ``None``."""
+        with pytest.raises(TypeError, match="projection_method"):
+            AllocationSchemeConfig(projection_method="ctd")  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("bad_cells", [0, -4])
+    def test_rejects_cells_per_band_cap_that_is_not_positive(self, bad_cells):
+        """The cap on the points per octave is a positive integer."""
+        with pytest.raises(ValueError, match="max_cells_per_band"):
+            AllocationSchemeConfig(max_cells_per_band=bad_cells)
+
+    @pytest.mark.parametrize("bad_grid", [0, 1, 2, 3, -1])
+    def test_rejects_closing_grid_cap_below_the_smallest_aligned_grid(self, bad_grid):
+        """An aligned grid over one interval of its step can take four points."""
+        with pytest.raises(ValueError, match="max_closing_grid"):
+            AllocationSchemeConfig(max_closing_grid=bad_grid)
+
+    @pytest.mark.parametrize("field", ["max_cells_per_band", "max_closing_grid"])
+    def test_rejects_cap_that_is_not_an_integer(self, field):
+        """The caps are integers."""
+        with pytest.raises(TypeError, match=field):
+            AllocationSchemeConfig(**{field: 1024.0})
+
     @pytest.mark.parametrize("bad_delta", [0.0, 1.0, -0.1])
     def test_gaussian_rejects_bad_delta(self, bad_delta):
         """δ targets must be valid probabilities strictly between zero and one."""
@@ -756,7 +825,7 @@ class TestInputValidation:
 
     def test_bound_type_both_rejected_for_general_epsilon(self):
         """``BoundType.BOTH`` is not implemented for the realization-based ε helper."""
-        rm, ad = _make_gaussian_realizations()
+        rm, ad = _make_gaussian_realizations(sigma=SIGMA)
         with pytest.raises(ValueError):
             general_allocation_epsilon(
                 delta=DELTA,
@@ -771,7 +840,7 @@ class TestInputValidation:
 
     def test_general_rejects_bad_delta(self):
         """``general_allocation_epsilon`` must reject δ outside (0, 1)."""
-        rm, ad = _make_gaussian_realizations()
+        rm, ad = _make_gaussian_realizations(sigma=SIGMA)
         with pytest.raises(ValueError):
             general_allocation_epsilon(
                 delta=0.0,
@@ -785,7 +854,7 @@ class TestInputValidation:
 
     def test_general_rejects_bad_epsilon(self):
         """``general_allocation_delta`` must reject non-positive ε targets."""
-        rm, ad = _make_gaussian_realizations()
+        rm, ad = _make_gaussian_realizations(sigma=SIGMA)
         with pytest.raises(ValueError):
             general_allocation_delta(
                 epsilon=0.0,

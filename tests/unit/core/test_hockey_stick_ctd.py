@@ -8,6 +8,12 @@ import numpy as np
 import pytest
 from scipy import stats
 
+from PLD_accounting.projections_ctd import (
+    _ctd_cell_endpoint_masses,
+    _discrete_ctd_cell_measures,
+    project_continuous_dist_ctd,
+    project_dist_onto_grid_ctd,
+)
 from PLD_accounting.discrete_dist import (
     REALIZATION_MOMENT_TOL,
     DenseDiscreteDist,
@@ -16,23 +22,17 @@ from PLD_accounting.discrete_dist import (
     PLDRealization,
     SparseDiscreteDist,
 )
-from PLD_accounting.distribution_discretization import (
-    _stable_cdf_and_sf,
-    _stable_cell_interval_masses,
-    _ctd_cell_endpoint_masses,
-    _discrete_ctd_cell_measures,
-    _partition_masses,
-    discretize_continuous_ctd,
-    joint_source_dual_bounds,
-    project_dist_onto_grid_ctd,
-    rediscretize_dist_by_bound,
-)
 from PLD_accounting.distribution_utils import (
     PMF_TOLERATED_MASS_TOL,
+    _stable_cdf_and_sf,
+    _stable_cell_interval_masses,
     exp_moment_terms,
+    joint_source_dual_bounds,
+    partition_masses,
     signed_unit_residual,
 )
 from PLD_accounting.mechanisms import _LaplacePLD, discrete_distribution
+from PLD_accounting.projections import project_discrete_dist
 from PLD_accounting.types import BoundType
 from PLD_accounting.utils import calc_pld_dual
 
@@ -60,16 +60,13 @@ def atomic_hockey_stick(
     p_max: float = 0.0,
 ) -> np.ndarray:
     """Evaluate an atomic PLD's hockey-stick profile."""
-    return np.array(
-        [
-            p_max
-            + math.fsum(
-                float(mass) * max(0.0, -math.expm1(float(epsilon - loss)))
-                for loss, mass in zip(losses, masses, strict=True)
-            )
-            for epsilon in epsilons
-        ]
-    )
+    profile = []
+    for epsilon in epsilons:
+        atom_terms = []
+        for loss, mass in zip(losses, masses, strict=True):
+            atom_terms.append(float(mass) * max(0.0, (-math.expm1(float(epsilon - loss)))))
+        profile.append(p_max + math.fsum(atom_terms))
+    return np.array(profile)
 
 
 class _ReflectedUniformDual:
@@ -174,12 +171,11 @@ def test_cellwise_algorithm1_matches_paper_algorithm1_on_same_knots() -> None:
     """Cellwise Algorithm 1 agrees with the paper's profile form when well conditioned."""
     sigma_inv = 1.0 / 1.3
     source = stats.norm(loc=sigma_inv**2 / 2.0, scale=sigma_inv)
-    result = discretize_continuous_ctd(
+    result = project_continuous_dist_ctd(
         dist=source,
         dual_dist=source,
         tail_truncation=1e-5,
         step=0.1,
-        align_to_multiples=True,
     )
     reference_probabilities, reference_p_max = paper_algorithm1_reference(
         source=source,
@@ -192,6 +188,7 @@ def test_cellwise_algorithm1_matches_paper_algorithm1_on_same_knots() -> None:
 
 
 def test_k_randomized_response_rediscretization_dominates_exact_profile() -> None:
+    # pylint: disable=too-many-locals  # each compared quantity is named
     """CtD preserves k-RR at knots and dominates between them."""
     num_buckets = 7
     noise_probability = 0.35
@@ -203,18 +200,19 @@ def test_k_randomized_response_rediscretization_dominates_exact_profile() -> Non
     probs = np.array([p_correct, (num_buckets - 2) * p_other, p_other])
     order = np.argsort(losses)
 
-    result = rediscretize_dist_by_bound(
-        dist=SparseDiscreteDist(x_array=losses[order], prob_arr=probs[order]),
+    source = SparseDiscreteDist(x_array=losses[order], prob_arr=probs[order])
+    result = project_discrete_dist(
+        dist=source,
         tail_truncation=0.0,
         loss_discretization=step,
         bound_type=BoundType.DOMINATES,
     )
 
-    np.testing.assert_allclose(
-        atomic_hockey_stick(result.x_array, result.prob_arr, result.x_array, result.p_max),
-        atomic_hockey_stick(losses, probs, result.x_array),
-        atol=5 * PMF_TOLERATED_MASS_TOL,
+    result_at_knots = atomic_hockey_stick(
+        result.x_array, result.prob_arr, result.x_array, result.p_max
     )
+    exact_at_knots = atomic_hockey_stick(losses, probs, result.x_array)
+    np.testing.assert_allclose(result_at_knots, exact_at_knots, atol=5 * PMF_TOLERATED_MASS_TOL)
     epsilons = np.linspace(result.x_array[0] - step, result.x_array[-1] + step, 2001)
     exact_profile = atomic_hockey_stick(losses, probs, epsilons)
     result_profile = atomic_hockey_stick(result.x_array, result.prob_arr, epsilons, result.p_max)
@@ -230,17 +228,10 @@ def test_k_randomized_response_rediscretization_dominates_exact_profile() -> Non
 
 def test_grid_atoms_are_unchanged() -> None:
     """CtD preserves source atoms that already lie on target grid knots."""
-    result = project_dist_onto_grid_ctd(
-        dist=PLDRealization(
-            grid=GridSpec(
-                step=1.0,
-                n=3,
-                anchor=-1.0,
-            ),
-            prob_arr=np.array([0.1, 0.3, 0.6]),
-        ),
-        grid=GridSpec(anchor=-1.0, step=1.0, n=3),
-    )
+    source_grid = GridSpec(step=1.0, n=3, anchor=-1.0)
+    source = PLDRealization(grid=source_grid, prob_arr=np.array([0.1, 0.3, 0.6]))
+    target_grid = GridSpec(anchor=-1.0, step=1.0, n=3)
+    result = project_dist_onto_grid_ctd(dist=source, grid=target_grid)
     assert isinstance(result, PLDRealization)
     assert np.allclose(result.prob_arr, [0.1, 0.3, 0.6])
 
@@ -252,40 +243,36 @@ def test_grid_atom_with_independently_formed_coordinate_lands_on_its_knot() -> N
     # Exact bin assignment uses the materialized target knots directly, so this
     # independently formed coordinate lands on the same intended knot.
     source_loss = 2.9 + 3 * step
-    result = project_dist_onto_grid_ctd(
-        dist=PLDRealization(
-            grid=GridSpec(
-                step=step,
-                n=1,
-                anchor=source_loss,
-            ),
-            prob_arr=np.array([1.0]),
-        ),
-        grid=GridSpec(anchor=x_0, step=step, n=5),
-    )
+    source_grid = GridSpec(step=step, n=1, anchor=source_loss)
+    source = PLDRealization(grid=source_grid, prob_arr=np.array([1.0]))
+    target_grid = GridSpec(anchor=x_0, step=step, n=5)
+    result = project_dist_onto_grid_ctd(dist=source, grid=target_grid)
     assert result.prob_arr[3] == pytest.approx(1.0)
+
+
+JUST_BELOW_ZERO = np.nextafter(0.0, -np.inf)
+JUST_ABOVE_ZERO = np.nextafter(0.0, np.inf)
+JUST_BELOW_ONE = np.nextafter(1.0, -np.inf)
+JUST_ABOVE_ONE = np.nextafter(1.0, np.inf)
 
 
 @pytest.mark.parametrize(
     ("loss", "expected_boundary"),
     [
-        (np.nextafter(0.0, -np.inf), "lower"),
-        (np.nextafter(0.0, np.inf), "interior"),
-        (np.nextafter(1.0, -np.inf), "interior"),
-        (np.nextafter(1.0, np.inf), "upper"),
+        (JUST_BELOW_ZERO, "lower"),
+        (JUST_ABOVE_ZERO, "interior"),
+        (JUST_BELOW_ONE, "interior"),
+        (JUST_ABOVE_ONE, "upper"),
     ],
 )
 def test_atomwise_ctd_respects_nextafter_sides(loss: float, expected_boundary: str) -> None:
     """Bin assignment is exact at the representable points around grid knots."""
     finite_mass = 0.5
-    result = project_dist_onto_grid_ctd(
-        dist=SparseDiscreteDist(
-            x_array=np.array([loss]),
-            prob_arr=np.array([finite_mass]),
-            p_max=1.0 - finite_mass,
-        ),
-        grid=GridSpec(anchor=0.0, step=1.0, n=2),
+    source = SparseDiscreteDist(
+        x_array=np.array([loss]), prob_arr=np.array([finite_mass]), p_max=1.0 - finite_mass
     )
+    target_grid = GridSpec(anchor=0.0, step=1.0, n=2)
+    result = project_dist_onto_grid_ctd(dist=source, grid=target_grid)
 
     if expected_boundary == "lower":
         assert result.prob_arr[0] == pytest.approx(finite_mass)
@@ -300,17 +287,10 @@ def test_atomwise_ctd_respects_nextafter_sides(loss: float, expected_boundary: s
 def test_between_knots_splits_and_preserves_hockey_values() -> None:
     """CtD splits an off-grid atom while preserving knot hockey values."""
     loss, mass = 0.3, 1.0
-    result = project_dist_onto_grid_ctd(
-        dist=PLDRealization(
-            grid=GridSpec(
-                step=0.1,
-                n=1,
-                anchor=loss,
-            ),
-            prob_arr=np.array([mass]),
-        ),
-        grid=GridSpec(anchor=0.0, step=1.0, n=2),
-    )
+    source_grid = GridSpec(step=0.1, n=1, anchor=loss)
+    source = PLDRealization(grid=source_grid, prob_arr=np.array([mass]))
+    target_grid = GridSpec(anchor=0.0, step=1.0, n=2)
+    result = project_dist_onto_grid_ctd(dist=source, grid=target_grid)
     high = -math.expm1(-loss) / -math.expm1(-1.0)
     assert result.prob_arr[1] == pytest.approx(high)
     assert result.prob_arr[0] == pytest.approx(1.0 - high)
@@ -322,17 +302,10 @@ def test_between_knots_splits_and_preserves_hockey_values() -> None:
 
 def test_irregular_support_and_boundaries() -> None:
     """CtD handles irregular support and moves overflow to boundary mass."""
-    result = project_dist_onto_grid_ctd(
-        dist=PLDRealization(
-            grid=GridSpec(
-                step=400.05,
-                n=3,
-                anchor=-0.1,
-            ),
-            prob_arr=np.array([0.1, 0.8, 0.1]),
-        ),
-        grid=GridSpec(anchor=0.0, step=1.0, n=2),
-    )
+    source_grid = GridSpec(step=400.05, n=3, anchor=-0.1)
+    source = PLDRealization(grid=source_grid, prob_arr=np.array([0.1, 0.8, 0.1]))
+    target_grid = GridSpec(anchor=0.0, step=1.0, n=2)
+    result = project_dist_onto_grid_ctd(dist=source, grid=target_grid)
     assert result.prob_arr[0] == pytest.approx(0.1, abs=PMF_TOLERATED_MASS_TOL)
     assert result.p_max == pytest.approx(0.9, abs=1e-14)
     assert math.fsum(map(float, result.prob_arr)) + result.p_max == pytest.approx(1.0)
@@ -343,10 +316,8 @@ def test_discrete_ctd_retains_original_discretize_then_dual_flow() -> None:
     losses = np.array([-0.2, 0.4, 1.4])
     masses = np.array([0.1, 0.4, 0.5])
     source = SparseDiscreteDist(x_array=losses, prob_arr=masses)
-    result = project_dist_onto_grid_ctd(
-        dist=source,
-        grid=GridSpec(anchor=0.0, step=1.0, n=2),
-    )
+    target_grid = GridSpec(anchor=0.0, step=1.0, n=2)
+    result = project_dist_onto_grid_ctd(dist=source, grid=target_grid)
     dual = calc_pld_dual(result)
 
     source_moment = math.fsum(
@@ -374,10 +345,8 @@ def test_adapter_accepts_semantically_valid_sparse_source() -> None:
     dist = SparseDiscreteDist(
         x_array=np.array([0.0, 1.0]), prob_arr=np.array([0.5, 0.5]), domain=Domain.REALS
     )
-    result = project_dist_onto_grid_ctd(
-        dist=dist,
-        grid=GridSpec(anchor=0.0, step=0.25, n=5),
-    )
+    target_grid = GridSpec(anchor=0.0, step=0.25, n=5)
+    result = project_dist_onto_grid_ctd(dist=dist, grid=target_grid)
     eps = np.linspace(0.0, 1.0, 101)
     source_profile = atomic_hockey_stick(dist.x_array, dist.prob_arr, eps)
     output_profile = atomic_hockey_stick(result.x_array, result.prob_arr, eps, result.p_max)
@@ -389,14 +358,10 @@ def test_adapter_accepts_semantically_valid_sparse_source() -> None:
 
 def test_rediscretization_rejects_single_finite_atom() -> None:
     """CtD rejects a degenerate finite range with no distinct grid bounds."""
-    source = SparseDiscreteDist(
-        x_array=np.array([0.2]),
-        prob_arr=np.array([0.7]),
-        p_max=0.3,
-    )
+    source = SparseDiscreteDist(x_array=np.array([0.2]), prob_arr=np.array([0.7]), p_max=0.3)
 
     with pytest.raises(ValueError, match="at least two distinct finite support points"):
-        rediscretize_dist_by_bound(
+        project_discrete_dist(
             dist=source,
             tail_truncation=0.0,
             loss_discretization=0.1,
@@ -409,10 +374,8 @@ def test_nonuniform_sparse_source_dominates_densely_between_knots() -> None:
     losses = np.array([0.0, 0.2, 1.3])
     masses = np.array([0.2, 0.3, 0.5])
     dist = SparseDiscreteDist(x_array=losses, prob_arr=masses, domain=Domain.REALS)
-    result = project_dist_onto_grid_ctd(
-        dist=dist,
-        grid=GridSpec(anchor=0.0, step=0.25, n=7),
-    )
+    target_grid = GridSpec(anchor=0.0, step=0.25, n=7)
+    result = project_dist_onto_grid_ctd(dist=dist, grid=target_grid)
 
     assert result.p_min == 0.0
     total_mass = math.fsum(map(float, result.prob_arr)) + result.p_max
@@ -426,26 +389,21 @@ def test_nonuniform_sparse_source_dominates_densely_between_knots() -> None:
     source_profile = atomic_hockey_stick(losses, masses, eps)
     output_profile = atomic_hockey_stick(result.x_array, result.prob_arr, eps, result.p_max)
     assert np.all(output_profile >= source_profile - 2 * PMF_TOLERATED_MASS_TOL)
-    np.testing.assert_allclose(
-        atomic_hockey_stick(result.x_array, result.prob_arr, result.x_array, result.p_max),
-        atomic_hockey_stick(losses, masses, result.x_array),
-        atol=2 * PMF_TOLERATED_MASS_TOL,
+    result_at_knots = atomic_hockey_stick(
+        result.x_array, result.prob_arr, result.x_array, result.p_max
     )
+    source_at_knots = atomic_hockey_stick(losses, masses, result.x_array)
+    np.testing.assert_allclose(result_at_knots, source_at_knots, atol=2 * PMF_TOLERATED_MASS_TOL)
 
 
 def test_ctd_repairs_accepted_arithmetic_moment_excess_before_dualization() -> None:
     """Every CtD realization accepted by the constructor must also be dualizable."""
     moment = 1.0 + REALIZATION_MOMENT_TOL / 2.0
     dist = SparseDiscreteDist(x_array=np.array([-math.log(moment)]), prob_arr=np.array([1.0]))
-    projected = project_dist_onto_grid_ctd(
-        dist=dist,
-        grid=GridSpec(anchor=-0.1, step=0.1, n=3),
-    )
-    residual = signed_unit_residual(
-        values=exp_moment_terms(prob_arr=projected.prob_arr, x_vals=projected.x_array),
-        lower_term=0.0,
-        upper_term=0.0,
-    )
+    target_grid = GridSpec(anchor=-0.1, step=0.1, n=3)
+    projected = project_dist_onto_grid_ctd(dist=dist, grid=target_grid)
+    moment_terms = exp_moment_terms(prob_arr=projected.prob_arr, x_vals=projected.x_array)
+    residual = signed_unit_residual(values=moment_terms, lower_term=0.0, upper_term=0.0)
     assert residual >= 0.0
     dual = calc_pld_dual(projected)
     assert dual.p_min == 0.0
@@ -460,13 +418,14 @@ def test_inconsistent_source_dual_pair_is_rejected_not_clipped() -> None:
     not the CtD interpolant of anything, which is the failure mode this whole path
     exists to remove.
     """
+    source = stats.norm(loc=0.0, scale=1.0)
+    dual = stats.norm(loc=0.0, scale=1.0)
     with pytest.raises(ValueError, match=r"r\*M <= exp\(a\)\*R <= M"):
-        discretize_continuous_ctd(
-            dist=stats.norm(loc=0.0, scale=1.0),
-            dual_dist=stats.norm(loc=0.0, scale=1.0),
+        project_continuous_dist_ctd(
+            dist=source,
+            dual_dist=dual,
             tail_truncation=1e-4,
             step=0.01,
-            align_to_multiples=False,
         )
 
 
@@ -478,14 +437,55 @@ def test_ctd_rejects_one_sided_zero_cell_measure(
     source_mass: float,
     dual_mass: float,
 ) -> None:
-    """A source/dual underflow mismatch must never silently discard cell mass."""
-    with pytest.raises(ValueError, match="must either both be zero or both be positive"):
+    """A one-sided zero cell measure moves the reciprocal moment by more than the tolerance."""
+    pld_pmf = np.array([source_mass])
+    pld_dual_pmf = np.array([dual_mass])
+    left = np.array([0.0])
+    width = np.array([1.0])
+    with pytest.raises(ValueError, match=r"r\*M <= exp\(a\)\*R <= M"):
         _ctd_cell_endpoint_masses(
-            pld_pmf=np.array([source_mass]),
-            pld_dual_pmf=np.array([dual_mass]),
-            left=np.array([0.0]),
-            width=np.array([1.0]),
+            pld_pmf=pld_pmf, pld_dual_pmf=pld_dual_pmf, left=left, width=width
         )
+
+
+@pytest.mark.parametrize(
+    ("source_mass", "dual_mass"),
+    [(0.0, 5e-324), (5e-324, 0.0)],
+)
+def test_ctd_puts_the_source_mass_of_a_subnormal_cell_at_its_right_knot(
+    source_mass: float,
+    dual_mass: float,
+) -> None:
+    """A cell with subnormal source mass stays at its right knot without splitting."""
+    left_weight, right_weight = _ctd_cell_endpoint_masses(
+        pld_pmf=np.array([source_mass]),
+        pld_dual_pmf=np.array([dual_mass]),
+        left=np.array([0.0]),
+        width=np.array([1.0]),
+    )
+    assert left_weight[0] == 0.0
+    assert right_weight[0] == source_mass
+
+
+def test_ctd_clips_the_split_of_a_negligible_tail_cell_but_not_of_a_heavy_one() -> None:
+    """Endpoint clipping must stay within the reciprocal-moment tolerance."""
+    left = np.array([0.0])
+    width = np.array([3e-8])
+    for mass in (1e-15, 1e-6):
+        dual_mass = mass * 0.3
+        args = {
+            "pld_pmf": np.array([mass]),
+            "pld_dual_pmf": np.array([dual_mass]),
+            "left": left,
+            "width": width,
+        }
+        if mass < 1e-9:
+            left_weight, right_weight = _ctd_cell_endpoint_masses(**args)
+            assert left_weight[0] + right_weight[0] == mass
+            assert right_weight[0] == mass
+        else:
+            with pytest.raises(ValueError, match=r"r\*M <= exp\(a\)\*R <= M"):
+                _ctd_cell_endpoint_masses(**args)
 
 
 def test_ctd_mixed_cell_weights_match_80_digit_oracle() -> None:
@@ -509,8 +509,10 @@ def test_ctd_mixed_cell_weights_match_80_digit_oracle() -> None:
         left=np.array([float(left_mp)]),
         width=np.array([float(width_mp)]),
     )
-    assert left_weight[0] == pytest.approx(float(left_weight_mp), rel=2e-15)
-    assert right_weight[0] == pytest.approx(float(right_mp), rel=2e-15)
+    expected_left_weight = float(left_weight_mp)
+    expected_right_weight = float(right_mp)
+    assert left_weight[0] == pytest.approx(expected_left_weight, rel=2e-15)
+    assert right_weight[0] == pytest.approx(expected_right_weight, rel=2e-15)
 
 
 def test_non_gaussian_continuous_ctd_matches_80_digit_uniform_profile() -> None:
@@ -519,12 +521,11 @@ def test_non_gaussian_continuous_ctd_matches_80_digit_uniform_profile() -> None:
     shift = math.log(-math.expm1(-width) / width)
     source = stats.uniform(loc=shift, scale=width)
     dual = _ReflectedUniformDual(width=width, shift=shift)
-    result = discretize_continuous_ctd(
+    result = project_continuous_dist_ctd(
         dist=source,
         dual_dist=dual,
         tail_truncation=1e-6,
         step=0.025,
-        align_to_multiples=True,
     )
 
     epsilons = result.x_array[:-1] + result.step / 2.0
@@ -553,23 +554,25 @@ def test_non_gaussian_continuous_ctd_matches_80_digit_uniform_profile() -> None:
 
 def test_ctd_rejects_a_grid_beyond_the_representable_exponential_range() -> None:
     """The moment factors exp(a) and exp(-x_0) must stay representable."""
+    source = stats.norm(loc=0.0, scale=200.0)
+    dual = stats.norm(loc=0.0, scale=200.0)
     with pytest.raises(ValueError, match="exp"):
-        discretize_continuous_ctd(
-            dist=stats.norm(loc=0.0, scale=200.0),
-            dual_dist=stats.norm(loc=0.0, scale=200.0),
+        project_continuous_dist_ctd(
+            dist=source,
+            dual_dist=dual,
             tail_truncation=1e-6,
             step=1.0,
-            align_to_multiples=False,
         )
 
 
 def test_invalid_ctd_source_is_rejected() -> None:
     """CtD rejects a source violating its reciprocal-moment contract."""
+    losses = np.array([-1.0])
+    masses = np.array([1.0])
     with pytest.raises(ValueError, match="moment"):
-        project_dist_onto_grid_ctd(
-            dist=SparseDiscreteDist(x_array=np.array([-1.0]), prob_arr=np.array([1.0])),
-            grid=GridSpec(anchor=-1.0, step=1.0, n=2),
-        )
+        source = SparseDiscreteDist(x_array=losses, prob_arr=masses)
+        target_grid = GridSpec(anchor=-1.0, step=1.0, n=2)
+        project_dist_onto_grid_ctd(dist=source, grid=target_grid)
 
 
 @pytest.mark.parametrize("sigma", [0.4, 0.8])
@@ -580,9 +583,9 @@ def test_gaussian_ctd_is_stable_through_parameter_scan_grid_cap(
     """Refinement through the scan cap has no growing CtD reconstruction defect.
 
     The two boundary atoms are semantic, so they are charged against the per-factor
-    budget ``tau = delta / (100 * 2 * 3 * 3 * T)`` at every grid size. The predecessor
-    reported a dual boundary atom of 4.07e-4 here -- fourteen orders over budget, and
-    growing by 2.4x-3.4x per grid doubling.
+    budget ``tau = delta / (100 * 2 * 3 * 3 * T)`` at every grid size. A reconstruction
+    defect would show as a dual boundary atom far over that budget that grows with each
+    grid doubling.
 
     Total mass is a pure arithmetic quantity, so it is charged only at binary64 scale.
     Chasing it below an ULP of 1 buys nothing the downstream accounting can use.
@@ -591,16 +594,16 @@ def test_gaussian_ctd_is_stable_through_parameter_scan_grid_cap(
     sigma_inv = 1.0 / sigma
     source = stats.norm(loc=sigma_inv**2 / 2.0, scale=sigma_inv)
     range_tail = factor_tail / 2.0
-    joint_min = min(source.ppf(range_tail), -source.isf(range_tail))
-    joint_max = max(source.isf(range_tail), -source.ppf(range_tail))
-    step = (joint_max - joint_min) / (grid_points - 3)
+    step = (
+        max(source.isf(range_tail), -source.ppf(range_tail))
+        - min(source.ppf(range_tail), -source.isf(range_tail))
+    ) / (grid_points - 3)
 
-    result = discretize_continuous_ctd(
+    result = project_continuous_dist_ctd(
         dist=source,
         dual_dist=source,
         tail_truncation=factor_tail,
         step=step,
-        align_to_multiples=True,
     )
 
     dual = calc_pld_dual(result)
@@ -654,12 +657,11 @@ def test_continuous_ctd_rejects_a_grid_coarser_than_the_support() -> None:
     # The second step is half the support, yet alignment still yields a 3-knot grid.
     for step in (100.0, (x_max - x_min) / 2.0):
         with pytest.raises(ValueError, match="coarser than"):
-            discretize_continuous_ctd(
+            project_continuous_dist_ctd(
                 dist=source,
                 dual_dist=source,
                 tail_truncation=tail,
                 step=step,
-                align_to_multiples=True,
             )
 
 
@@ -671,10 +673,12 @@ def _gaussian_production_ctd_grid(
     sigma_inv = 1.0 / sigma
     source = stats.norm(loc=sigma_inv**2 / 2.0, scale=sigma_inv)
     range_tail = factor_tail / 2.0
-    joint_min = min(source.ppf(range_tail), -source.isf(range_tail))
-    joint_max = max(source.isf(range_tail), -source.ppf(range_tail))
-    knots = np.linspace(joint_min, joint_max, grid_points - 2, dtype=np.float64)
-    return source, knots
+    return source, np.linspace(
+        min(source.ppf(range_tail), -source.isf(range_tail)),
+        max(source.isf(range_tail), -source.ppf(range_tail)),
+        grid_points - 2,
+        dtype=np.float64,
+    )
 
 
 def test_scipy_continuous_laws_use_log_interval_oracle() -> None:
@@ -709,12 +713,13 @@ def test_discrete_ctd_cells_are_right_closed_at_exact_knots() -> None:
 
 
 def test_stable_interval_oracle_beats_raw_cdf_on_gaussian_far_tail() -> None:
+    # pylint: disable=too-many-locals  # each compared quantity is named
     """Far-tail cell widths must come from the small-side cumulative, not ``cdf(b)-cdf(a)``."""
     source, knots = _gaussian_production_ctd_grid(sigma=0.4, grid_points=500)
     raw_cdf = np.asarray(source.cdf(knots), dtype=np.float64)
     cdf_only_masses = np.diff(raw_cdf)
 
-    stable_masses, _, _ = _partition_masses(
+    stable_masses, _, _ = partition_masses(
         dist=source,
         points=knots,
         label="Gaussian far-tail audit",
@@ -728,10 +733,10 @@ def test_stable_interval_oracle_beats_raw_cdf_on_gaussian_far_tail() -> None:
         def exact_cell_mass(left: float, right: float) -> float:
             return float(mpmath.ncdf(right, mu, scale) - mpmath.ncdf(left, mu, scale))
 
-        reference = np.array(
-            [exact_cell_mass(float(knots[i]), float(knots[i + 1])) for i in cell_indices],
-            dtype=np.float64,
-        )
+        reference_masses = []
+        for i in cell_indices:
+            reference_masses.append(exact_cell_mass(float(knots[i]), float(knots[i + 1])))
+        reference = np.array(reference_masses, dtype=np.float64)
     stable_slice = stable_masses[cell_indices]
     raw_slice = cdf_only_masses[cell_indices]
 
@@ -749,16 +754,16 @@ def test_ctd_dual_residual_route_measures_three_independent_quantities() -> None
     sigma_inv = 1.0 / 0.4
     source = stats.norm(loc=sigma_inv**2 / 2.0, scale=sigma_inv)
     range_tail = factor_tail / 2.0
-    joint_min = min(source.ppf(range_tail), -source.isf(range_tail))
-    joint_max = max(source.isf(range_tail), -source.ppf(range_tail))
-    step = (joint_max - joint_min) / (125_000 - 3)
+    step = (
+        max(source.isf(range_tail), -source.ppf(range_tail))
+        - min(source.ppf(range_tail), -source.isf(range_tail))
+    ) / (125_000 - 3)
 
-    result = discretize_continuous_ctd(
+    result = project_continuous_dist_ctd(
         dist=source,
         dual_dist=source,
         tail_truncation=factor_tail,
         step=step,
-        align_to_multiples=True,
     )
     dual = calc_pld_dual(result)
     analytic_dual_eta = float(
@@ -811,11 +816,12 @@ def _laplace_production_ctd_grid(
 
 
 def test_laplace_interval_oracle_meets_floor_on_far_tail() -> None:
+    # pylint: disable=too-many-locals  # each compared quantity is named
     """Laplace-mechanism CtD must meet the same interval-oracle floor as the Gaussian."""
     source, knots = _laplace_production_ctd_grid(scale=1.0, grid_points=500)
     raw_cdf = np.asarray(source.cdf(knots), dtype=np.float64)
     cdf_only_masses = np.diff(raw_cdf)
-    stable_masses, _, _ = _partition_masses(
+    stable_masses, _, _ = partition_masses(
         dist=source,
         points=knots,
         label="Laplace far-tail audit",
@@ -824,16 +830,14 @@ def test_laplace_interval_oracle_meets_floor_on_far_tail() -> None:
     cell_indices = np.arange(knots.size - 31, knots.size - 1, dtype=np.int64)
     lam = mpmath.mpf(str(source.lam))
     with mpmath.workdps(80):
-        reference = np.array(
-            [
-                float(
-                    _laplace_pld_cdf_mp(mpmath.mpf(str(knots[i + 1])), lam)
-                    - _laplace_pld_cdf_mp(mpmath.mpf(str(knots[i])), lam)
-                )
-                for i in cell_indices
-            ],
-            dtype=np.float64,
-        )
+        reference_masses = []
+        for i in cell_indices:
+            right_knot = mpmath.mpf(str(knots[i + 1]))
+            left_knot = mpmath.mpf(str(knots[i]))
+            reference_masses.append(
+                float((_laplace_pld_cdf_mp(right_knot, lam) - _laplace_pld_cdf_mp(left_knot, lam)))
+            )
+        reference = np.array(reference_masses, dtype=np.float64)
     stable_slice = stable_masses[cell_indices]
     raw_slice = cdf_only_masses[cell_indices]
 
@@ -845,12 +849,9 @@ def test_laplace_interval_oracle_meets_floor_on_far_tail() -> None:
 
 def test_discrete_count_noise_routes_without_continuous_interval_fallback() -> None:
     """Integer count-noise PLDs use atomic CtD rather than the continuous interval oracle."""
+    noise_grid = GridSpec(step=1.0, n=5, anchor=-3.0)
     noise = DenseDiscreteDist(
-        grid=GridSpec(
-            step=1.0,
-            n=5,
-            anchor=-3.0,
-        ),
+        grid=noise_grid,
         prob_arr=np.array([0.1, 0.2, 0.4, 0.2, 0.1], dtype=np.float64),
         domain=Domain.REALS,
     )
@@ -866,29 +867,29 @@ def test_discrete_count_noise_routes_without_continuous_interval_fallback() -> N
 
 
 def test_ctd_reciprocal_moment_warning_route_is_unreproducible() -> None:
-    """The historical 6.905e-14 integration warning no longer fires on production paths.
+    """Production paths emit no integration warning at a residual of 6.905e-14.
 
-    That warning named ``REALIZATION_MOMENT_TOL`` (3.553e-15) as the drift threshold during
-    CtD reciprocal-moment repair. The current tree repairs silently below the repair band
-    instead, and the production-shaped Gaussian and allocation routes below emit no
+    ``REALIZATION_MOMENT_TOL`` (3.553e-15) is the drift threshold of the
+    reciprocal-moment repair. The tree repairs silently below the repair band, and
+    the production-shaped Gaussian and allocation routes below emit no
     ``classify_residual`` warnings.
     """
     factor_tail = 1e-10 / (100 * 2 * 3 * 3 * 100000)
     sigma_inv = 1.0 / 0.4
     source = stats.norm(loc=sigma_inv**2 / 2.0, scale=sigma_inv)
     range_tail = factor_tail / 2.0
-    joint_min = min(source.ppf(range_tail), -source.isf(range_tail))
-    joint_max = max(source.isf(range_tail), -source.ppf(range_tail))
-    step = (joint_max - joint_min) / (125_000 - 3)
+    step = (
+        max(source.isf(range_tail), -source.ppf(range_tail))
+        - min(source.ppf(range_tail), -source.isf(range_tail))
+    ) / (125_000 - 3)
 
     with warnings.catch_warnings():
         warnings.simplefilter("error", RuntimeWarning)
-        discretize_continuous_ctd(
+        project_continuous_dist_ctd(
             dist=source,
             dual_dist=source,
             tail_truncation=factor_tail,
             step=step,
-            align_to_multiples=True,
         )
     assert REALIZATION_MOMENT_TOL == pytest.approx(3.553e-15, rel=1e-3)
 

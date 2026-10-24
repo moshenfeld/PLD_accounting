@@ -9,7 +9,6 @@ from pathlib import Path
 
 import PLD_accounting
 
-
 # Public symbols listed in IMPLEMENTATION_OVERVIEW / public README that an
 # installed user imports from the package root or the documented module path.
 _PACKAGE_ROOT_NAMES = (
@@ -17,7 +16,6 @@ _PACKAGE_ROOT_NAMES = (
     "discrete_distribution",
     "dp_accounting_pmf_to_pld_realization",
     "gaussian_allocation_delta_configurable",
-    "gaussian_allocation_directional_pld",
     "gaussian_allocation_epsilon_configurable",
     "gaussian_allocation_epsilon_range",
     "gaussian_allocation_pld",
@@ -27,28 +25,20 @@ _PACKAGE_ROOT_NAMES = (
     "general_allocation_pld",
     "GridSpec",
     "laplace_distribution",
-    "rediscretize_dist_by_bound",
+    "project_discrete_dist",
     "subsample_pld",
     "subsample_pld_realization",
 )
 
 _MODULE_PATH_HELPERS = (
-    (
-        "PLD_accounting.random_allocation_gaussian",
-        "_embed_positive_boundary_on_nonpositive_real_cell",
-    ),
-    (
-        "PLD_accounting.random_allocation_gaussian",
-        "_fold_nonpositive_real_mass_to_positive_boundary",
-    ),
-    ("PLD_accounting.geometric_convolution", "_add_single_zero_atom_cross_term"),
+    ("PLD_accounting.geometric_convolution", "_add_zero_atom_cross_term_stoch_dom"),
 )
 
 _JIT_DECORATOR_NAMES = frozenset({"njit", "jit", "vectorize", "optional_njit"})
 # NumPy fallback twin of a positional Numba kernel; both keep one call shape.
 _POSITIONAL_KERNEL_TWINS = frozenset(
     {
-        ("distribution_discretization.py", "_numpy_rediscretize_prob"),
+        ("projections_stoch_dom.py", "_numpy_project_prob"),
     }
 )
 

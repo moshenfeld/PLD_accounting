@@ -12,21 +12,23 @@ from PLD_accounting.discrete_dist import (
     Domain,
     GridSpec,
     SparseDiscreteDist,
-    require_dense_dist,
+    cast_dense_dist,
+    cast_geometric_positives_dist,
+    cast_linear_reals_dist,
     require_geometric_positives_dist,
     require_linear_reals_dist,
 )
 from PLD_accounting.mechanisms import discrete_distribution
+from PLD_accounting.projections import project_discrete_dist
+from PLD_accounting.projections_stoch_dom import project_dist_onto_grid_stoch_dom
 from PLD_accounting.types import (
     AllocationSchemeConfig,
     BoundType,
     Direction,
     PrivacyParams,
     SpacingType,
-    require_allocation_config,
     require_bound_type,
     require_direction,
-    require_privacy_params,
 )
 from PLD_accounting.validation import (
     require_allocation_counts,
@@ -34,11 +36,12 @@ from PLD_accounting.validation import (
     require_enum,
     require_finite_real,
     require_integer,
+    require_increasing_array,
     require_nonnegative_masses,
     require_open_unit_interval,
     require_positive_int,
     require_positive_real,
-    require_type,
+    cast_type,
     require_unit_interval_left_open,
 )
 
@@ -63,10 +66,13 @@ def test_require_positive_real_rejects_nonpositive() -> None:
 
 def test_require_positive_real_accepts_parallel_sequences() -> None:
     """Scalar helpers accept parallel value and name sequences."""
-    assert require_positive_real(
-        value=[1.5, 0.25, 2.0],
-        name=["sigma", "loss_discretization", "tail_truncation"],
-    ) == [1.5, 0.25, 2.0]
+    assert (
+        require_positive_real(
+            value=[1.5, 0.25, 2.0],
+            name=["sigma", "loss_discretization", "tail_truncation"],
+        )
+        is None
+    )
     with pytest.raises(ValueError, match="loss_discretization must be positive"):
         require_positive_real(value=[1.5, 0.0], name=["sigma", "loss_discretization"])
     with pytest.raises(ValueError, match="values and names must have equal length"):
@@ -93,44 +99,32 @@ def test_require_open_unit_interval_is_exclusive() -> None:
         require_open_unit_interval(value=0.0, name="delta")
     with pytest.raises(ValueError, match=r"delta must be in \(0, 1\)"):
         require_open_unit_interval(value=1.0, name="delta")
-    assert require_open_unit_interval(value=0.5, name="delta") == 0.5
+    assert require_open_unit_interval(value=0.5, name="delta") is None
 
 
 def test_require_unit_interval_left_open_allows_one() -> None:
     """Sampling probability lives in ``(0, 1]``."""
     with pytest.raises(ValueError, match=r"sampling_probability must be in \(0, 1\]"):
         require_unit_interval_left_open(value=0.0, name="sampling_probability")
-    assert require_unit_interval_left_open(value=1.0, name="sampling_probability") == 1.0
+    assert require_unit_interval_left_open(value=1.0, name="sampling_probability") is None
 
 
-def test_require_closed_unit_interval_clamps_overshoot_within_atol() -> None:
-    """Float overshoot inside ``atol`` is a representation artifact and is clamped."""
-    atol = 1e-10
-    assert require_closed_unit_interval(value=-atol / 2, name="p_min", atol=atol) == 0.0
-    assert require_closed_unit_interval(value=1.0 + atol / 2, name="p_max", atol=atol) == 1.0
-    assert require_closed_unit_interval(
-        value=[-atol / 2, 1.0 + atol / 2],
-        name=["expected_p_min", "expected_p_max"],
-        atol=atol,
-    ) == [0.0, 1.0]
-
-
-def test_require_closed_unit_interval_rejects_values_beyond_atol() -> None:
-    """Overshoot larger than ``atol`` is a real out-of-range value."""
-    atol = 1e-10
+def test_require_closed_unit_interval_is_exact() -> None:
+    """The closed unit interval admits its endpoints and rejects the smallest overshoot."""
+    assert require_closed_unit_interval(value=0.0, name="p_min") is None
+    assert (
+        require_closed_unit_interval(value=[0.0, 1.0], name=["expected_p_min", "expected_p_max"])
+        is None
+    )
     with pytest.raises(ValueError, match="p_min must be in \\[0, 1\\]"):
-        require_closed_unit_interval(value=-2 * atol, name="p_min", atol=atol)
+        require_closed_unit_interval(value=-1e-300, name="p_min")
     with pytest.raises(ValueError, match="p_max must be in \\[0, 1\\]"):
-        require_closed_unit_interval(value=1.0 + 2 * atol, name="p_max", atol=atol)
-    with pytest.raises(ValueError, match="atol must be nonnegative"):
-        require_closed_unit_interval(value=0.5, name="p_min", atol=-1.0)
+        require_closed_unit_interval(value=float(np.nextafter(1.0, 2.0)), name="p_max")
 
 
 def test_require_enum_allows_both_unless_restricted() -> None:
     """``BOTH`` is a real member; APIs that reject it pass an ``allowed`` subset."""
-    assert (
-        require_enum(value=Direction.BOTH, enum_cls=Direction, name="direction") is Direction.BOTH
-    )
+    assert require_enum(value=Direction.BOTH, enum_cls=Direction, name="direction") is None
     with pytest.raises(ValueError, match="direction must be one of"):
         require_enum(
             value=Direction.BOTH,
@@ -138,9 +132,7 @@ def test_require_enum_allows_both_unless_restricted() -> None:
             name="direction",
             allowed=(Direction.ADD, Direction.REMOVE),
         )
-    assert (
-        require_enum(value=BoundType.BOTH, enum_cls=BoundType, name="bound_type") is BoundType.BOTH
-    )
+    assert require_enum(value=BoundType.BOTH, enum_cls=BoundType, name="bound_type") is None
     with pytest.raises(ValueError, match="bound_type must be one of"):
         require_enum(
             value=BoundType.BOTH,
@@ -152,36 +144,26 @@ def test_require_enum_allows_both_unless_restricted() -> None:
 
 def test_require_bound_type_rejects_both() -> None:
     """The repeated one-sided bound-type check lives in one wrapper."""
-    assert require_bound_type(value=BoundType.DOMINATES) is BoundType.DOMINATES
-    assert require_bound_type(value=BoundType.IS_DOMINATED) is BoundType.IS_DOMINATED
+    assert require_bound_type(value=BoundType.DOMINATES) is None
+    assert require_bound_type(value=BoundType.IS_DOMINATED) is None
     with pytest.raises(ValueError, match="bound_type must be one of"):
         require_bound_type(value=BoundType.BOTH)
 
 
 def test_require_direction_rejects_both() -> None:
     """The repeated one-sided direction check lives in one wrapper."""
-    assert require_direction(value=Direction.ADD) is Direction.ADD
-    assert require_direction(value=Direction.REMOVE) is Direction.REMOVE
+    assert require_direction(value=Direction.ADD) is None
+    assert require_direction(value=Direction.REMOVE) is None
     with pytest.raises(ValueError, match="direction must be one of"):
         require_direction(value=Direction.BOTH)
 
 
-def test_require_privacy_params_and_allocation_config() -> None:
-    """Dataclass instance checks share one wrapper per type."""
-    params = PrivacyParams(sigma=1.0, num_steps=4)
+def test_cast_type_names_the_argument() -> None:
+    """Checked casting preserves identity and names invalid arguments."""
     config = AllocationSchemeConfig()
-    assert require_privacy_params(value=params) is params
-    assert require_allocation_config(value=config) is config
-    with pytest.raises(TypeError, match="params must be PrivacyParams"):
-        require_privacy_params(value="params")
+    assert cast_type(value=config, expected_type=AllocationSchemeConfig, name="config") is config
     with pytest.raises(TypeError, match="config must be AllocationSchemeConfig"):
-        require_allocation_config(value="fft")
-
-
-def test_require_type_names_the_argument() -> None:
-    """Type errors name the argument and the expected class."""
-    with pytest.raises(TypeError, match="config must be AllocationSchemeConfig"):
-        require_type(value="fft", expected_type=AllocationSchemeConfig, name="config")
+        cast_type(value="fft", expected_type=AllocationSchemeConfig, name="config")
 
 
 def test_require_allocation_counts_enforces_order() -> None:
@@ -193,47 +175,42 @@ def test_require_allocation_counts_enforces_order() -> None:
 
 def test_require_nonnegative_masses_names_boundary_fields() -> None:
     """Boundary-mass errors use ``p_min`` / ``p_max``, not ``min`` / ``max``."""
+    prob_arr = np.array([1.0])
     with pytest.raises(ValueError, match="p_min must be nonnegative"):
-        require_nonnegative_masses(prob_arr=np.array([1.0]), p_min=-0.1, p_max=0.0)
+        require_nonnegative_masses(prob_arr=prob_arr, p_min=-0.1, p_max=0.0)
     with pytest.raises(ValueError, match="p_max must be nonnegative"):
-        require_nonnegative_masses(prob_arr=np.array([1.0]), p_min=0.0, p_max=-0.1)
+        require_nonnegative_masses(prob_arr=prob_arr, p_min=0.0, p_max=-0.1)
 
 
-def test_require_dense_dist_checks_type_spacing_and_domain() -> None:
+def test_cast_dense_dist_checks_type_spacing_and_domain() -> None:
     """Dense-dist checks live next to the type, not in ``validation.py``."""
-    sparse = SparseDiscreteDist(
-        x_array=np.array([0.0, 1.0]),
-        prob_arr=np.array([0.5, 0.5]),
-    )
+    sparse = SparseDiscreteDist(x_array=np.array([0.0, 1.0]), prob_arr=np.array([0.5, 0.5]))
     with pytest.raises(TypeError, match="dist must be DenseDiscreteDist with LINEAR spacing"):
-        require_dense_dist(dist=sparse, name="dist", spacing=SpacingType.LINEAR)
+        cast_dense_dist(dist=sparse, name="dist", spacing=SpacingType.LINEAR)
 
+    geometric_grid = GridSpec(
+        step=math.log(2.0), n=2, spacing_type=SpacingType.GEOMETRIC, anchor=1.0
+    )
     geometric = DenseDiscreteDist(
-        grid=GridSpec(
-            step=math.log(2.0),
-            n=2,
-            spacing_type=SpacingType.GEOMETRIC,
-            anchor=1.0,
-        ),
-        prob_arr=np.array([0.4, 0.6]),
-        domain=Domain.POSITIVES,
+        grid=geometric_grid, prob_arr=np.array([0.4, 0.6]), domain=Domain.POSITIVES
     )
     with pytest.raises(TypeError, match="expected DenseDiscreteDist with LINEAR spacing"):
-        require_dense_dist(dist=geometric, name="dist", spacing=SpacingType.LINEAR)
+        cast_dense_dist(dist=geometric, name="dist", spacing=SpacingType.LINEAR)
     with pytest.raises(ValueError, match=r"must use Domain\.REALS"):
-        require_dense_dist(
+        cast_dense_dist(
             dist=geometric, name="dist", spacing=SpacingType.GEOMETRIC, domain=Domain.REALS
         )
-    linear = DenseDiscreteDist(
-        grid=GridSpec(step=1.0, n=2, anchor=0.0),
-        prob_arr=np.array([0.4, 0.6]),
-    )
-    assert require_linear_reals_dist(dist=linear, name="dist") is linear
+    linear_grid = GridSpec(step=1.0, n=2, anchor=0.0)
+    linear = DenseDiscreteDist(grid=linear_grid, prob_arr=np.array([0.4, 0.6]))
+    assert cast_dense_dist(dist=linear, name="dist") is linear
+    assert cast_linear_reals_dist(dist=linear, name="dist") is linear
+    assert require_linear_reals_dist(dist=linear, name="dist") is None
     with pytest.raises(TypeError, match="expected DenseDiscreteDist with LINEAR spacing"):
-        require_linear_reals_dist(dist=geometric, name="dist")
-    assert require_geometric_positives_dist(dist=geometric, name="dist") is geometric
+        cast_linear_reals_dist(dist=geometric, name="dist")
+    assert cast_geometric_positives_dist(dist=geometric, name="dist") is geometric
+    assert require_geometric_positives_dist(dist=geometric, name="dist") is None
     with pytest.raises(TypeError, match="expected DenseDiscreteDist with GEOMETRIC spacing"):
-        require_geometric_positives_dist(dist=linear, name="dist")
+        cast_geometric_positives_dist(dist=linear, name="dist")
 
 
 def test_privacy_params_validate_on_construction() -> None:
@@ -249,15 +226,17 @@ def test_privacy_params_validate_on_construction() -> None:
         PrivacyParams(sigma=1.0, num_steps=4, epsilon=0.0)
 
 
-def test_privacy_params_require_delta_and_epsilon() -> None:
+def test_privacy_params_get_delta_and_epsilon() -> None:
     """Query helpers demand the optional field that the query uses."""
     params = PrivacyParams(sigma=1.0, num_steps=4)
     with pytest.raises(ValueError, match="delta must be in"):
-        params.require_delta()
+        params.get_delta()
     with pytest.raises(ValueError, match="epsilon must be positive"):
-        params.require_epsilon()
-    assert PrivacyParams(sigma=1.0, num_steps=4, delta=1e-5).require_delta() == 1e-5
-    assert PrivacyParams(sigma=1.0, num_steps=4, epsilon=1.0).require_epsilon() == 1.0
+        params.get_epsilon()
+    delta = np.float64(1e-5)
+    assert PrivacyParams(sigma=1.0, num_steps=4, delta=delta).get_delta() is delta
+    epsilon = np.float64(1.0)
+    assert PrivacyParams(sigma=1.0, num_steps=4, epsilon=epsilon).get_epsilon() is epsilon
 
 
 def test_allocation_scheme_config_validates_on_construction() -> None:
@@ -267,18 +246,77 @@ def test_allocation_scheme_config_validates_on_construction() -> None:
         AllocationSchemeConfig(tail_truncation=0.0)
     with pytest.raises(ValueError, match="loss_discretization must be positive"):
         AllocationSchemeConfig(loss_discretization=0.0)
-    with pytest.raises(ValueError, match="max_grid_fft must be >= 1"):
-        AllocationSchemeConfig(max_grid_fft=0)
     with pytest.raises(TypeError, match="convolution_method must be ConvolutionMethod"):
         AllocationSchemeConfig(convolution_method="fft")  # type: ignore[arg-type]
 
 
+@pytest.mark.parametrize("cap", [1, 2, 3])
+def test_allocation_scheme_config_rejects_positive_caps_below_four(cap: int) -> None:
+    """A positive geometric cap must leave enough points for outward grid alignment."""
+    with pytest.raises(ValueError, match="max_grid_mult must be <= 0 or >= 4"):
+        AllocationSchemeConfig(max_grid_mult=cap)
+
+
+@pytest.mark.parametrize("cap", [-1, 0, 4])
+def test_allocation_scheme_config_accepts_uncapped_or_usable_grids(cap: int) -> None:
+    """Zero and negative disable the cap; four is the smallest supported cap."""
+    assert AllocationSchemeConfig(max_grid_mult=cap).max_grid_mult == cap
+
+
+@pytest.mark.parametrize("bound_type", [BoundType.DOMINATES, BoundType.IS_DOMINATED])
+@pytest.mark.parametrize("sparse", [False, True], ids=["dense", "sparse"])
+def test_real_loss_projection_rejects_positive_domain(bound_type: BoundType, sparse: bool) -> None:
+    """A real-loss projection must not reinterpret an atom at zero as negative infinity."""
+    grid = GridSpec(step=1.0, n=2, index_0=1)
+    kwargs = {"prob_arr": np.array([0.4, 0.4]), "p_min": 0.2, "domain": Domain.POSITIVES}
+    source = (
+        SparseDiscreteDist(x_array=grid.materialize(), **kwargs)
+        if sparse
+        else DenseDiscreteDist(grid=grid, **kwargs)
+    )
+    with pytest.raises(ValueError, match="requires a real-domain source"):
+        project_discrete_dist(
+            dist=source,
+            tail_truncation=0.0,
+            loss_discretization=1.0,
+            bound_type=bound_type,
+        )
+
+
+@pytest.mark.parametrize("bound_type", [BoundType.DOMINATES, BoundType.IS_DOMINATED])
+def test_generic_grid_projection_preserves_positive_boundary(bound_type: BoundType) -> None:
+    """The generic rounding projector keeps zero-boundary semantics on a positive grid."""
+    grid = GridSpec(step=1.0, n=2, index_0=1)
+    source = DenseDiscreteDist(
+        grid=grid, prob_arr=np.array([0.25, 0.25]), p_min=0.5, domain=Domain.POSITIVES
+    )
+    result = project_dist_onto_grid_stoch_dom(dist=source, grid=grid, bound_type=bound_type)
+
+    assert result.domain == Domain.POSITIVES
+    assert result.p_min == 0.5
+    np.testing.assert_array_equal(result.prob_arr, source.prob_arr)
+
+
+@pytest.mark.parametrize("bound_type", [BoundType.DOMINATES, BoundType.IS_DOMINATED])
+@pytest.mark.parametrize("tail", [-1.0, math.nan, math.inf, -math.inf])
+def test_real_loss_projection_rejects_invalid_tail_budget(
+    bound_type: BoundType, tail: float
+) -> None:
+    """Invalid tail budgets fail before either discretization engine runs."""
+    source = SparseDiscreteDist(x_array=np.array([0.0, 1.0]), prob_arr=np.array([0.5, 0.5]))
+    with pytest.raises(ValueError, match="tail_truncation must be (nonnegative|finite)"):
+        project_discrete_dist(
+            dist=source,
+            tail_truncation=tail,
+            loss_discretization=0.1,
+            bound_type=bound_type,
+        )
+
+
 def test_algorithm_tail_truncation_zero_remains_valid() -> None:
     """Convolution/discretization ``tail_truncation=0`` is an algorithm arg, not a config field."""
-    noise = DenseDiscreteDist(
-        grid=GridSpec(step=1.0, n=3, anchor=0.0),
-        prob_arr=np.array([0.5, 0.0, 0.5]),
-    )
+    grid = GridSpec(step=1.0, n=3, anchor=0.0)
+    noise = DenseDiscreteDist(grid=grid, prob_arr=np.array([0.5, 0.0, 0.5]))
     remove, add = discrete_distribution(
         noise_dist=noise,
         loss_discretization=0.1,
@@ -286,3 +324,20 @@ def test_algorithm_tail_truncation_zero_remains_valid() -> None:
     )
     assert remove.p_min == 0.0
     assert add.p_min == 0.0
+
+
+def test_require_increasing_array_preserves_readonly_input() -> None:
+    """Validation neither returns a converted array nor writes to the input."""
+    values = np.array([-1.0, 0.0, 2.0])
+    values.flags.writeable = False
+    assert require_increasing_array(values=values, name="loss_points") is None
+    np.testing.assert_array_equal(values, [-1.0, 0.0, 2.0])
+    assert not values.flags.writeable
+
+
+def test_require_numeric_sequences_preserve_numpy_scalar_types() -> None:
+    """Batch validation leaves the supplied values and their scalar types intact."""
+    values = [np.int64(2), np.int64(5)]
+    assert require_positive_int(value=values, name=["num_steps", "num_epochs"]) is None
+    assert all(isinstance(value, np.int64) for value in values)
+    assert values == [2, 5]

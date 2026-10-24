@@ -1,6 +1,6 @@
 """Unit tests for mass-conservation and truncation primitives.
 
-Covers ``enforce_mass_conservation``, ``compute_truncation``, and mass-edge draining.
+Covers ``enforce_mass_conservation``, ``truncate_tails_stoch_dom``, and mass-edge draining.
 """
 
 import math
@@ -8,18 +8,14 @@ import math
 import numpy as np
 import pytest
 
-from PLD_accounting.discrete_dist import (
-    DenseDiscreteDist,
-    GridSpec,
-    SparseDiscreteDist,
-)
+from PLD_accounting.discrete_dist import DenseDiscreteDist, GridSpec, SparseDiscreteDist
 from PLD_accounting.distribution_utils import (
     PMF_MASS_DRIFT_TOL,
     PMF_TOLERATED_MASS_TOL,
-    _drain_mass_from_edge,
-    compute_truncation,
+    drain_mass_from_edge,
     enforce_mass_conservation,
 )
+from PLD_accounting.projections_stoch_dom import truncate_tails_stoch_dom, truncate_edges_stoch_dom
 from PLD_accounting.types import BoundType
 from tests.test_tolerances import TestTolerances as TOL
 
@@ -60,9 +56,10 @@ class TestEnforceMassConservation:
     @pytest.mark.parametrize("bound_type", [BoundType.DOMINATES, BoundType.IS_DOMINATED])
     def test_rejects_excess_too_large_to_be_drift(self, bound_type: BoundType) -> None:
         """Undeclared surplus mass must fail rather than be trimmed away silently."""
+        prob_arr = np.array([0.4, 0.1], dtype=np.float64)
         with pytest.raises(ValueError, match="exceeds the repair tolerance"):
             enforce_mass_conservation(
-                prob_arr=np.array([0.4, 0.1], dtype=np.float64),
+                prob_arr=prob_arr,
                 expected_p_min=0.3,
                 expected_p_max=0.4,
                 bound_type=bound_type,
@@ -87,18 +84,25 @@ class TestEnforceMassConservation:
         assert np.isclose(math.fsum([*map(float, prob_out), p_min, p_max]), 1.0)
 
     @pytest.mark.parametrize("bound_type", [BoundType.DOMINATES, BoundType.IS_DOMINATED])
-    def test_clamps_float_overshoot_on_expected_boundaries(self, bound_type: BoundType) -> None:
-        """A slightly negative expected boundary is overshoot, not an illegal mass."""
-        overshoot = -PMF_TOLERATED_MASS_TOL / 2
+    def test_rejects_an_expected_boundary_outside_the_unit_interval(
+        self, bound_type: BoundType
+    ) -> None:
+        """An expected boundary outside ``[0, 1]`` is an illegal mass, however small."""
         prob_arr = np.array([0.4, 0.6], dtype=np.float64)
-        _, p_min, p_max = enforce_mass_conservation(
-            prob_arr=prob_arr,
-            expected_p_min=overshoot,
-            expected_p_max=0.0,
-            bound_type=bound_type,
-        )
-        assert p_min >= 0.0
-        assert p_max >= 0.0
+        with pytest.raises(ValueError, match=r"expected_p_min must be in \[0, 1\]"):
+            enforce_mass_conservation(
+                prob_arr=prob_arr,
+                expected_p_min=-PMF_TOLERATED_MASS_TOL / 2,
+                expected_p_max=0.0,
+                bound_type=bound_type,
+            )
+        with pytest.raises(ValueError, match=r"expected_p_max must be in \[0, 1\]"):
+            enforce_mass_conservation(
+                prob_arr=prob_arr,
+                expected_p_min=0.0,
+                expected_p_max=float(np.nextafter(1.0, 2.0)),
+                bound_type=bound_type,
+            )
 
     def test_is_dominated_trims_right_including_p_max_within_widened_bands(self):
         """Middle-band excess is trimmed from the right, consuming p_max, and warns."""
@@ -186,9 +190,10 @@ class TestMassEnforcementDeficit:
     @pytest.mark.parametrize("bound_type", [BoundType.DOMINATES, BoundType.IS_DOMINATED])
     def test_rejects_deficit_too_large_to_be_drift(self, bound_type: BoundType) -> None:
         """Undeclared omitted mass must fail rather than be hidden as conservatism."""
+        prob_arr = np.array([0.4, 0.4])
         with pytest.raises(ValueError, match="exceeds the repair tolerance"):
             enforce_mass_conservation(
-                prob_arr=np.array([0.4, 0.4]),
+                prob_arr=prob_arr,
                 expected_p_min=0.0,
                 expected_p_max=0.0,
                 bound_type=bound_type,
@@ -240,7 +245,7 @@ class TestComputeTruncation:
 
     def test_strips_zero_edges_before_tail_truncation(self):
         """Strips zero edges before tail truncation."""
-        new_prob_arr, new_p_min, new_p_max, min_ind, max_ind = compute_truncation(
+        new_prob_arr, new_p_min, new_p_max, min_ind, max_ind = truncate_tails_stoch_dom(
             prob_arr=np.array([0.0, 0.8], dtype=np.float64),
             p_min=0.0,
             p_max=0.2,
@@ -255,7 +260,7 @@ class TestComputeTruncation:
 
     def test_keeps_boundary_when_it_is_the_first_remaining_element(self):
         """Keeps boundary when it is the first remaining element."""
-        new_prob_arr, new_p_min, new_p_max, min_ind, max_ind = compute_truncation(
+        new_prob_arr, new_p_min, new_p_max, min_ind, max_ind = truncate_tails_stoch_dom(
             prob_arr=np.array([0.0, 0.2, 0.5], dtype=np.float64),
             p_min=0.3,
             p_max=0.0,
@@ -270,9 +275,10 @@ class TestComputeTruncation:
 
     def test_rejects_a_pmf_whose_finite_mass_is_all_zero(self):
         """A law with no finite mass has no support to truncate; it must not slip through."""
+        prob_arr = np.zeros(4, dtype=np.float64)
         with pytest.raises(ValueError, match="zero finite mass"):
-            compute_truncation(
-                prob_arr=np.zeros(4, dtype=np.float64),
+            truncate_tails_stoch_dom(
+                prob_arr=prob_arr,
                 p_min=0.0,
                 p_max=0.0,
                 tail_truncation=0.0,
@@ -281,9 +287,10 @@ class TestComputeTruncation:
 
     def test_rejects_all_zero_finite_mass_even_when_truncating(self):
         """The same holds on the truncating path, not just the tail_truncation == 0 one."""
+        prob_arr = np.zeros(4, dtype=np.float64)
         with pytest.raises(ValueError):
-            compute_truncation(
-                prob_arr=np.zeros(4, dtype=np.float64),
+            truncate_tails_stoch_dom(
+                prob_arr=prob_arr,
                 p_min=1.0,
                 p_max=0.0,
                 tail_truncation=1e-3,
@@ -292,7 +299,7 @@ class TestComputeTruncation:
 
     def test_truncation_folds_consumed_boundary_into_first_finite_bin(self):
         """Truncation folds consumed boundary into first finite bin."""
-        new_prob_arr, new_p_min, new_p_max, min_ind, max_ind = compute_truncation(
+        new_prob_arr, new_p_min, new_p_max, min_ind, max_ind = truncate_tails_stoch_dom(
             prob_arr=np.array([0.2, 0.75], dtype=np.float64),
             p_min=0.05,
             p_max=0.0,
@@ -307,7 +314,7 @@ class TestComputeTruncation:
 
     def test_strips_zero_edges_for_is_dominated_right_tail(self):
         """Strips zero edges for is dominated right tail."""
-        new_prob_arr, new_p_min, new_p_max, min_ind, max_ind = compute_truncation(
+        new_prob_arr, new_p_min, new_p_max, min_ind, max_ind = truncate_tails_stoch_dom(
             prob_arr=np.array([0.8, 0.0], dtype=np.float64),
             p_min=0.2,
             p_max=0.0,
@@ -322,20 +329,19 @@ class TestComputeTruncation:
 
     def test_dense_truncate_edges_updates_x_min_after_zero_edge_removal(self):
         """Dense truncate edges updates x min after zero edge removal."""
+        grid = GridSpec(step=1.0, n=2, anchor=0.0)
         dist = DenseDiscreteDist(
-            grid=GridSpec(
-                step=1.0,
-                n=2,
-                anchor=0.0,
-            ),
-            prob_arr=np.array([0.0, 0.8], dtype=np.float64),
-            p_max=0.2,
+            grid=grid, prob_arr=np.array([0.0, 0.8], dtype=np.float64), p_max=0.2
         )
 
-        result = dist.truncate_edges(tail_truncation=0.1, bound_type=BoundType.DOMINATES)
+        result = truncate_edges_stoch_dom(
+            dist=dist, tail_truncation=0.1, bound_type=BoundType.DOMINATES
+        )
 
-        assert np.allclose(result.x_array, np.array([1.0], dtype=np.float64))
-        assert np.allclose(result.prob_arr, np.array([0.8], dtype=np.float64))
+        expected_x = np.array([1.0], dtype=np.float64)
+        expected_prob = np.array([0.8], dtype=np.float64)
+        assert np.allclose(result.x_array, expected_x)
+        assert np.allclose(result.prob_arr, expected_prob)
         assert np.isclose(result.p_min, 0.0)
         assert np.isclose(result.p_max, 0.2)
 
@@ -346,20 +352,20 @@ class TestComputeTruncation:
             prob_arr=np.array([0.8, 0.1, 0.1], dtype=np.float64),
         )
 
-        result = dist.truncate_edges(tail_truncation=0.15, bound_type=BoundType.DOMINATES)
+        result = truncate_edges_stoch_dom(
+            dist=dist, tail_truncation=0.15, bound_type=BoundType.DOMINATES
+        )
 
-        assert np.allclose(result.x_array, np.array([1.0, 2.0], dtype=np.float64))
-        assert np.allclose(result.prob_arr, np.array([0.8, 0.1], dtype=np.float64))
+        expected_x = np.array([1.0, 2.0], dtype=np.float64)
+        expected_prob = np.array([0.8, 0.1], dtype=np.float64)
+        assert np.allclose(result.x_array, expected_x)
+        assert np.allclose(result.prob_arr, expected_prob)
         assert np.isclose(result.p_min, 0.0)
         assert np.isclose(result.p_max, 0.1)
 
 
 def test_raises_when_mass_is_at_least_total():
     """Raises when mass is at least total."""
+    values = np.array([0.2, 0.8], dtype=np.float64)
     with pytest.raises(ValueError, match="mass must be smaller than total array mass"):
-        _drain_mass_from_edge(
-            values=np.array([0.2, 0.8], dtype=np.float64),
-            mass=1.0,
-            from_left=True,
-            exact=True,
-        )
+        drain_mass_from_edge(values=values, mass=1.0, from_left=True, exact=True)

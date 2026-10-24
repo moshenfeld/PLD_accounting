@@ -11,55 +11,40 @@ from PLD_accounting.fft_convolution import (
     fft_convolve,
     fft_self_convolve,
 )
-from PLD_accounting.types import BoundType, SpacingType
+from PLD_accounting.types import BoundType, ProjectionMethod, SpacingType
 
 
 def _linear_dist() -> DenseDiscreteDist:
+    grid = GridSpec(step=0.5, n=3, anchor=0.0)
     return DenseDiscreteDist(
-        grid=GridSpec(
-            step=0.5,
-            n=3,
-            anchor=0.0,
-        ),
-        prob_arr=np.array([0.2, 0.5, 0.3], dtype=np.float64),
-        p_max=0.0,
+        grid=grid, prob_arr=np.array([0.2, 0.5, 0.3], dtype=np.float64), p_max=0.0
     )
 
 
 def _geometric_dist() -> DenseDiscreteDist:
+    grid = GridSpec(step=math.log(2.0), spacing_type=SpacingType.GEOMETRIC, n=3, anchor=1.0)
     return DenseDiscreteDist(
-        grid=GridSpec(
-            step=math.log(2.0),
-            spacing_type=SpacingType.GEOMETRIC,
-            n=3,
-            anchor=1.0,
-        ),
+        grid=grid,
         prob_arr=np.array([0.3, 0.4, 0.3], dtype=np.float64),
         p_max=0.0,
         domain=Domain.POSITIVES,
     )
 
 
-def _linear_positive_dist(*, p_min: float = 0.0) -> DenseDiscreteDist:
+def _linear_positive_dist(*, p_min: float) -> DenseDiscreteDist:
+    grid = GridSpec(step=1.0, n=2, anchor=1.0)
     return DenseDiscreteDist(
-        grid=GridSpec(
-            step=1.0,
-            n=2,
-            anchor=1.0,
-        ),
+        grid=grid,
         prob_arr=np.array([0.4, 0.6 - p_min], dtype=np.float64),
         p_min=p_min,
         domain=Domain.POSITIVES,
     )
 
 
-def _linear_real_boundary_dist(*, p_min: float = 0.0, p_max: float = 0.0) -> DenseDiscreteDist:
+def _linear_real_boundary_dist(*, p_min: float, p_max: float) -> DenseDiscreteDist:
+    grid = GridSpec(step=1.0, n=1, anchor=0.0)
     return DenseDiscreteDist(
-        grid=GridSpec(
-            step=1.0,
-            n=1,
-            anchor=0.0,
-        ),
+        grid=grid,
         prob_arr=np.array([1.0 - p_min - p_max], dtype=np.float64),
         p_min=p_min,
         p_max=p_max,
@@ -82,22 +67,10 @@ def test_fft_requires_linear_spacing():
 
 def test_fft_accepts_different_origins_and_support_lengths():
     """FFT inputs need equal spacing and domains, not identical support metadata."""
-    dist_1 = DenseDiscreteDist(
-        grid=GridSpec(
-            step=0.5,
-            n=2,
-            anchor=-1.0,
-        ),
-        prob_arr=np.array([0.25, 0.75], dtype=np.float64),
-    )
-    dist_2 = DenseDiscreteDist(
-        grid=GridSpec(
-            step=0.5,
-            n=3,
-            anchor=0.25,
-        ),
-        prob_arr=np.array([0.2, 0.3, 0.5], dtype=np.float64),
-    )
+    grid_1 = GridSpec(step=0.5, n=2, anchor=-1.0)
+    dist_1 = DenseDiscreteDist(grid=grid_1, prob_arr=np.array([0.25, 0.75], dtype=np.float64))
+    grid_2 = GridSpec(step=0.5, n=3, anchor=0.25)
+    dist_2 = DenseDiscreteDist(grid=grid_2, prob_arr=np.array([0.2, 0.3, 0.5], dtype=np.float64))
 
     result = fft_convolve(
         dist_1=dist_1,
@@ -116,7 +89,7 @@ def test_fft_accepts_different_origins_and_support_lengths():
 @pytest.mark.parametrize("p_min", [0.0, 0.2])
 def test_fft_pair_requires_real_domain(positive_operand: int, p_min: float) -> None:
     """Pairwise FFT rejects positive-domain inputs regardless of boundary mass."""
-    dists = [_linear_positive_dist(), _linear_positive_dist()]
+    dists = [_linear_positive_dist(p_min=0.0), _linear_positive_dist(p_min=0.0)]
     dists[1 - positive_operand] = _linear_dist()
     dists[positive_operand] = _linear_positive_dist(p_min=p_min)
 
@@ -132,11 +105,9 @@ def test_fft_pair_requires_real_domain(positive_operand: int, p_min: float) -> N
 @pytest.mark.parametrize("use_direct", [False, True])
 def test_fft_self_rejects_boundary_only_input(use_direct: bool) -> None:
     """Boundary-only inputs fail before FFT work, without warnings or NaNs."""
+    grid = GridSpec(step=1.0, n=2, anchor=0.0)
     dist = DenseDiscreteDist(
-        grid=GridSpec(step=1.0, n=2, anchor=0.0),
-        prob_arr=np.array([0.0, 0.0], dtype=np.float64),
-        p_max=1.0,
-        domain=Domain.REALS,
+        grid=grid, prob_arr=np.array([0.0, 0.0], dtype=np.float64), p_max=1.0, domain=Domain.REALS
     )
     with warnings.catch_warnings():
         warnings.simplefilter("error")
@@ -154,9 +125,10 @@ def test_fft_self_rejects_boundary_only_input(use_direct: bool) -> None:
 @pytest.mark.parametrize("p_min", [0.0, 0.2])
 def test_fft_self_requires_real_domain(use_direct: bool, p_min: float) -> None:
     """FFT self-convolution receives REALS intermediates from both allocation paths."""
+    dist = _linear_positive_dist(p_min=p_min)
     with pytest.raises(ValueError, match=r"must use Domain\.REALS"):
         fft_self_convolve(
-            dist=_linear_positive_dist(p_min=p_min),
+            dist=dist,
             num_convolutions=2,
             tail_truncation=0.0,
             bound_type=BoundType.DOMINATES,
@@ -168,8 +140,8 @@ def test_fft_self_requires_real_domain(use_direct: bool, p_min: float) -> None:
 def test_fft_pair_rejects_opposing_real_boundary_atoms(reverse_inputs: bool) -> None:
     """The sum -inf + +inf has no distribution-independent interpretation."""
     dists = [
-        _linear_real_boundary_dist(p_min=0.2),
-        _linear_real_boundary_dist(p_max=0.3),
+        _linear_real_boundary_dist(p_min=0.2, p_max=0.0),
+        _linear_real_boundary_dist(p_max=0.3, p_min=0.0),
     ]
     if reverse_inputs:
         dists.reverse()
@@ -180,4 +152,64 @@ def test_fft_pair_rejects_opposing_real_boundary_atoms(reverse_inputs: bool) -> 
             dist_2=dists[1],
             tail_truncation=0.0,
             bound_type=BoundType.DOMINATES,
+        )
+
+
+@pytest.mark.parametrize("use_direct", [False, True])
+@pytest.mark.parametrize("num_convolutions", [1, 2])
+def test_fft_self_rejects_unknown_projection(use_direct: bool, num_convolutions: int) -> None:
+    """Projection validation applies even when self-composition has no merge."""
+    dist = _linear_dist()
+    with pytest.raises(TypeError, match="projection_method"):
+        fft_self_convolve(
+            dist=dist,
+            num_convolutions=num_convolutions,
+            tail_truncation=0.0,
+            bound_type=BoundType.DOMINATES,
+            use_direct=use_direct,
+            projection_method="invalid",
+        )
+
+
+@pytest.mark.parametrize("use_direct", [False, True])
+@pytest.mark.parametrize("num_convolutions", [1, 2])
+def test_fft_self_rejects_connect_the_dots_lower_bound(
+    use_direct: bool, num_convolutions: int
+) -> None:
+    """Direct and binary composition support CtD only for dominating bounds."""
+    dist = _linear_dist()
+    with pytest.raises(ValueError, match="dominating bounds only"):
+        fft_self_convolve(
+            dist=dist,
+            num_convolutions=num_convolutions,
+            tail_truncation=0.0,
+            bound_type=BoundType.IS_DOMINATED,
+            use_direct=use_direct,
+            projection_method=ProjectionMethod.CTD,
+        )
+
+
+def test_fft_pair_rejects_unknown_projection() -> None:
+    """Pairwise convolution requires a projection enum."""
+    dist = _linear_dist()
+    with pytest.raises(TypeError, match="projection_method"):
+        fft_convolve(
+            dist_1=dist,
+            dist_2=dist,
+            tail_truncation=0.0,
+            bound_type=BoundType.DOMINATES,
+            projection_method="invalid",
+        )
+
+
+def test_fft_pair_rejects_connect_the_dots_lower_bound() -> None:
+    """Pairwise CtD truncation gives dominating bounds only."""
+    dist = _linear_dist()
+    with pytest.raises(ValueError, match="dominating bounds only"):
+        fft_convolve(
+            dist_1=dist,
+            dist_2=dist,
+            tail_truncation=0.0,
+            bound_type=BoundType.IS_DOMINATED,
+            projection_method=ProjectionMethod.CTD,
         )

@@ -1,20 +1,19 @@
 """Distribution-level operations shared by the convolution and allocation routes.
 
-Boundary-mass algebra for sums, binary self-composition, combination of two bounds
-of one quantity, the exp/log and reflection transforms, and the canonical PLD dual.
+The aligned linear grid of a range, boundary-mass algebra for sums, binary
+self-composition, the exp/log and reflection transforms, and the canonical PLD
+dual.
 
-Every operation preserves or explicitly replaces its inputs' ``GridSpec``.
-``calc_pld_dual`` is the single dualization boundary, and the place where a
+Representation metadata stays with the distributions throughout these operations.
+``calc_pld_dual`` is the dualization boundary: the one place where a
 reciprocal-moment deficit becomes mass at ``+inf``.
 """
 
 from __future__ import annotations
 
-from dataclasses import replace
-from typing import Any, Callable
+from typing import Callable, TypeVar, overload
 
 import numpy as np
-from numpy.typing import NDArray
 
 from PLD_accounting.discrete_dist import (
     DenseDiscreteDist,
@@ -22,27 +21,81 @@ from PLD_accounting.discrete_dist import (
     Domain,
     GridSpec,
     PLDRealization,
-    require_dense_dist,
+    SparseDiscreteDist,
     require_geometric_positives_dist,
     require_linear_reals_dist,
 )
-from PLD_accounting.distribution_discretization import (
-    project_dist_onto_grid_ctd,
-    project_dist_onto_grid_stoch_dom,
-)
 from PLD_accounting.distribution_utils import (
-    enforce_mass_conservation,
     exp_moment_terms,
-    kahan_reverse_exclusive_cumsum,
     signed_unit_residual,
     trim_mass_from_edge,
 )
-from PLD_accounting.types import BoundType, require_bound_type
+from PLD_accounting.types import MIN_GRID_POINT_CAP, BoundType, require_bound_type
 from PLD_accounting.validation import (
+    require_integer,
     require_nonnegative_real,
     require_positive_int,
-    require_type,
+    require_positive_real,
 )
+
+_Dist = TypeVar("_Dist")
+
+# =============================================================================
+# Grid Construction
+# =============================================================================
+
+
+def aligned_grid_params(
+    *,
+    x_min: float,
+    x_max: float,
+    discretization: float,
+) -> GridSpec:
+    """Return a linear grid on multiples of ``discretization`` that covers ``[x_min, x_max]``."""
+    if x_max <= x_min:
+        raise ValueError(f"x_max must be greater than x_min, got x_min={x_min}, x_max={x_max}")
+    require_positive_real(value=discretization, name="discretization")
+
+    k_lo = int(np.floor(x_min / discretization))
+    k_hi = int(np.ceil(x_max / discretization))
+    if discretization * k_lo > x_min:
+        k_lo -= 1
+    if discretization * k_hi < x_max:
+        k_hi += 1
+
+    grid = GridSpec(step=discretization, n=k_hi - k_lo + 1, anchor=0.0, index_0=k_lo)
+    candidate = grid
+    while candidate.last_point < x_max:
+        candidate = candidate.with_n(candidate.n + 1)
+    return candidate
+
+
+def grid_step_for_point_cap(
+    *,
+    x_min: float,
+    x_max: float,
+    requested_step: float,
+    max_grid_points: int,
+) -> float:
+    """Return ``requested_step``, increased when needed for an aligned grid to fit a point cap.
+
+    A non-positive ``max_grid_points`` means no cap. A cap is at least
+    ``MIN_GRID_POINT_CAP``: the grid of ``aligned_grid_params`` over one interval of
+    the step can take that many points.
+    """
+    require_positive_real(value=requested_step, name="requested_step")
+    require_integer(value=max_grid_points, name="max_grid_points")
+    if max_grid_points <= 0:
+        return requested_step
+    if max_grid_points < MIN_GRID_POINT_CAP:
+        raise ValueError(
+            f"max_grid_points must be >= {MIN_GRID_POINT_CAP}, got {max_grid_points!r}"
+        )
+
+    # Reserve one fencepost plus up to two bins for outward grid alignment.
+    usable_intervals = max_grid_points - 3
+    return max(requested_step, (x_max - x_min) / usable_intervals)
+
 
 # =============================================================================
 # Boundary-Mass Convolution Utilities
@@ -109,22 +162,29 @@ def self_convolve_boundary_masses(
 
 def binary_self_convolve(
     *,
-    dist: DenseDiscreteDist,
+    dist: _Dist,
     num_convolutions: int,
     tail_truncation: float,
     bound_type: BoundType,
-    convolve: Callable[..., DenseDiscreteDist],
-) -> DenseDiscreteDist:
-    """Exponentiation by squaring-based self-convolution using a provided convolve function.
+    convolve: Callable[..., _Dist],
+) -> _Dist:
+    """Sum copies by repeated squaring with a representation-preserving merge.
 
     Algorithm 3 (`self-conv`), in Appendix C of
     https://arxiv.org/abs/2602.17284.
 
-    Each intermediate distribution carries its own ``GridSpec``, so ``convolve``
-    derives the output lattice from its two inputs; no lattice metadata travels
-    alongside the distributions.
+    ``convolve`` takes ``dist_1``, ``dist_2``, ``tail_truncation`` and
+    ``bound_type`` as keywords and validates the representation of its operands.
+    The caller validates ``dist`` before this loop; one copy returns it unchanged
+    without invoking the merge.
+    Powers of two are accumulated from smallest to largest. The result retains
+    the representation of ``dist``.
+
+    ``tail_truncation`` is divided over the merges and passed to each as a
+    keyword. Use zero for untrimmed merges. The supplied merge owns projection,
+    truncation and any per-merge admission. This loop performs no admission of
+    the completed sum.
     """
-    require_dense_dist(dist=dist, name="dist")
     require_positive_int(value=num_convolutions, name="num_convolutions")
     require_nonnegative_real(value=tail_truncation, name="tail_truncation")
     require_bound_type(value=bound_type)
@@ -133,12 +193,8 @@ def binary_self_convolve(
 
     base_dist = dist
     acc_dist = None
-    # Tail budget. Every convolve below is charged tail_truncation / num_convolutions
-    # using the *current* counter, which halves each pass, so the per-call charge
-    # doubles each pass and peaks at tail_truncation on the final pass. A doubling
-    # series sums to under twice its last term, so the squaring calls together spend
-    # under 2 * tail_truncation, and the accumulating calls likewise. Pre-dividing by
-    # those two families' combined factor of 4 keeps the total within the caller's budget.
+    # Squaring and accumulation each spend less than twice their largest charge.
+    # Divide by four so both families together stay within the tail budget.
     tail_truncation /= 4
     while num_convolutions > 0:
         if num_convolutions & 1:
@@ -148,168 +204,33 @@ def binary_self_convolve(
                 acc_dist = convolve(
                     dist_1=acc_dist,
                     dist_2=base_dist,
-                    tail_truncation=tail_truncation / num_convolutions,
                     bound_type=bound_type,
+                    tail_truncation=tail_truncation / num_convolutions,
                 )
         num_convolutions >>= 1
         if num_convolutions > 0:
             base_dist = convolve(
                 dist_1=base_dist,
                 dist_2=base_dist,
-                tail_truncation=tail_truncation / num_convolutions,
                 bound_type=bound_type,
+                tail_truncation=tail_truncation / num_convolutions,
             )
-    # For a power-of-two count acc_dist is never set; return the final squared base_dist.
     return acc_dist if acc_dist is not None else base_dist
 
 
-def combine_distributions(
-    *,
-    dist_1: DenseDiscreteDist,
-    dist_2: DenseDiscreteDist,
-    bound_type: BoundType,
-) -> DenseDiscreteDist:
-    """Combine two same-grid distributions by tightening bounds via CCDF min/max.
+def binary_self_convolve_depth(num_convolutions: int) -> int:
+    """Return the largest number of merges above one copy in ``binary_self_convolve``.
 
-    For DOMINATES: returns tighter dominating distribution using pointwise min CCDF.
-    For IS_DOMINATED: returns tighter dominated distribution using pointwise max CCDF.
-    Both inputs must use the same domain and spacing type and already share an
-    identical dense support grid; callers are responsible for projecting one
-    distribution onto the other's grid first.
+    Squaring gives the sum of ``2**b`` copies the depth ``b``, and an accumulation is
+    one merge above the deeper of its operands, which is the power just added. The
+    sum of ``num_convolutions`` copies thus has the depth ``ceil(log2(num_convolutions))``,
+    against up to ``2 * ceil(log2(num_convolutions))`` merges. A merge that projects onto
+    a grid of consecutive ratio at most ``r`` scales a sum by at most ``r``, and adding
+    values preserves a common factor, so the errors of the merges accumulate along
+    this depth and not over all of the merges.
     """
-    require_dense_dist(dist=dist_1, name="dist_1")
-    require_dense_dist(dist=dist_2, name="dist_2")
-    require_bound_type(value=bound_type)
-    if dist_1.domain != dist_2.domain:
-        raise ValueError("combine_distributions requires matching domains")
-    if dist_1.spacing_type != dist_2.spacing_type:
-        raise ValueError("combine_distributions requires matching spacing types")
-    ccdf_op: Any
-    if bound_type == BoundType.DOMINATES:
-        ccdf_op = np.minimum
-    elif bound_type == BoundType.IS_DOMINATED:
-        ccdf_op = np.maximum
-    else:
-        raise ValueError(f"Unknown BoundType: {bound_type}")
-
-    if dist_1.grid != dist_2.grid:
-        raise ValueError(
-            f"combine_distributions requires identical support grids, got "
-            f"{dist_1.grid} and {dist_2.grid}"
-        )
-
-    ccdf_1 = _ccdf_from_pmf(dist_1)
-    ccdf_2 = _ccdf_from_pmf(dist_2)
-    combined_ccdf = ccdf_op(ccdf_1, ccdf_2)
-    prob_arr = combined_ccdf[:-2] - combined_ccdf[1:-1]
-
-    # The boundary atoms are the CCDF limits, so the pointwise CCDF operation
-    # carries through to them: min CCDF gives max p_min and min p_max, max CCDF
-    # the reverse.
-    if bound_type == BoundType.DOMINATES:
-        expected_p_min = max(dist_1.p_min, dist_2.p_min)
-        expected_p_max = min(dist_1.p_max, dist_2.p_max)
-    else:
-        expected_p_min = min(dist_1.p_min, dist_2.p_min)
-        expected_p_max = max(dist_1.p_max, dist_2.p_max)
-    # Repair numerical drift after the CCDF operation fixes both boundary atoms.
-    prob_arr, p_min, p_max = enforce_mass_conservation(
-        prob_arr=prob_arr,
-        expected_p_min=expected_p_min,
-        expected_p_max=expected_p_max,
-        bound_type=bound_type,
-    )
-
-    return DenseDiscreteDist(
-        grid=dist_1.grid,
-        prob_arr=prob_arr,
-        p_min=p_min,
-        p_max=p_max,
-        domain=dist_1.domain,
-    )
-
-
-def combine_best_of_two_plds(
-    *,
-    dist_1: DenseDiscreteDist,
-    dist_2: DenseDiscreteDist,
-    bound_type: BoundType,
-) -> DenseDiscreteDist:
-    """Combine two same-quantity directional PLDs on the finer of their grids.
-
-    Both inputs are complete directional PLDs of the same quantity (e.g. the
-    FFT and GEOM candidates of a BEST_OF_TWO build), each constructed with its
-    own correct budget scaling.  The coarser candidate is projected onto the
-    finer candidate's exact lattice with domination-aware rounding, and the
-    pointwise CCDF combination runs on that shared grid.  The anchored (finer)
-    candidate's values are untouched, so the result is never looser than it,
-    and never looser than the other candidate by more than one fine grid step.
-    On equal steps ``dist_1`` is the anchor.
-    """
-    require_linear_reals_dist(dist=dist_1, name="dist_1")
-    require_linear_reals_dist(dist=dist_2, name="dist_2")
-    require_bound_type(value=bound_type)
-    if bound_type == BoundType.DOMINATES:
-        boundary, label = "p_min", "dominating"
-    else:
-        boundary, label = "p_max", "dominated"
-    for name, dist in (("dist_1", dist_1), ("dist_2", dist_2)):
-        value = getattr(dist, boundary)
-        if value != 0.0:
-            raise ValueError(
-                f"combine_best_of_two_plds requires canonical {label} inputs with "
-                f"{boundary} = 0 exactly; {name}.{boundary}={value:.2e}"
-            )
-
-    if dist_1.step <= dist_2.step:
-        anchor_dist, other_dist = dist_1, dist_2
-    else:
-        anchor_dist, other_dist = dist_2, dist_1
-
-    anchor_grid = anchor_dist.grid
-    other_grid = other_dist.grid
-    step = anchor_grid.step
-
-    if anchor_grid.step == other_grid.step and anchor_grid.anchor == other_grid.anchor:
-        # Same lattice, different windows: the union is an integer index range and
-        # both candidates embed into it exactly, so neither needs reprojection.
-        out_index_0 = min(anchor_grid.index_0, other_grid.index_0)
-        out_n = (
-            max(anchor_grid.index_0 + anchor_grid.n, other_grid.index_0 + other_grid.n)
-            - out_index_0
-        )
-        out_grid = replace(anchor_grid, index_0=out_index_0, n=out_n)
-        return combine_distributions(
-            dist_1=_embed_on_grid(
-                dist=anchor_dist, grid=out_grid, offset=anchor_grid.index_0 - out_index_0
-            ),
-            dist_2=_embed_on_grid(
-                dist=other_dist, grid=out_grid, offset=other_grid.index_0 - out_index_0
-            ),
-            bound_type=bound_type,
-        )
-
-    # Genuinely different lattices: keep the finer candidate's own lattice, widen it by
-    # whole steps to cover the other, and reproject only the other candidate.
-    n_left = max(0, int(np.ceil((anchor_grid.x_0 - other_grid.x_0) / step)))
-    n_right = max(0, int(np.ceil((other_grid.last_point - anchor_grid.last_point) / step)))
-    out_grid = anchor_grid.pad(left=n_left, right=n_right)
-
-    other_on_grid: DenseDiscreteDist
-    if bound_type == BoundType.DOMINATES:
-        other_on_grid = project_dist_onto_grid_ctd(dist=other_dist, grid=out_grid)
-    else:
-        other_on_grid = project_dist_onto_grid_stoch_dom(
-            dist=other_dist,
-            grid=out_grid,
-            bound_type=bound_type,
-        )
-
-    return combine_distributions(
-        dist_1=_embed_on_grid(dist=anchor_dist, grid=out_grid, offset=n_left),
-        dist_2=other_on_grid,
-        bound_type=bound_type,
-    )
+    require_positive_int(value=num_convolutions, name="num_convolutions")
+    return (num_convolutions - 1).bit_length()
 
 
 # =============================================================================
@@ -349,10 +270,33 @@ def log_geometric_to_linear(dist: DenseDiscreteDist) -> DenseDiscreteDist:
     )
 
 
-def negate_reverse_linear_distribution(
-    dist: DenseDiscreteDist,
-) -> DenseDiscreteDist:
-    """Map X -> -X, reverse PMF order, and swap boundary atoms."""
+@overload
+def negate_reverse_distribution(dist: SparseDiscreteDist) -> SparseDiscreteDist:
+    ...
+
+
+@overload
+def negate_reverse_distribution(dist: DenseDiscreteDist) -> DenseDiscreteDist:
+    ...
+
+
+def negate_reverse_distribution(
+    dist: DenseDiscreteDist | SparseDiscreteDist,
+) -> DenseDiscreteDist | SparseDiscreteDist:
+    """Map X -> -X, reverse PMF order, and swap boundary atoms.
+
+    ``dist`` is on a linear grid or on explicit points, over the reals; the result
+    has the representation of ``dist``.
+    """
+    if isinstance(dist, SparseDiscreteDist):
+        if dist.domain != Domain.REALS:
+            raise ValueError(f"dist must be over the reals, got {dist.domain}")
+        return SparseDiscreteDist(
+            x_array=-dist.x_array[::-1],
+            prob_arr=dist.prob_arr[::-1],
+            p_min=dist.p_max,
+            p_max=dist.p_min,
+        )
     require_linear_reals_dist(dist=dist, name="dist")
     return DenseDiscreteDist(
         grid=dist.grid.reflect(),
@@ -362,29 +306,51 @@ def negate_reverse_linear_distribution(
     )
 
 
-def calc_pld_dual(realization: PLDRealization) -> PLDRealization:
+@overload
+def calc_pld_dual(dist: PLDRealization) -> PLDRealization:
+    ...
+
+
+@overload
+def calc_pld_dual(dist: SparseDiscreteDist) -> SparseDiscreteDist:
+    ...
+
+
+def calc_pld_dual(
+    dist: PLDRealization | SparseDiscreteDist,
+) -> PLDRealization | SparseDiscreteDist:
     """Compute the paper PLD dual ``D(L)`` (Definition 3.1).
 
     Algorithm 7 (`PLD-dual`), in Appendix C of
     https://arxiv.org/abs/2602.17284.
 
-    For a PLD realization ``L`` with support ``l`` and mass ``f_L(l)``, the dual has:
+    For a PLD ``L`` with support ``l`` and mass ``f_L(l)``, the dual has:
     - finite mass ``f_D(-l) = f_L(l) * exp(-l)``,
     - support reflected to ``-l``,
     - residual mass at ``+inf``.
-    """
-    require_type(value=realization, expected_type=PLDRealization, name="realization")
 
-    dual_grid = realization.grid.reflect()
-    dual_loss = dual_grid.materialize()
+    ``dist`` is a realization, or a loss distribution on explicit points with no
+    mass at ``-inf``; the dual has the representation of ``dist``.
+    """
+    if isinstance(dist, SparseDiscreteDist):
+        if dist.domain != Domain.REALS or dist.p_min != 0.0:
+            raise ValueError(
+                "dist must be over the reals with no mass at -inf, "
+                f"got {dist.domain} and p_min={dist.p_min:.12g}"
+            )
+        dual_loss = -dist.x_array[::-1]
+    else:
+        dual_grid = dist.grid.reflect()
+        dual_loss = dual_grid.materialize()
     dual_probs = exp_moment_terms(
-        prob_arr=np.flip(realization.prob_arr),
+        prob_arr=np.flip(dist.prob_arr),
         x_vals=-dual_loss,
     )
 
     dual_residual = signed_unit_residual(values=dual_probs, lower_term=0.0, upper_term=0.0)
     if dual_residual < 0.0:
-        # Input may sit in (1, 1 + REALIZATION_MOMENT_TOL]; trim cheapest mass to +inf.
+        # Input may sit in (1, 1 + REALIZATION_MOMENT_TOL]; drop that surplus from the
+        # low-loss edge of the dual, where it is cheapest, so the dual has unit mass.
         # Do not classify_residual: its middle band would warn on that admitted excess.
         dual_probs = trim_mass_from_edge(
             prob_arr=dual_probs,
@@ -393,53 +359,9 @@ def calc_pld_dual(realization: PLDRealization) -> PLDRealization:
         )
         dual_residual = signed_unit_residual(values=dual_probs, lower_term=0.0, upper_term=0.0)
 
-    return PLDRealization(
-        grid=dual_grid,
-        prob_arr=dual_probs,
-        p_max=max(0.0, dual_residual),
-        p_min=0.0,
-    )
-
-
-# =============================================================================
-# Internal Helper Functions
-# =============================================================================
-
-
-def _embed_on_grid(
-    *,
-    dist: DenseDiscreteDist,
-    grid: GridSpec,
-    offset: int,
-) -> DenseDiscreteDist:
-    """Zero-pad ``dist`` onto a wider grid it already sits on at integer ``offset``.
-
-    ``grid.slice(start=offset, n=dist.grid.n)`` reproduces the source grid exactly, so this
-    moves no mass and rounds no coordinate.
-    """
-    if grid.slice(start=offset, n=dist.grid.n) != dist.grid:
-        raise ValueError(
-            f"Cannot embed {dist.grid} into {grid} at offset {offset}: not the same lattice"
+    dual_p_max = max(0.0, dual_residual)
+    if isinstance(dist, SparseDiscreteDist):
+        return SparseDiscreteDist(
+            x_array=dual_loss, prob_arr=dual_probs, p_min=0.0, p_max=dual_p_max
         )
-    prob_arr = np.zeros(grid.n, dtype=np.float64)
-    end = offset + dist.grid.n
-    prob_arr[offset:end] = dist.prob_arr
-    return DenseDiscreteDist(
-        grid=grid,
-        prob_arr=prob_arr,
-        p_min=dist.p_min,
-        p_max=dist.p_max,
-        domain=dist.domain,
-    )
-
-
-def _ccdf_from_pmf(dist: DiscreteDistBase) -> NDArray[np.float64]:
-    """Convert distribution PMF to padded complementary CDF.
-
-    Returns CCDF over [−∞/0, l_0, l_1, ..., +∞]:
-      CCDF[i] = P(X > position[i])
-
-    Includes both boundary atoms (p_min at the left, p_max at the right).
-    """
-    padded_probs = np.concatenate(([dist.p_min], dist.prob_arr, [dist.p_max]))
-    return kahan_reverse_exclusive_cumsum(values=padded_probs)
+    return PLDRealization(grid=dual_grid, prob_arr=dual_probs, p_max=dual_p_max, p_min=0.0)

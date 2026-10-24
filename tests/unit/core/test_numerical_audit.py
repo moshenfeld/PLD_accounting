@@ -9,6 +9,9 @@ from dataclasses import replace
 import numpy as np
 import pytest
 
+from PLD_accounting.convolutions import self_convolve
+from PLD_accounting.types import ProjectionMethod
+from PLD_accounting.projections_ctd import _ctd_moment_repair_tol
 from PLD_accounting.discrete_dist import (
     REALIZATION_MOMENT_TOL,
     DenseDiscreteDist,
@@ -16,13 +19,12 @@ from PLD_accounting.discrete_dist import (
     GridSpec,
     PLDRealization,
 )
-from PLD_accounting.distribution_discretization import _ctd_moment_repair_tol
 from PLD_accounting.distribution_utils import (
     PMF_MASS_DRIFT_TOL,
     PMF_TOLERATED_MASS_TOL,
-    _drain_mass_from_edge,
     classify_residual,
     compensated_segmented_sum,
+    drain_mass_from_edge,
     exp_moment_terms,
     signed_unit_residual,
     trim_mass_to_moment_target,
@@ -32,21 +34,17 @@ from PLD_accounting.dp_accounting_support import (
     linear_dist_to_dp_accounting_pmf,
 )
 from PLD_accounting.geometric_convolution import (
-    _add_single_zero_atom_cross_term,
+    _add_zero_atom_cross_term_stoch_dom,
     _numba_geometric_kernel,
     _numpy_geometric_kernel,
     geometric_convolve,
-    geometric_self_convolve,
 )
 from PLD_accounting.mechanisms import gaussian_distribution
-from PLD_accounting.random_allocation_accounting import (
-    _align_component_grids,
-    _averaged_exp_factor,
-)
-from PLD_accounting.random_allocation_api import (
-    gaussian_allocation_directional_pld,
-    gaussian_allocation_pld,
-)
+from PLD_accounting.projections import project_discrete_dist
+from PLD_accounting.random_allocation_accounting import _align_component_grids
+from PLD_accounting.random_allocation_api import gaussian_allocation_pld
+from PLD_accounting.random_allocation_base import _geometric_loss_of_average
+from PLD_accounting.projections_stoch_dom import truncate_edges_stoch_dom
 from PLD_accounting.subsample_pld import (
     _atomic_source,
     _calc_subsampled_grid,
@@ -62,11 +60,8 @@ from PLD_accounting.types import (
     PrivacyParams,
     SpacingType,
 )
-from PLD_accounting.utils import (
-    calc_pld_dual,
-    combine_best_of_two_plds,
-    negate_reverse_linear_distribution,
-)
+from PLD_accounting.utils import calc_pld_dual, negate_reverse_distribution
+from tests.unit.allocation_dists import allocation_dists
 
 
 def _reference_segmented_sum(
@@ -124,15 +119,11 @@ def test_truncation_direct_adversarial_leading_zeros_and_near_boundary_moment() 
     prob_arr = np.concatenate(
         [np.zeros(100, dtype=np.float64), np.array([0.35, 0.65], dtype=np.float64)]
     )
-    realization = PLDRealization(
-        grid=GridSpec(
-            step=step,
-            n=prob_arr.size,
-            anchor=0.0,
-        ),
-        prob_arr=prob_arr,
+    grid = GridSpec(step=step, n=prob_arr.size, anchor=0.0)
+    realization = PLDRealization(grid=grid, prob_arr=prob_arr)
+    truncated = truncate_edges_stoch_dom(
+        dist=realization, tail_truncation=0.0, bound_type=BoundType.DOMINATES
     )
-    truncated = realization.truncate_edges(tail_truncation=0.0, bound_type=BoundType.DOMINATES)
     assert truncated.prob_arr.size == 2
     assert truncated.x_0 == pytest.approx(0.1)
     assert truncated.p_min == 0.0
@@ -171,20 +162,16 @@ def test_moment_trim_rejects_an_unsatisfiable_target_instead_of_emptying_the_law
 
 
 def test_moment_trim_reaches_the_target_in_a_single_pass() -> None:
-    """The trim has no retry loop, so one pass must land on or past the target."""
+    """One call lands on or past the target, from an excess of one ulp to ``1e-7``."""
     base = gaussian_distribution(scale=0.8, value_discretization=1e-2, tail_truncation=1e-10)
     mass, loss = base.prob_arr.copy(), base.x_array.copy()
-    moment = 1.0 - signed_unit_residual(
-        values=exp_moment_terms(prob_arr=mass, x_vals=loss), lower_term=0.0, upper_term=0.0
-    )
+    moment_terms = exp_moment_terms(prob_arr=mass, x_vals=loss)
+    moment = 1.0 - signed_unit_residual(values=moment_terms, lower_term=0.0, upper_term=0.0)
     for eta in (1e-16, 1e-15, 1e-13, 1e-11, 1e-9, 1e-7):
         nudged = mass * ((1.0 + eta) / moment)
         repaired, _p_max = trim_mass_to_moment_target(prob_arr=nudged, loss=loss, p_max=0.0)
-        residual = signed_unit_residual(
-            values=exp_moment_terms(prob_arr=repaired, x_vals=loss),
-            lower_term=0.0,
-            upper_term=0.0,
-        )
+        repaired_terms = exp_moment_terms(prob_arr=repaired, x_vals=loss)
+        residual = signed_unit_residual(values=repaired_terms, lower_term=0.0, upper_term=0.0)
         assert residual >= 0.0, f"single pass fell short for eta={eta:g}"
 
 
@@ -192,22 +179,10 @@ def test_align_component_grids_reconciles_last_bit_steps_quietly() -> None:
     """Dividing one common_step by different stage counts is not worth a warning."""
     step_a = 0.01
     step_b = float(np.nextafter(step_a, 2.0))
-    dist_floor = DenseDiscreteDist(
-        grid=GridSpec(
-            step=step_a,
-            n=2,
-            anchor=0.0,
-        ),
-        prob_arr=np.array([0.5, 0.5]),
-    )
-    dist_ceil = DenseDiscreteDist(
-        grid=GridSpec(
-            step=step_b,
-            n=2,
-            anchor=0.0,
-        ),
-        prob_arr=np.array([0.25, 0.75]),
-    )
+    floor_grid = GridSpec(step=step_a, n=2, anchor=0.0)
+    dist_floor = DenseDiscreteDist(grid=floor_grid, prob_arr=np.array([0.5, 0.5]))
+    ceil_grid = GridSpec(step=step_b, n=2, anchor=0.0)
+    dist_ceil = DenseDiscreteDist(grid=ceil_grid, prob_arr=np.array([0.25, 0.75]))
 
     with warnings.catch_warnings():
         warnings.simplefilter("error")
@@ -222,22 +197,10 @@ def test_align_component_grids_reconciles_last_bit_steps_quietly() -> None:
 
 def test_align_component_grids_reports_a_material_step_mismatch() -> None:
     """A cap-coarsened component is a different grid, not float noise, so it is reported."""
-    dist_floor = DenseDiscreteDist(
-        grid=GridSpec(
-            step=0.01,
-            n=2,
-            anchor=0.0,
-        ),
-        prob_arr=np.array([0.5, 0.5]),
-    )
-    dist_ceil = DenseDiscreteDist(
-        grid=GridSpec(
-            step=0.05,
-            n=2,
-            anchor=0.0,
-        ),
-        prob_arr=np.array([0.25, 0.75]),
-    )
+    floor_grid = GridSpec(step=0.01, n=2, anchor=0.0)
+    dist_floor = DenseDiscreteDist(grid=floor_grid, prob_arr=np.array([0.5, 0.5]))
+    ceil_grid = GridSpec(step=0.05, n=2, anchor=0.0)
+    dist_ceil = DenseDiscreteDist(grid=ceil_grid, prob_arr=np.array([0.25, 0.75]))
 
     with pytest.warns(UserWarning, match="aligning mismatched floor/ceil grids"):
         floor_out, ceil_out = _align_component_grids(
@@ -256,15 +219,10 @@ def test_geometric_convolve_reads_anchors_from_the_input_grids() -> None:
     distributions and had to detect the ones that lied. The anchor is now a field of the
     input grid, so the output anchor is the sum of what the inputs actually carry.
     """
+    log_step = math.log(2.0)
+    grid = GridSpec(step=log_step, spacing_type=SpacingType.GEOMETRIC, n=2, anchor=0.6)
     dist = DenseDiscreteDist(
-        grid=GridSpec(
-            step=math.log(2.0),
-            spacing_type=SpacingType.GEOMETRIC,
-            n=2,
-            anchor=0.6,
-        ),
-        prob_arr=np.array([0.5, 0.5], dtype=np.float64),
-        domain=Domain.POSITIVES,
+        grid=grid, prob_arr=np.array([0.5, 0.5], dtype=np.float64), domain=Domain.POSITIVES
     )
     assert dist.grid.anchor == 0.6
     result = geometric_convolve(
@@ -282,14 +240,15 @@ def test_geometric_convolve_keeps_a_deep_index_hit_exact() -> None:
     anchor = 1e-5
     ratio = 1.0001167359166174
     lattice_index = 500
+    grid = GridSpec(
+        step=math.log(ratio),
+        n=4,
+        spacing_type=SpacingType.GEOMETRIC,
+        anchor=anchor,
+        index_0=lattice_index,
+    )
     dist = DenseDiscreteDist(
-        grid=GridSpec(
-            step=math.log(ratio),
-            n=4,
-            spacing_type=SpacingType.GEOMETRIC,
-            anchor=anchor,
-            index_0=lattice_index,
-        ),
+        grid=grid,
         prob_arr=np.array([0.25, 0.25, 0.25, 0.25], dtype=np.float64),
         domain=Domain.POSITIVES,
     )
@@ -304,51 +263,22 @@ def test_geometric_convolve_keeps_a_deep_index_hit_exact() -> None:
     assert result.x_0 == pytest.approx(2.0 * dist.x_0)
 
 
-def test_geometric_self_convolve_doubles_the_input_anchor() -> None:
+def test_geometric_sum_of_two_copies_doubles_the_input_anchor() -> None:
     """Self-convolution derives its lattice; there is no certificate to disbelieve."""
+    log_step = math.log(2.0)
+    grid = GridSpec(step=log_step, spacing_type=SpacingType.GEOMETRIC, n=2, anchor=0.6)
     dist = DenseDiscreteDist(
-        grid=GridSpec(
-            step=math.log(2.0),
-            spacing_type=SpacingType.GEOMETRIC,
-            n=2,
-            anchor=0.6,
-        ),
-        prob_arr=np.array([0.5, 0.5], dtype=np.float64),
-        domain=Domain.POSITIVES,
+        grid=grid, prob_arr=np.array([0.5, 0.5], dtype=np.float64), domain=Domain.POSITIVES
     )
-    result = geometric_self_convolve(
+    result = self_convolve(
         dist=dist,
         num_convolutions=2,
         tail_truncation=0.0,
         bound_type=BoundType.DOMINATES,
+        convolution_method=ConvolutionMethod.GEOM,
+        projection_method=ProjectionMethod.STOCH_DOM,
     )
     assert result.grid.anchor == 1.2
-
-
-def test_combine_best_of_two_projects_when_anchor_embedding_shifts() -> None:
-    """A one-ULP left extension must take the projection branch, not silent drift."""
-    anchor = DenseDiscreteDist(
-        grid=GridSpec(
-            step=1.0,
-            n=2,
-            anchor=float(np.nextafter(0.0, 1.0)),
-        ),
-        prob_arr=np.array([0.4, 0.6], dtype=np.float64),
-    )
-    other = DenseDiscreteDist(
-        grid=GridSpec(
-            step=1.0,
-            n=2,
-            anchor=0.0,
-        ),
-        prob_arr=np.array([0.3, 0.7], dtype=np.float64),
-    )
-    result = combine_best_of_two_plds(
-        dist_1=anchor,
-        dist_2=other,
-        bound_type=BoundType.DOMINATES,
-    )
-    assert result.prob_arr.size >= anchor.prob_arr.size
 
 
 @pytest.mark.parametrize("num_steps", [2, 10, 17])
@@ -364,31 +294,26 @@ def test_composed_loss_grid_is_exactly_zero_anchored(num_steps: int, direction: 
     params = PrivacyParams(sigma=1.0, num_steps=num_steps)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        result = gaussian_allocation_directional_pld(
+        result = allocation_dists(
+            pld_builder=gaussian_allocation_pld,
             params=params,
             config=config,
-            direction=direction,
             bound_type=BoundType.DOMINATES,
-        )
+        )[direction]
     assert (
         result.grid.anchor == 0.0
     ), f"composed loss grid must be zero-anchored, got {result.grid.anchor!r}"
 
 
-def test_averaged_exp_factor_rejects_a_non_unit_anchored_composition() -> None:
+def test_loss_of_average_rejects_a_non_unit_anchored_composition() -> None:
     """The averaging guard names the zero-anchor precondition it depends on."""
+    log_step = math.log(2.0)
+    grid = GridSpec(step=log_step, n=2, spacing_type=SpacingType.GEOMETRIC, anchor=1.5)
     dist = DenseDiscreteDist(
-        grid=GridSpec(
-            step=math.log(2.0),
-            n=2,
-            spacing_type=SpacingType.GEOMETRIC,
-            anchor=1.5,
-        ),
-        prob_arr=np.array([0.5, 0.5], dtype=np.float64),
-        domain=Domain.POSITIVES,
+        grid=grid, prob_arr=np.array([0.5, 0.5], dtype=np.float64), domain=Domain.POSITIVES
     )
     with pytest.raises(ValueError, match="were not zero-anchored"):
-        _averaged_exp_factor(dist=dist, num_steps=2)
+        _geometric_loss_of_average(summed=dist, num_steps=2)
 
 
 def test_dp_accounting_import_mass_band_admits_observed_residual() -> None:
@@ -443,17 +368,11 @@ def test_dp_accounting_export_rejects_anchors_the_quotient_cannot_see() -> None:
     """
     step = 1e-4
     swallowed = GridSpec(
-        step=step,
-        n=3,
-        anchor=float(np.spacing(100_000 * step) / 4),  # > 0, invisible in x_0
-        index_0=100_000,
+        step=step, n=3, anchor=float(np.spacing(100_000 * step) / 4), index_0=100_000
     )
     whole_step = 0.0005640745848883568
     whole_quotient = GridSpec(
-        step=whole_step,
-        n=3,
-        anchor=float(np.nextafter(368 * whole_step, np.inf)),  # anchor/step == 368.0
-        index_0=0,
+        step=whole_step, n=3, anchor=float(np.nextafter(368 * whole_step, np.inf)), index_0=0
     )
     assert whole_quotient.anchor / whole_step == 368.0
 
@@ -488,9 +407,11 @@ def test_every_geometric_diagonal_sum_is_placed_conservatively(bound_type: Bound
     for i in range(n):
         mass = np.zeros(n)
         mass[i] = 1.0
+        dist_1 = DenseDiscreteDist(grid=grid_1, prob_arr=mass, domain=Domain.POSITIVES)
+        dist_2 = DenseDiscreteDist(grid=grid_2, prob_arr=mass, domain=Domain.POSITIVES)
         result = geometric_convolve(
-            dist_1=DenseDiscreteDist(grid=grid_1, prob_arr=mass, domain=Domain.POSITIVES),
-            dist_2=DenseDiscreteDist(grid=grid_2, prob_arr=mass, domain=Domain.POSITIVES),
+            dist_1=dist_1,
+            dist_2=dist_2,
             tail_truncation=0.0,
             bound_type=bound_type,
         )
@@ -509,16 +430,15 @@ def test_geometric_convolve_compares_stored_log_steps() -> None:
     assert math.exp(step) == math.exp(other)  # indistinguishable as ratios
 
     def make(spacing: float) -> DenseDiscreteDist:
-        return DenseDiscreteDist(
-            grid=GridSpec(step=spacing, n=2, spacing_type=SpacingType.GEOMETRIC, anchor=1.0),
-            prob_arr=np.array([0.5, 0.5]),
-            domain=Domain.POSITIVES,
-        )
+        grid = GridSpec(step=spacing, n=2, spacing_type=SpacingType.GEOMETRIC, anchor=1.0)
+        return DenseDiscreteDist(grid=grid, prob_arr=np.array([0.5, 0.5]), domain=Domain.POSITIVES)
 
     with pytest.raises(ValueError, match="must share one exact log spacing"):
+        dist_1 = make(step)
+        dist_2 = make(other)
         geometric_convolve(
-            dist_1=make(step),
-            dist_2=make(other),
+            dist_1=dist_1,
+            dist_2=dist_2,
             tail_truncation=0.0,
             bound_type=BoundType.DOMINATES,
         )
@@ -546,9 +466,8 @@ def test_lower_semantic_dual_mass_postcondition_holds(
         target_residual=eta,
     )
 
-    residual = signed_unit_residual(
-        values=exp_moment_terms(prob_arr=adjusted, x_vals=loss_arr), lower_term=0.0, upper_term=0.0
-    )
+    moment_terms = exp_moment_terms(prob_arr=adjusted, x_vals=loss_arr)
+    residual = signed_unit_residual(values=moment_terms, lower_term=0.0, upper_term=0.0)
     assert residual >= eta
     assert removed == pytest.approx(math.fsum(map(float, prob_arr - adjusted)))
 
@@ -569,9 +488,8 @@ def test_lower_semantic_dual_mass_continues_past_an_exhausted_subnormal() -> Non
         target_residual=eta,
     )
 
-    residual = signed_unit_residual(
-        values=exp_moment_terms(prob_arr=adjusted, x_vals=loss_arr), lower_term=0.0, upper_term=0.0
-    )
+    moment_terms = exp_moment_terms(prob_arr=adjusted, x_vals=loss_arr)
+    residual = signed_unit_residual(values=moment_terms, lower_term=0.0, upper_term=0.0)
     assert residual >= eta
     assert adjusted[0] == 0.0
     assert removed > 0.0
@@ -579,6 +497,7 @@ def test_lower_semantic_dual_mass_continues_past_an_exhausted_subnormal() -> Non
 
 @pytest.mark.parametrize("bound_type", [BoundType.DOMINATES, BoundType.IS_DOMINATED])
 def test_diagonal_placement_is_per_element(bound_type: BoundType) -> None:
+    # pylint: disable=too-many-locals  # each compared quantity is named
     """Elements that land off their knot get their own bin, not the whole diagonal."""
     step = 3.9915989732929734e-05
     index_0 = -9017
@@ -597,13 +516,15 @@ def test_diagonal_placement_is_per_element(bound_type: BoundType) -> None:
         anchor=0.0108584022381824,
         index_0=index_0,
     )
+    uniform_1 = DenseDiscreteDist(
+        grid=grid_1, prob_arr=np.full(n, 1.0 / n), domain=Domain.POSITIVES
+    )
+    uniform_2 = DenseDiscreteDist(
+        grid=grid_2, prob_arr=np.full(n, 1.0 / n), domain=Domain.POSITIVES
+    )
     result = geometric_convolve(
-        dist_1=DenseDiscreteDist(
-            grid=grid_1, prob_arr=np.full(n, 1.0 / n), domain=Domain.POSITIVES
-        ),
-        dist_2=DenseDiscreteDist(
-            grid=grid_2, prob_arr=np.full(n, 1.0 / n), domain=Domain.POSITIVES
-        ),
+        dist_1=uniform_1,
+        dist_2=uniform_2,
         tail_truncation=0.0,
         bound_type=bound_type,
     )
@@ -615,9 +536,11 @@ def test_diagonal_placement_is_per_element(bound_type: BoundType) -> None:
     for i in range(n):
         mass = np.zeros(n)
         mass[i] = 1.0
+        dist_1 = DenseDiscreteDist(grid=grid_1, prob_arr=mass, domain=Domain.POSITIVES)
+        dist_2 = DenseDiscreteDist(grid=grid_2, prob_arr=mass, domain=Domain.POSITIVES)
         placed = geometric_convolve(
-            dist_1=DenseDiscreteDist(grid=grid_1, prob_arr=mass, domain=Domain.POSITIVES),
-            dist_2=DenseDiscreteDist(grid=grid_2, prob_arr=mass, domain=Domain.POSITIVES),
+            dist_1=dist_1,
+            dist_2=dist_2,
             tail_truncation=0.0,
             bound_type=bound_type,
         )
@@ -652,8 +575,12 @@ def test_drain_mass_from_edge_handles_fsum_cumsum_pivot_disagreement() -> None:
     assert total_fsum > total_cumsum
     mass = float(np.nextafter(total_cumsum, total_fsum))
     assert total_cumsum <= mass < total_fsum
-    trimmed = _drain_mass_from_edge(values=values.copy(), mass=mass, from_left=True, exact=True)
-    assert math.fsum(map(float, trimmed)) == pytest.approx(total_fsum - mass, abs=1e-14)
+    assert math.fsum(
+        map(
+            float,
+            drain_mass_from_edge(values=values.copy(), mass=mass, from_left=True, exact=True),
+        )
+    ) == pytest.approx(total_fsum - mass, abs=1e-14)
 
 
 def test_zero_atom_cross_term_uses_stored_log_step() -> None:
@@ -668,7 +595,7 @@ def test_zero_atom_cross_term_uses_stored_log_step() -> None:
     )
     x_on_lattice = float(output_grid.point(i=2))
     pmf = np.zeros(5)
-    result, below, above = _add_single_zero_atom_cross_term(
+    result, below, above = _add_zero_atom_cross_term_stoch_dom(
         pmf_conv=pmf,
         x_arr=np.array([x_on_lattice]),
         prob_arr=np.array([1.0]),
@@ -684,22 +611,21 @@ def test_zero_atom_cross_term_uses_stored_log_step() -> None:
 def test_geometric_kernel_numba_and_numpy_paths_agree_within_machine_eps() -> None:
     """The Numba and NumPy geometric kernels must stay observationally equivalent."""
     pmf = np.array([0.2, 0.3, 0.25, 0.25], dtype=np.float64)
-    delta_lohi = np.array([0, 1, 2, 3], dtype=np.int64)
-    delta_hilo = np.array([0, 1, 2, 3], dtype=np.int64)
+    bin_offsets = np.array([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=np.int64)
     diagonal_bins = np.arange(pmf.size, dtype=np.int64)
     numba_out = _numba_geometric_kernel(
         pmf_base=pmf,
         pmf_scaled=pmf,
-        delta_lohi=delta_lohi,
-        delta_hilo=delta_hilo,
+        bin_offsets=bin_offsets,
+        weights=np.zeros(bin_offsets.shape),
         diagonal_bins=diagonal_bins,
         output_size=8,
     )
     numpy_out = _numpy_geometric_kernel(
         pmf_base=pmf,
         pmf_scaled=pmf,
-        delta_lohi=delta_lohi,
-        delta_hilo=delta_hilo,
+        bin_offsets=bin_offsets,
+        weights=np.zeros(bin_offsets.shape),
         diagonal_bins=diagonal_bins,
         output_size=8,
     )
@@ -709,7 +635,7 @@ def test_geometric_kernel_numba_and_numpy_paths_agree_within_machine_eps() -> No
 def test_remove_subsample_extends_target_grid_for_dual_branch() -> None:
     """The REMOVE path must pad the lattice before mixing transformed branches."""
     base = gaussian_distribution(scale=2.0, value_discretization=0.5, tail_truncation=1e-8)
-    dual = negate_reverse_linear_distribution(calc_pld_dual(base))
+    dual = negate_reverse_distribution(calc_pld_dual(base))
     sampling_prob = 0.4
     base_only = _calc_subsampled_grid(
         source_grid=base.grid,
@@ -762,22 +688,17 @@ def test_gaussian_internal_routes_emit_no_repair_warnings() -> None:
     """Normal Gaussian allocation paths must not lean on generic repair fallbacks."""
     with warnings.catch_warnings():
         warnings.simplefilter("error", RuntimeWarning)
-        for method in (
-            ConvolutionMethod.GEOM,
-            ConvolutionMethod.FFT,
-            ConvolutionMethod.BEST_OF_TWO,
-        ):
-            config = replace(_PRODUCTION_CONFIG, convolution_method=method)
-            for direction in (Direction.REMOVE, Direction.ADD):
-                dist = gaussian_allocation_directional_pld(
-                    params=_PRODUCTION_PARAMS,
-                    config=config,
-                    direction=direction,
-                )
-                dist.truncate_edges(
-                    tail_truncation=config.tail_truncation,
-                    bound_type=BoundType.DOMINATES,
-                )
+        dists = allocation_dists(
+            pld_builder=gaussian_allocation_pld,
+            params=_PRODUCTION_PARAMS,
+            config=_PRODUCTION_CONFIG,
+        )
+        for dist in dists.values():
+            truncate_edges_stoch_dom(
+                dist=dist,
+                tail_truncation=_PRODUCTION_CONFIG.tail_truncation,
+                bound_type=BoundType.DOMINATES,
+            )
         base = gaussian_distribution(scale=1.0, value_discretization=1e-3, tail_truncation=1e-10)
         _ = calc_pld_dual(base)
 
@@ -794,14 +715,15 @@ def test_gaussian_floor_ceil_combination_emits_no_repair_warnings() -> None:
     params = replace(_PRODUCTION_PARAMS, num_steps=101, num_selected=3)
     with warnings.catch_warnings():
         warnings.simplefilter("error", RuntimeWarning)
-        for direction in (Direction.REMOVE, Direction.ADD):
-            with pytest.warns(UserWarning, match="aligning mismatched floor/ceil grids"):
-                dist = gaussian_allocation_directional_pld(
-                    params=params,
-                    config=_PRODUCTION_CONFIG,
-                    direction=direction,
-                )
-            dist.truncate_edges(
+        with pytest.warns(UserWarning, match="aligning mismatched floor/ceil grids"):
+            dists = allocation_dists(
+                pld_builder=gaussian_allocation_pld,
+                params=params,
+                config=_PRODUCTION_CONFIG,
+            )
+        for dist in dists.values():
+            truncate_edges_stoch_dom(
+                dist=dist,
                 tail_truncation=_PRODUCTION_CONFIG.tail_truncation,
                 bound_type=BoundType.DOMINATES,
             )
@@ -816,15 +738,64 @@ def test_dp_accounting_round_trip_emits_no_repair_warnings() -> None:
         assert math.isfinite(epsilon)
 
 
+def test_truncation_fold_drained_atom_sits_one_step_below_the_kept_atom() -> None:
+    """A near-unit mass difference must not be folded onto a loss near -13.
+
+    The drained atom is one step (1e-3) below the kept atom, and the law has
+    only about 1e-13 of moment slack. Subtracting two fsums near one adds an
+    ulp of mass there, and ``e^{13}`` turns that ulp into a moment above one.
+    """
+    step = 1e-3
+    index_0 = -13001
+    n = 20000 - index_0 + 1
+    prob_arr = np.zeros(n, dtype=np.float64)
+    prob_arr[0] = 3.072333577977318e-15
+    prob_arr[1] = 2.2603293877843404e-06
+    for index, mass in (
+        (32899, 0.1468060931618353),
+        (31945, 0.007361521496633788),
+        (31071, 0.20127653958169772),
+        (33001, 0.14374749773670065),
+        (32647, 0.08807711255878463),
+        (31290, 0.21060310604555202),
+        (32508, 0.08098864552762922),
+        (32022, 0.12113722356177584),
+    ):
+        prob_arr[index] = mass
+    grid = GridSpec(step=step, n=n, anchor=0.0, index_0=index_0)
+    realization = PLDRealization(grid=grid, prob_arr=prob_arr)
+    assert realization.x_array[1] == pytest.approx(-13.0)
+    assert realization.x_array[1] - realization.x_array[0] == pytest.approx(step)
+    terms = exp_moment_terms(prob_arr=realization.prob_arr, x_vals=realization.x_array)
+    residual = signed_unit_residual(values=terms, lower_term=0.0, upper_term=0.0)
+    assert residual == pytest.approx(1e-13, rel=0.0, abs=5e-15)
+
+    truncated = truncate_edges_stoch_dom(
+        dist=realization, tail_truncation=1e-14, bound_type=BoundType.DOMINATES
+    )
+    truncated_terms = exp_moment_terms(prob_arr=truncated.prob_arr, x_vals=truncated.x_array)
+    assert (
+        signed_unit_residual(values=truncated_terms, lower_term=0.0, upper_term=0.0)
+        >= -REALIZATION_MOMENT_TOL
+    )
+    project_discrete_dist(
+        dist=truncated,
+        tail_truncation=1e-14,
+        loss_discretization=step,
+        bound_type=BoundType.DOMINATES,
+    )
+
+
 def test_ctd_moment_repair_respects_coarse_grid_tolerance_order() -> None:
     """Coarse-grid repair tolerance must cap drift tolerance, not invert it."""
     repair_tol = _ctd_moment_repair_tol(max_abs_loss=1.0, step=10.0)
     assert repair_tol < REALIZATION_MOMENT_TOL
+    drift_tol = min(REALIZATION_MOMENT_TOL, repair_tol)
     with warnings.catch_warnings():
         warnings.simplefilter("error")
         classify_residual(
             residual=repair_tol / 2.0,
-            drift_tol=min(REALIZATION_MOMENT_TOL, repair_tol),
+            drift_tol=drift_tol,
             repair_tol=repair_tol,
             context="CtD reciprocal-moment repair",
             repair="moving the cheapest mass to +inf",

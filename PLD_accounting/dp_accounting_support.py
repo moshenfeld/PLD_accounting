@@ -66,7 +66,8 @@ def linear_dist_to_dp_accounting_pmf(
         raise ValueError("Dominating PMF conversion requires p_min = 0")
 
     # Zero-anchored by contract, so the lattice index is the export index, exactly.
-    grid = require_zero_anchor(grid=dist.grid, name="dist.grid")
+    require_zero_anchor(grid=dist.grid, name="dist.grid")
+    grid = dist.grid
     base_index = grid.index_0
     return DensePLDPmf(
         discretization=dist.step,
@@ -90,14 +91,15 @@ def dp_accounting_pmf_to_pld_realization(
     """Convert a pessimistic dp_accounting PMF to a linear-grid PLD realization.
 
     Negative finite and infinity mass are clipped to zero without an upper clip,
-    total mass is repaired directionally, and reciprocal-moment excess is moved
-    to ``+inf``. Repairs above their drift band warn; repairs at or above their
-    ceiling raise. Defaults cover an uncomposed PMF, so composed inputs may need
+    total mass is repaired with the infinity mass held fixed (excess from the
+    low-loss edge, deficit at the last finite loss), and reciprocal-moment excess
+    is moved to ``+inf``. Repairs above their drift band warn; repairs at or above
+    their ceiling raise. Defaults cover an uncomposed PMF, so composed inputs may need
     wider ceilings.
 
     Args:
         pmf: Dense or sparse pessimistic dp_accounting PMF.
-        mass_drift_tol: Mass residual normalized away as noise.
+        mass_drift_tol: Directional mass repair treated as noise.
         mass_repair_tol: Mass residual that rejects the input.
         moment_drift_tol: Moment-repair mass movement treated as noise.
         moment_repair_tol: Moment-repair mass movement that rejects the input.
@@ -113,13 +115,14 @@ def dp_accounting_pmf_to_pld_realization(
     # so they cannot disagree about a coordinate.
     x_values = grid.materialize()
 
+    negative_mass = math.fsum(
+        chain(
+            (float(-value) for value in probs_dense[probs_dense < 0.0]),
+            (float(-inf_mass),) if inf_mass < 0.0 else (),
+        )
+    )
     classify_residual(
-        residual=math.fsum(
-            chain(
-                (float(-value) for value in probs_dense[probs_dense < 0.0]),
-                (float(-inf_mass),) if inf_mass < 0.0 else (),
-            )
-        ),
+        residual=negative_mass,
         drift_tol=negative_drift_tol,
         repair_tol=negative_repair_tol,
         context="dp_accounting import negative mass",
@@ -145,9 +148,8 @@ def dp_accounting_pmf_to_pld_realization(
         p_max=inf_mass,
         context="dp_accounting import reciprocal moment",
     )
-    moved_mass = repaired_inf_mass - inf_mass
     classify_residual(
-        residual=moved_mass,
+        residual=repaired_inf_mass - inf_mass,
         drift_tol=moment_drift_tol,
         repair_tol=moment_repair_tol,
         context="dp_accounting import reciprocal moment",
@@ -166,7 +168,7 @@ def dp_accounting_pmf_to_pld_realization(
     )
 
 
-def require_importable_dp_accounting_pmf(pmf: object) -> PLDPmf:
+def require_importable_dp_accounting_pmf(pmf: object) -> None:
     """Reject an unsupported representation or an optimistic dp_accounting PMF."""
     if not isinstance(pmf, (DensePLDPmf, SparsePLDPmf)):
         raise TypeError(
@@ -177,7 +179,6 @@ def require_importable_dp_accounting_pmf(pmf: object) -> PLDPmf:
             "An optimistic dp_accounting PMF does not map to either package BoundType. "
             "Only pessimistic PMFs can be imported."
         )
-    return pmf
 
 
 # ============================================================================
@@ -208,10 +209,5 @@ def _pmf_to_dense_components(pmf: PLDPmf) -> tuple[GridSpec, np.ndarray, float]:
             f"Unrecognized PMF format: {type(pmf)}. Expected DensePLDPmf or SparsePLDPmf."
         )
 
-    inf_mass = float(pmf._infinity_mass)
-    grid = GridSpec(
-        step=float(pmf._discretization),
-        n=probs_dense.size,
-        index_0=lower_index,
-    )
-    return grid, probs_dense, inf_mass
+    grid = GridSpec(step=float(pmf._discretization), n=probs_dense.size, index_0=lower_index)
+    return grid, probs_dense, float(pmf._infinity_mass)

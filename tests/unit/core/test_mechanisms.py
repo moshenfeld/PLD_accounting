@@ -19,23 +19,20 @@ from PLD_accounting.mechanisms import (
     _LaplacePLD,
     discrete_distribution,
     gaussian_distribution,
+    gaussian_loss_law,
     laplace_distribution,
 )
-from PLD_accounting.types import (
-    DEFAULT_TAIL_TRUNCATION,
-    BoundType,
-    SpacingType,
-)
+from PLD_accounting.types import DEFAULT_TAIL_TRUNCATION, BoundType, SpacingType
 from PLD_accounting.utils import binary_self_convolve
 
 
 def _noise_distribution(
     pmf: np.ndarray,
     *,
-    x_0: float = 0.0,
-    step: float = 1.0,
-    boundaries: tuple[float, float] = (0.0, 0.0),
-    spacing_type: SpacingType = SpacingType.LINEAR,
+    x_0: float,
+    step: float,
+    boundaries: tuple[float, float],
+    spacing_type: SpacingType,
 ) -> DenseDiscreteDist:
     """Build a count-noise distribution for mechanism tests."""
     domain = Domain.POSITIVES if spacing_type == SpacingType.GEOMETRIC else Domain.REALS
@@ -61,16 +58,13 @@ def atomic_hockey_stick(
     p_max: float = 0.0,
 ) -> np.ndarray:
     """Evaluate an atomic PLD's hockey-stick profile."""
-    return np.array(
-        [
-            p_max
-            + math.fsum(
-                float(mass) * max(0.0, -math.expm1(float(epsilon - loss)))
-                for loss, mass in zip(losses, masses, strict=True)
-            )
-            for epsilon in epsilons
-        ]
-    )
+    profile = []
+    for epsilon in epsilons:
+        terms = []
+        for loss, mass in zip(losses, masses, strict=True):
+            terms.append(float(mass) * max(0.0, (-math.expm1(float(epsilon - loss)))))
+        profile.append(p_max + math.fsum(terms))
+    return np.array(profile)
 
 
 def _exact_count_noise_atoms(
@@ -86,6 +80,30 @@ def _exact_count_noise_atoms(
     losses = np.log(pmf[finite]) - np.log(denominator[finite])
     probs = pmf[finite]
     return losses, probs, 1.0 - math.fsum(map(float, probs))
+
+
+@pytest.mark.parametrize("sigma", [0.3, 1.0, 3.0, 7.5])
+def test_gaussian_loss_law_parameters(sigma: float):
+    """The Gaussian loss law is normal with mean ``1 / (2 sigma^2)`` and deviation ``1 / sigma``."""
+    law = gaussian_loss_law(sigma)
+    assert law.dist.name == "norm"
+    assert law.mean() == 1.0 / (2.0 * sigma**2)
+    assert law.std() == 1.0 / sigma
+
+
+def test_gaussian_loss_law_is_its_own_dual():
+    """The density ratio of the law at ``x`` and at ``-x`` is ``exp(x)``."""
+    law = gaussian_loss_law(1.7)
+    losses = np.linspace(-2.0, 2.0, 9)
+    log_density_ratio = law.logpdf(losses) - law.logpdf(-losses)
+    np.testing.assert_allclose(log_density_ratio, losses, atol=1e-12)
+
+
+@pytest.mark.parametrize("sigma", [0.0, -1.0, math.inf, math.nan])
+def test_gaussian_loss_law_rejects_invalid_sigma(sigma: float):
+    """A noise scale that is not a positive finite real is rejected."""
+    with pytest.raises(ValueError, match="sigma"):
+        gaussian_loss_law(sigma)
 
 
 def test_gaussian_distribution_dominates_returns_pld_realization():
@@ -173,11 +191,11 @@ def test_laplace_distribution_has_no_infinite_mass(scale):
 
 
 def test_laplace_distribution_self_convolve_t100():
-    """Regression: laplace_distribution must survive 100 self-convolutions (100 epochs).
+    """laplace_distribution survives 100 self-convolutions (100 epochs).
 
-    Previously, the 0.5 atom at +lam was misrouted to p_max=0.5; after ~5
-    binary squarings the finite mass fell below the truncation budget and raised
-    ValueError inside truncate_edges.
+    The 0.5 atom at +lam is a finite atom, not mass at ``p_max``. Were it routed to
+    ``p_max``, the finite mass would fall below the truncation budget after about five
+    binary squarings and ``truncate_edges`` would raise ``ValueError``.
     """
     # Use a looser truncation budget for the 100-step composition to avoid
     # re-triggering the truncation error; the initial distribution uses the
@@ -205,28 +223,35 @@ def test_count_noise_coalesces_duplicate_loss_atoms():
     """Repeated shifted-PMF ratios are combined before sparse CtD construction."""
     pmf = np.array([0.1, 0.2, 0.1, 0.2, 0.4])
     step = 0.05
+    noise_dist = _noise_distribution(
+        pmf, x_0=0.0, step=1.0, boundaries=(0.0, 0.0), spacing_type=SpacingType.LINEAR
+    )
     remove, _ = discrete_distribution(
-        noise_dist=_noise_distribution(pmf),
+        noise_dist=noise_dist,
         loss_discretization=step,
         tail_truncation=0.0,
     )
     losses, probs, p_max = _exact_count_noise_atoms(pmf, 1, 1)
 
     assert np.unique(losses).size < losses.size
-    np.testing.assert_allclose(
-        atomic_hockey_stick(remove.x_array, remove.prob_arr, remove.x_array, remove.p_max),
-        atomic_hockey_stick(losses, probs, remove.x_array, p_max),
-        atol=5 * PMF_TOLERATED_MASS_TOL,
+    remove_profile = atomic_hockey_stick(
+        remove.x_array, remove.prob_arr, remove.x_array, remove.p_max
     )
+    exact_profile = atomic_hockey_stick(losses, probs, remove.x_array, p_max)
+    np.testing.assert_allclose(remove_profile, exact_profile, atol=5 * PMF_TOLERATED_MASS_TOL)
 
 
 @pytest.mark.parametrize("sensitivity", [1, 2])
 def test_discrete_distribution_match_exact_shift_profiles(sensitivity: int):
+    # pylint: disable=too-many-locals  # each compared quantity is named
     """Both directional count-noise PLDs CtD-dominate their exact shifted PMFs."""
     pmf = np.array([0.05, 0.15, 0.40, 0.30, 0.10])
     step = 0.025
+    noise_dist = _noise_distribution(
+        pmf, x_0=0.0, step=1.0, boundaries=(0.0, 0.0), spacing_type=SpacingType.LINEAR
+    )
     remove, add = discrete_distribution(
-        noise_dist=_noise_distribution(pmf),
+        noise_dist=noise_dist,
         sensitivity=sensitivity,
         loss_discretization=step,
         tail_truncation=0.0,
@@ -240,24 +265,30 @@ def test_discrete_distribution_match_exact_shift_profiles(sensitivity: int):
             result.x_array, result.prob_arr, epsilons, result.p_max
         )
         assert np.all(result_profile >= exact_profile - 5 * PMF_TOLERATED_MASS_TOL)
-        np.testing.assert_allclose(
-            atomic_hockey_stick(result.x_array, result.prob_arr, result.x_array, result.p_max),
-            atomic_hockey_stick(losses, probs, result.x_array, p_max),
-            atol=5 * PMF_TOLERATED_MASS_TOL,
+        result_at_atoms = atomic_hockey_stick(
+            result.x_array, result.prob_arr, result.x_array, result.p_max
         )
+        exact_at_atoms = atomic_hockey_stick(losses, probs, result.x_array, p_max)
+        np.testing.assert_allclose(result_at_atoms, exact_at_atoms, atol=5 * PMF_TOLERATED_MASS_TOL)
         assert result.p_max == pytest.approx(p_max, abs=5 * PMF_TOLERATED_MASS_TOL)
 
 
 def test_count_noise_support_offset_does_not_change_pld():
     """Translating the integer support leaves privacy-loss ratios unchanged."""
     pmf = np.array([0.1, 0.2, 0.4, 0.2, 0.1])
+    negative_offset_noise = _noise_distribution(
+        pmf, x_0=-17.0, step=1.0, boundaries=(0.0, 0.0), spacing_type=SpacingType.LINEAR
+    )
     at_negative_offset = discrete_distribution(
-        noise_dist=_noise_distribution(pmf, x_0=-17.0),
+        noise_dist=negative_offset_noise,
         loss_discretization=0.01,
         tail_truncation=0.0,
     )
+    positive_offset_noise = _noise_distribution(
+        pmf, x_0=23.0, step=1.0, boundaries=(0.0, 0.0), spacing_type=SpacingType.LINEAR
+    )
     at_positive_offset = discrete_distribution(
-        noise_dist=_noise_distribution(pmf, x_0=23.0),
+        noise_dist=positive_offset_noise,
         loss_discretization=0.01,
         tail_truncation=0.0,
     )
@@ -275,12 +306,11 @@ def test_count_noise_support_offset_does_not_change_pld():
 def test_count_noise_each_boundary_mass_is_routed_to_infinity(boundaries, boundary_mass):
     """The distinct lower and upper noise tails each become infinite loss."""
     interior = (1.0 - boundary_mass) * np.array([0.05, 0.15, 0.40, 0.30, 0.10])
+    noise_dist = _noise_distribution(
+        interior, x_0=-2.0, boundaries=boundaries, step=1.0, spacing_type=SpacingType.LINEAR
+    )
     remove, add = discrete_distribution(
-        noise_dist=_noise_distribution(
-            interior,
-            x_0=-2.0,
-            boundaries=boundaries,
-        ),
+        noise_dist=noise_dist,
         loss_discretization=0.05,
         tail_truncation=0.0,
     )
@@ -295,8 +325,11 @@ def test_count_noise_keeps_every_positive_loss_atom():
     """The exact sparse loss law retains positive atoms without thresholding."""
     tiny = 1e-12
     pmf = np.array([tiny, 0.25, 0.50, 0.25 - tiny])
+    noise_dist = _noise_distribution(
+        pmf, x_0=0.0, step=1.0, boundaries=(0.0, 0.0), spacing_type=SpacingType.LINEAR
+    )
     remove, add = discrete_distribution(
-        noise_dist=_noise_distribution(pmf),
+        noise_dist=noise_dist,
         loss_discretization=0.01,
         tail_truncation=0.0,
     )
@@ -311,22 +344,23 @@ def test_discrete_distribution_rediscretizes_sparse_loss_laws(monkeypatch):
 
     def fake_rediscretize_dist_by_bound(**kwargs):
         calls.append(kwargs)
-        return PLDRealization(
-            grid=GridSpec(
-                step=kwargs["loss_discretization"],
-                n=1,
-                anchor=0.0,
-            ),
-            prob_arr=np.array([1.0]),
-        )
+        grid = GridSpec(step=kwargs["loss_discretization"], n=1, anchor=0.0)
+        return PLDRealization(grid=grid, prob_arr=np.array([1.0]))
 
     monkeypatch.setattr(
-        "PLD_accounting.mechanisms.rediscretize_dist_by_bound",
+        "PLD_accounting.mechanisms.project_discrete_dist",
         fake_rediscretize_dist_by_bound,
     )
 
+    noise_dist = _noise_distribution(
+        np.array([0.1, 0.2, 0.4, 0.2, 0.1]),
+        x_0=0.0,
+        step=1.0,
+        boundaries=(0.0, 0.0),
+        spacing_type=SpacingType.LINEAR,
+    )
     discrete_distribution(
-        noise_dist=_noise_distribution(np.array([0.1, 0.2, 0.4, 0.2, 0.1])),
+        noise_dist=noise_dist,
         loss_discretization=0.125,
         tail_truncation=0.025,
     )
@@ -341,8 +375,15 @@ def test_discrete_distribution_rediscretizes_sparse_loss_laws(monkeypatch):
 
 def test_count_noise_with_no_overlapping_support_is_all_infinity():
     """A PMF with no positive shifted overlap produces the valid all-infinity PLD."""
+    noise_dist = _noise_distribution(
+        np.array([0.5, 0.0, 0.5]),
+        x_0=0.0,
+        step=1.0,
+        boundaries=(0.0, 0.0),
+        spacing_type=SpacingType.LINEAR,
+    )
     remove, add = discrete_distribution(
-        noise_dist=_noise_distribution(np.array([0.5, 0.0, 0.5])),
+        noise_dist=noise_dist,
         loss_discretization=0.1,
         tail_truncation=0.0,
         sensitivity=1,
@@ -356,9 +397,16 @@ def test_count_noise_with_no_overlapping_support_is_all_infinity():
 
 def test_count_noise_rejects_single_finite_loss_atom():
     """A one-atom finite overlap cannot define distinct CtD grid bounds."""
+    noise_dist = _noise_distribution(
+        np.array([0.4, 0.6]),
+        x_0=0.0,
+        step=1.0,
+        boundaries=(0.0, 0.0),
+        spacing_type=SpacingType.LINEAR,
+    )
     with pytest.raises(ValueError, match="at least two distinct finite support points"):
         discrete_distribution(
-            noise_dist=_noise_distribution(np.array([0.4, 0.6])),
+            noise_dist=noise_dist,
             loss_discretization=0.1,
             tail_truncation=0.0,
         )
@@ -384,46 +432,39 @@ def test_count_noise_rejects_invalid_parameters(kwargs, error_type, match):
     """Scalar count-noise parameters receive explicit type and range validation."""
     params = {"loss_discretization": 0.1, "tail_truncation": 0.0}
     params.update(kwargs)
+    noise_dist = _noise_distribution(
+        np.array([0.4, 0.6]),
+        x_0=0.0,
+        step=1.0,
+        boundaries=(0.0, 0.0),
+        spacing_type=SpacingType.LINEAR,
+    )
     with pytest.raises(error_type, match=match):
-        discrete_distribution(noise_dist=_noise_distribution(np.array([0.4, 0.6])), **params)
+        discrete_distribution(noise_dist=noise_dist, **params)
+
+
+_TWO_POINT_PMF = np.array([0.4, 0.6])
+_POINT_MASS_GRID = GridSpec(step=1.0, n=1, anchor=0.0)
+_POINT_MASS_REALIZATION = PLDRealization(grid=_POINT_MASS_GRID, prob_arr=np.array([1.0]))
+_HALF_STEP_NOISE = _noise_distribution(
+    _TWO_POINT_PMF, step=0.5, x_0=0.0, boundaries=(0.0, 0.0), spacing_type=SpacingType.LINEAR
+)
+_HALF_ORIGIN_NOISE = _noise_distribution(
+    _TWO_POINT_PMF, x_0=0.5, step=1.0, boundaries=(0.0, 0.0), spacing_type=SpacingType.LINEAR
+)
+_GEOMETRIC_NOISE = _noise_distribution(
+    _TWO_POINT_PMF, x_0=1.0, step=2.0, spacing_type=SpacingType.GEOMETRIC, boundaries=(0.0, 0.0)
+)
 
 
 @pytest.mark.parametrize(
     ("noise_dist", "error_type", "match"),
     [
-        (np.array([0.4, 0.6]), TypeError, "must be a DenseDiscreteDist"),
-        (
-            PLDRealization(
-                grid=GridSpec(
-                    step=1.0,
-                    n=1,
-                    anchor=0.0,
-                ),
-                prob_arr=np.array([1.0]),
-            ),
-            TypeError,
-            "not a PLDRealization",
-        ),
-        (
-            _noise_distribution(np.array([0.4, 0.6]), step=0.5),
-            ValueError,
-            "unit spacing",
-        ),
-        (
-            _noise_distribution(np.array([0.4, 0.6]), x_0=0.5),
-            ValueError,
-            "integer grid origin",
-        ),
-        (
-            _noise_distribution(
-                np.array([0.4, 0.6]),
-                x_0=1.0,
-                step=2.0,
-                spacing_type=SpacingType.GEOMETRIC,
-            ),
-            ValueError,
-            "real-domain linear grid",
-        ),
+        (_TWO_POINT_PMF, TypeError, "must be a DenseDiscreteDist"),
+        (_POINT_MASS_REALIZATION, TypeError, "not a PLDRealization"),
+        (_HALF_STEP_NOISE, ValueError, "unit spacing"),
+        (_HALF_ORIGIN_NOISE, ValueError, "integer grid origin"),
+        (_GEOMETRIC_NOISE, ValueError, "real-domain linear grid"),
     ],
 )
 def test_count_noise_rejects_invalid_distributions(noise_dist, error_type, match):
@@ -439,8 +480,15 @@ def test_count_noise_rejects_invalid_distributions(noise_dist, error_type, match
 @pytest.mark.parametrize("sensitivity", [2, 3])
 def test_count_noise_without_possible_shift_overlap_is_all_infinity(sensitivity: int):
     """Sensitivity at least as large as the support yields mutually singular laws."""
+    noise_dist = _noise_distribution(
+        np.array([0.4, 0.6]),
+        x_0=0.0,
+        step=1.0,
+        boundaries=(0.0, 0.0),
+        spacing_type=SpacingType.LINEAR,
+    )
     remove, add = discrete_distribution(
-        noise_dist=_noise_distribution(np.array([0.4, 0.6])),
+        noise_dist=noise_dist,
         loss_discretization=0.1,
         tail_truncation=0.0,
         sensitivity=sensitivity,
